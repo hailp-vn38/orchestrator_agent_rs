@@ -83,6 +83,15 @@ impl ToolContext {
     /// `MAX_PROGRESS_BYTES`, bị throttle theo `RuntimeConfig::progress_min_interval` và đi vào
     /// event feed (`tool.progress`, secret đã cấu hình bị che) cùng tracing.
     pub fn progress(&self, update: &str) {
+        self.report(update, None);
+    }
+
+    /// Như [`Self::progress`] kèm phần trăm hoàn thành (kẹp vào `0..=100`).
+    pub fn progress_with_percent(&self, update: &str, percent: u8) {
+        self.report(update, Some(percent.min(100)));
+    }
+
+    fn report(&self, update: &str, percent: Option<u8>) {
         let mut end = update.len().min(MAX_PROGRESS_BYTES);
         while !update.is_char_boundary(end) {
             end -= 1;
@@ -95,7 +104,7 @@ impl ToolContext {
             "tool progress"
         );
         if let Some(sink) = &self.progress {
-            sink.send(&update[..end]);
+            sink.send(&update[..end], percent);
         }
     }
 }

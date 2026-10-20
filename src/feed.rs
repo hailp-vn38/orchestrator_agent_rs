@@ -32,6 +32,59 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Tên event (docs/16 §16.3): một nơi duy nhất cho publisher, fault hook và test.
+pub(crate) mod event {
+    pub(crate) const RUN_STARTED: &str = "run.started";
+    pub(crate) const RUN_COMPLETED: &str = "run.completed";
+    pub(crate) const RUN_FAILED: &str = "run.failed";
+    pub(crate) const RUN_CANCELLED: &str = "run.cancelled";
+    pub(crate) const RUN_INTERRUPTED: &str = "run.interrupted";
+    pub(crate) const STEP_STARTED: &str = "step.started";
+    pub(crate) const STEP_ENDED: &str = "step.ended";
+    pub(crate) const TEXT_DELTA: &str = "text.delta";
+    pub(crate) const MESSAGE_COMMITTED: &str = "message.committed";
+    pub(crate) const TOOL_STARTED: &str = "tool.started";
+    pub(crate) const TOOL_PROGRESS: &str = "tool.progress";
+    pub(crate) const TOOL_COMPLETED: &str = "tool.completed";
+    pub(crate) const TOOL_FAILED: &str = "tool.failed";
+    pub(crate) const TOOL_INTERRUPTED: &str = "tool.interrupted";
+    pub(crate) const SESSION_CHANGED: &str = "session.changed";
+    pub(crate) const COMPACTION_STARTED: &str = "compaction.started";
+    pub(crate) const COMPACTION_COMPLETED: &str = "compaction.completed";
+
+    /// Event kết thúc một run/tool: publication bị mất thì chỉ snapshot mới bù được.
+    #[cfg(feature = "test-support")]
+    pub(crate) const TERMINAL: &[&str] = &[
+        RUN_COMPLETED,
+        RUN_FAILED,
+        RUN_CANCELLED,
+        RUN_INTERRUPTED,
+        TOOL_COMPLETED,
+        TOOL_FAILED,
+        TOOL_INTERRUPTED,
+    ];
+
+    /// Event terminal của run theo trạng thái (timed_out gộp vào failed).
+    pub(crate) fn run_terminal(status: crate::types::RunStatus) -> &'static str {
+        use crate::types::RunStatus;
+        match status {
+            RunStatus::Completed => RUN_COMPLETED,
+            RunStatus::Cancelled => RUN_CANCELLED,
+            RunStatus::Interrupted => RUN_INTERRUPTED,
+            _ => RUN_FAILED,
+        }
+    }
+}
+
+/// Payload chung của event tool (không bao giờ có arguments/kết quả).
+pub(crate) fn tool_payload(invocation_id: &str, tool_call_id: &str, tool_name: &str) -> Value {
+    json!({
+        "tool_call_id": tool_call_id,
+        "invocation_id": invocation_id,
+        "tool_name": tool_name,
+    })
+}
+
 /// Envelope tối thiểu (docs/16 §16.4). `payload` có kiểu theo `event_type`.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -160,22 +213,13 @@ impl FeedFault {
     }
 
     fn intercept(&self, event: ExecutionEvent) -> Vec<ExecutionEvent> {
-        const TERMINAL: &[&str] = &[
-            "run.completed",
-            "run.failed",
-            "run.cancelled",
-            "run.interrupted",
-            "tool.completed",
-            "tool.failed",
-            "tool.interrupted",
-        ];
         if !event.is_committed() {
             return vec![event];
         }
         let final_message =
-            event.event_type == "message.committed" && event.payload["final"] == json!(true);
+            event.event_type == event::MESSAGE_COMMITTED && event.payload["final"] == json!(true);
         if self.suppress_terminal.load(Ordering::Acquire)
-            && (final_message || TERMINAL.contains(&event.event_type.as_str()))
+            && (final_message || event::TERMINAL.contains(&event.event_type.as_str()))
         {
             return Vec::new();
         }
@@ -420,7 +464,7 @@ impl ProgressSink {
     }
 
     /// Throttle theo `min_interval`: update tới quá sớm bị bỏ (ephemeral, best-effort).
-    pub(crate) fn send(&self, message: &str) {
+    pub(crate) fn send(&self, message: &str, percent: Option<u8>) {
         {
             let mut last = lock(&self.last);
             let now = Instant::now();
@@ -429,16 +473,20 @@ impl ProgressSink {
             }
             *last = Some(now);
         }
+        let mut payload = json!({
+            "tool_call_id": self.tool_call_id,
+            "invocation_id": self.invocation_id,
+            "message": self.feed.redact(message),
+        });
+        if let Some(percent) = percent {
+            payload["percent"] = json!(percent);
+        }
         self.feed.ephemeral(
             &self.root_session_id,
             &self.session_id,
             Some(&self.run_id),
-            "tool.progress",
-            json!({
-                "tool_call_id": self.tool_call_id,
-                "invocation_id": self.invocation_id,
-                "message": self.feed.redact(message),
-            }),
+            event::TOOL_PROGRESS,
+            payload,
         );
     }
 }
@@ -508,36 +556,18 @@ impl Emitter {
     ) {
         if let Ok(closed) = self.store.closed_invocations(run_id).await {
             for inv in closed {
-                let (event_type, payload) = if inv.status == InvocationStatus::Cancelled {
-                    (
-                        "tool.failed",
-                        json!({
-                            "tool_call_id": inv.tool_call_id,
-                            "invocation_id": inv.id,
-                            "tool_name": inv.tool_name,
-                            "status": "cancelled",
-                        }),
-                    )
+                let mut payload = tool_payload(&inv.id, &inv.tool_call_id, &inv.tool_name);
+                let event_type = if inv.status == InvocationStatus::Cancelled {
+                    payload["status"] = json!("cancelled");
+                    event::TOOL_FAILED
                 } else {
-                    (
-                        "tool.interrupted",
-                        json!({
-                            "tool_call_id": inv.tool_call_id,
-                            "invocation_id": inv.id,
-                            "tool_name": inv.tool_name,
-                            "error_code": inv.error_code,
-                        }),
-                    )
+                    payload["error_code"] = json!(inv.error_code);
+                    event::TOOL_INTERRUPTED
                 };
                 self.committed_run(run_id, event_type, payload).await;
             }
         }
-        let event_type = match status {
-            RunStatus::Completed => "run.completed",
-            RunStatus::Cancelled => "run.cancelled",
-            RunStatus::Interrupted => "run.interrupted",
-            _ => "run.failed",
-        };
+        let event_type = event::run_terminal(status);
         self.committed_run(
             run_id,
             event_type,

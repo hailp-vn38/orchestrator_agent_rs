@@ -242,3 +242,128 @@ async fn live_family_shows_deltas_and_progress_then_canonical_terminal() {
     let wire: String = events.iter().map(|e| e.to_json().to_string()).collect();
     assert!(!wire.contains(&key), "API key lọt vào event");
 }
+
+/// Tool nhận arguments dài (nhiều phần tử) để buộc backend stream arguments qua nhiều mảnh nếu
+/// nó hỗ trợ; ghi lại arguments đã nhận để đối chiếu.
+struct RecordItems(Arc<Mutex<Vec<Value>>>);
+
+#[async_trait::async_trait]
+impl HostTool for RecordItems {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "record_items".into(),
+            description: "Record a list of items. Pass every item exactly as requested.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "items": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["title", "items"]
+            }),
+            effect: ToolEffect::ReadOnly,
+        }
+    }
+
+    async fn execute(&self, ctx: ToolContext, args: Value) -> Result<ToolOutcome, ToolError> {
+        let n = args["items"].as_array().map_or(0, Vec::len);
+        self.0.lock().unwrap().push(args);
+        Ok(ToolOutcome {
+            call_id: ctx.scope().tool_call_id.clone(),
+            content: format!("recorded {n} items"),
+            metadata: Value::Null,
+        })
+    }
+}
+
+#[tokio::test]
+#[ignore = "live provider: gọi tường minh với --ignored"]
+async fn live_long_tool_arguments_arrive_intact_and_run_only_after_finished() {
+    let (Some(key), Some(base), Some(model)) = (
+        env("G0_OPENAI_API_KEY").or_else(|| env("OPENAI_API_KEY")),
+        env("G0_OPENAI_BASE_URL"),
+        env("G0_OPENAI_MODEL"),
+    ) else {
+        panic!("BLOCKED: fill .env.live (see .env.live.example) or set G0_OPENAI_BASE_URL, G0_OPENAI_MODEL, G0_OPENAI_API_KEY");
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let prompt = dir.path().join("agent.md");
+    std::fs::write(
+        &prompt,
+        "You record data with the record_items tool. Always call it exactly once with all \
+         items requested, then confirm in one short sentence.",
+    )
+    .unwrap();
+    let cfg = OrchestratorConfig::new(
+        LlmConfig {
+            providers: vec![LlmProviderConfig {
+                id: "live".into(),
+                backend: LlmBackend::OpenAiCompatible,
+                endpoint: Some(base),
+                auth: ProviderAuth::ApiKey(SecretString::new(key)),
+                request_timeout: Duration::from_secs(90),
+            }],
+        },
+        vec![AgentDefinition::new("recorder", "live", model)
+            .with_mode(AgentMode::Primary)
+            .with_prompt_path(&prompt)
+            .with_allowed_tools(["record_items"])],
+        dir.path().join("store"),
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let o = Orchestrator::builder(cfg)
+        .register_tool(Arc::new(RecordItems(seen.clone())))
+        .build()
+        .await
+        .unwrap();
+    let who = CallerContext::new("live", "m6-args");
+    let sid = o.create_session(&who, "recorder").await.unwrap();
+    let mut sub = o.subscribe(&who, &sid).await.unwrap();
+    let events: Arc<Mutex<Vec<ExecutionEvent>>> = Arc::default();
+    let sink = events.clone();
+    tokio::spawn(async move {
+        while let Some(FeedItem::Event(e)) = sub.recv().await {
+            sink.lock().unwrap().push(e);
+        }
+    });
+
+    let turn = o
+        .submit(
+            &who,
+            &sid,
+            "Call record_items once with title 'letters' and 30 items: item-01-alpha-bravo-charlie \
+             through item-30-alpha-bravo-charlie (zero-padded numbers, same suffix)."
+                .into(),
+        )
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+    loop {
+        let r = o.result(&who, &sid, &turn.turn_id).await.unwrap();
+        if r.status != RunStatus::Running {
+            assert_eq!(r.status, RunStatus::Completed, "{:?}", r.error);
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "live run stuck");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let args = seen.lock().unwrap().clone();
+    assert_eq!(args.len(), 1, "tool phải chạy đúng một lần: {args:?}");
+    let items = args[0]["items"].as_array().expect("items array");
+    let expected: Vec<String> = (1..=30)
+        .map(|i| format!("item-{i:02}-alpha-bravo-charlie"))
+        .collect();
+    let got: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
+    println!("items received: {}", got.len());
+    assert_eq!(got, expected, "arguments phải đến nguyên vẹn");
+
+    let events = events.lock().unwrap().clone();
+    let pos = |ty: &str| events.iter().position(|e| e.event_type == ty).unwrap();
+    let first_step_ended = pos("step.ended");
+    let committed = pos("message.committed");
+    let started = pos("tool.started");
+    assert!(first_step_ended < committed && committed <= started);
+    o.shutdown().await.unwrap();
+}

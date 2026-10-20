@@ -13,7 +13,7 @@ use crate::agent::{AgentDefinition, AgentMode, AgentRegistry};
 use crate::config::{OrchestratorConfig, ProviderAuth, RuntimeConfig};
 use crate::error::{ConfigReason, ErrorCode, OrchestratorError};
 use crate::executor::{replay_safe_names, Settled, ToolExecutor, ToolLimits};
-use crate::feed::{Emitter, ExecutionFeed, Subscription};
+use crate::feed::{event, Emitter, ExecutionFeed, Subscription};
 use crate::gateway::{ClientGateway, LlmGateway};
 use crate::owner_lock::OwnerLock;
 use crate::prompt::PromptBuilder;
@@ -232,7 +232,7 @@ impl Orchestrator {
             .committed_session(
                 session_id,
                 None,
-                "session.changed",
+                event::SESSION_CHANGED,
                 serde_json::json!({ "reason": "archived" }),
             )
             .await;
@@ -347,7 +347,7 @@ impl Orchestrator {
             .committed_session(
                 session_id,
                 None,
-                "session.changed",
+                event::SESSION_CHANGED,
                 serde_json::json!({
                     "reason": "invocation_resolved",
                     "invocation_id": invocation_id,

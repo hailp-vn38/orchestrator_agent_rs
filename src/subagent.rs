@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentDefinition, AgentMode};
-use crate::feed::Emitter;
+use crate::feed::{event, Emitter};
 use crate::gateway::ModelTool;
 use crate::store::{ChildAdmission, ChildAdmitError, ChildTarget, RunRoute, SessionStore};
 use crate::supervisor::AdmissionSignal;
@@ -197,7 +197,7 @@ impl TaskManager {
                 .committed_session(
                     &scope.session_id,
                     Some(&scope.run_id),
-                    "session.changed",
+                    event::SESSION_CHANGED,
                     serde_json::json!({
                         "reason": "child_created",
                         "child_session_id": admission.session_id,

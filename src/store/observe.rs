@@ -115,14 +115,15 @@ impl SessionStore {
         root_id: &str,
         limit: u32,
     ) -> Result<FamilySnapshot, OrchestratorError> {
-        let scope = self.authorize(caller, root_id).await?;
+        // Authorization và đọc cùng một transaction: không có cửa sổ giữa kiểm quyền và dữ liệu.
+        let mut tx = self.pool.begin().await.map_err(db("begin snapshot"))?;
+        let scope = super::authorize_on(&mut tx, caller, root_id).await?;
         if scope.is_child {
             return Err(OrchestratorError::new(
                 ErrorCode::InvalidInput,
                 "observation is addressed by the root session of a family",
             ));
         }
-        let mut tx = self.pool.begin().await.map_err(db("begin snapshot"))?;
         let rows = sqlx::query(
             "SELECT id, parent_session_id, agent_id, status, state_revision FROM sessions \
              WHERE (id = ?1 OR parent_session_id = ?1) AND owner_id = ?2 AND workspace_id = ?3 \

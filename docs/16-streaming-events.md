@@ -239,6 +239,12 @@ MVP dùng **một concrete `tokio::sync::broadcast` channel** cho server process
 | ST-15 | Revision 16 publish trước revision 15 | Snapshot refresh lên ít nhất 16, không mất committed state dù bỏ event 15. |
 | ST-16 | Terminal DB commit nhưng notification mất trong lúc SSE vẫn sống | Active-run periodic snapshot hội tụ canonical terminal state mà không chờ reconnect. |
 
+## 16.11a. Quyết định triển khai M6
+
+- `subscribe`/`snapshot` nhận **Root** của family; child id (kể cả của chính owner) trả `INVALID_INPUT`, child được thấy qua snapshot theo ancestry trong SQLite. Authorization và đọc snapshot cùng một read transaction.
+- Snapshot/history trả text canonical nguyên văn; redaction secret chỉ áp cho text ephemeral (`text.delta`, `tool.progress`). Snapshot không chứa arguments/kết quả/progress của tool.
+- `tool.progress` có `percent` tùy chọn (0..=100); revision trên event được đọc sau commit nên hai event liên tiếp có thể cùng revision. Chi tiết: [evidence M6](evidence/m6.md).
+
 ## 16.12. OpenCode reference & differences
 
 - [Event schema (durable / ephemeral)](https://github.com/anomalyco/opencode/blob/dev/packages/schema/src/session-event.ts)

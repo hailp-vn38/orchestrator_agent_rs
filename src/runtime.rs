@@ -30,7 +30,7 @@ use tracing::{info, warn, Instrument};
 use crate::agent::AgentDefinition;
 use crate::compaction::{estimate_tokens, plan, SUMMARY_SYSTEM};
 use crate::executor::{Dispatch, Effective, Prepared, ToolExecutor, CODE_OUTCOME_UNKNOWN};
-use crate::feed::{chunks, Emitter};
+use crate::feed::{chunks, event, tool_payload, Emitter};
 use crate::gateway::{
     GatewayError, LlmGateway, ModelMessage, ModelRequest, ModelResponse, ModelRole, StreamEvent,
 };
@@ -132,7 +132,11 @@ impl AgentRuntime {
         };
         tracing::Span::current().record("session_id", tracing::field::display(&run.session_id));
         self.emitter
-            .committed_run(run_id, "run.started", json!({ "agent_id": run.agent_id }))
+            .committed_run(
+                run_id,
+                event::RUN_STARTED,
+                json!({ "agent_id": run.agent_id }),
+            )
             .await;
         let Some(agent) = self.agents.get(&run.agent_id) else {
             return self.fail(run_id, GatewayError::NotConfigured).await;
@@ -193,7 +197,7 @@ impl AgentRuntime {
                             self.emitter
                                 .committed_run(
                                     run_id,
-                                    "message.committed",
+                                    event::MESSAGE_COMMITTED,
                                     json!({
                                         "message_id": message_id,
                                         "role": "assistant",
@@ -252,7 +256,7 @@ impl AgentRuntime {
             self.emitter
                 .committed_run(
                     run_id,
-                    "message.committed",
+                    event::MESSAGE_COMMITTED,
                     json!({
                         "role": "assistant",
                         "step_id": step_id,
@@ -265,12 +269,8 @@ impl AgentRuntime {
                 self.emitter
                     .committed_run(
                         run_id,
-                        "tool.started",
-                        json!({
-                            "tool_call_id": inv.tool_call_id,
-                            "invocation_id": inv.id,
-                            "tool_name": inv.tool_name,
-                        }),
+                        event::TOOL_STARTED,
+                        tool_payload(&inv.id, &inv.tool_call_id, &inv.tool_name),
                     )
                     .await;
             }
@@ -352,7 +352,7 @@ impl AgentRuntime {
             root,
             session,
             Some(run_id),
-            "step.started",
+            event::STEP_STARTED,
             json!({ "step_id": step_id }),
         );
         let filter = Mutex::new(feed.delta_filter());
@@ -363,7 +363,7 @@ impl AgentRuntime {
                     root,
                     session,
                     Some(run_id),
-                    "text.delta",
+                    event::TEXT_DELTA,
                     json!({
                         "step_id": step_id,
                         "delta_index": next_index.fetch_add(1, Ordering::Relaxed),
@@ -395,7 +395,7 @@ impl AgentRuntime {
             }),
             Err(e) => json!({ "step_id": step_id, "completed": false, "error_code": e.code() }),
         };
-        feed.ephemeral(root, session, Some(run_id), "step.ended", ended);
+        feed.ephemeral(root, session, Some(run_id), event::STEP_ENDED, ended);
         result
     }
 
@@ -448,7 +448,7 @@ impl AgentRuntime {
             run.root_session_id(),
             &run.session_id,
             Some(&run.run_id),
-            "compaction.started",
+            event::COMPACTION_STARTED,
             json!({}),
         );
         let request = ModelRequest {
@@ -480,7 +480,7 @@ impl AgentRuntime {
             .map_err(|_| GatewayError::Protocol)?;
         if written {
             self.emitter
-                .committed_run(&run.run_id, "compaction.completed", json!({}))
+                .committed_run(&run.run_id, event::COMPACTION_COMPLETED, json!({}))
                 .await;
         }
         Ok(written)
@@ -565,20 +565,17 @@ impl AgentRuntime {
         {
             Ok(true) => {
                 // Chỉ sau khi tool-result + terminal state đã commit.
+                let mut payload = tool_payload(&inv.id, &inv.tool_call_id, &inv.tool_name);
+                payload["error_code"] = json!(settled.error_code);
                 self.emitter
                     .committed_run(
                         run_id,
                         if settled.failed {
-                            "tool.failed"
+                            event::TOOL_FAILED
                         } else {
-                            "tool.completed"
+                            event::TOOL_COMPLETED
                         },
-                        json!({
-                            "tool_call_id": inv.tool_call_id,
-                            "invocation_id": inv.id,
-                            "tool_name": inv.tool_name,
-                            "error_code": settled.error_code,
-                        }),
+                        payload,
                     )
                     .await;
                 None

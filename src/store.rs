@@ -512,36 +512,12 @@ impl SessionStore {
         caller: &CallerContext,
         session_id: &str,
     ) -> Result<SessionScope, OrchestratorError> {
-        let row = sqlx::query(
-            "SELECT owner_id, workspace_id, status, agent_id, parent_session_id \
-             FROM sessions WHERE id = ?1",
-        )
-        .bind(session_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db("load session"))?;
-        let Some(row) = row else {
-            return Err(OrchestratorError::new(
-                ErrorCode::NotFound,
-                "session not found",
-            ));
-        };
-        let owner: String = row.try_get("owner_id").map_err(db("read owner"))?;
-        let workspace: String = row.try_get("workspace_id").map_err(db("read workspace"))?;
-        if owner != caller.owner_id || workspace != caller.workspace_id {
-            return Err(OrchestratorError::new(
-                ErrorCode::PermissionDenied,
-                "the session is outside the caller's scope",
-            ));
-        }
-        let status: String = row.try_get("status").map_err(db("read status"))?;
-        let parent: Option<String> = row
-            .try_get("parent_session_id")
-            .map_err(db("read parent"))?;
-        Ok(SessionScope {
-            archived: status == "archived",
-            is_child: parent.is_some(),
-        })
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(db("acquire connection"))?;
+        authorize_on(&mut conn, caller, session_id).await
     }
 
     pub(crate) async fn running_run_ids(&self) -> Result<Vec<String>, OrchestratorError> {
@@ -1445,6 +1421,44 @@ async fn claim_sequence(
         row.try_get("id").map_err(db("read session"))?,
         row.try_get("seq").map_err(db("read sequence"))?,
     )))
+}
+
+/// Kiểm tra owner/workspace trên một connection cho trước (để dùng trong read transaction).
+async fn authorize_on(
+    conn: &mut sqlx::SqliteConnection,
+    caller: &CallerContext,
+    session_id: &str,
+) -> Result<SessionScope, OrchestratorError> {
+    let row = sqlx::query(
+        "SELECT owner_id, workspace_id, status, agent_id, parent_session_id \
+         FROM sessions WHERE id = ?1",
+    )
+    .bind(session_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(db("load session"))?;
+    let Some(row) = row else {
+        return Err(OrchestratorError::new(
+            ErrorCode::NotFound,
+            "session not found",
+        ));
+    };
+    let owner: String = row.try_get("owner_id").map_err(db("read owner"))?;
+    let workspace: String = row.try_get("workspace_id").map_err(db("read workspace"))?;
+    if owner != caller.owner_id || workspace != caller.workspace_id {
+        return Err(OrchestratorError::new(
+            ErrorCode::PermissionDenied,
+            "the session is outside the caller's scope",
+        ));
+    }
+    let status: String = row.try_get("status").map_err(db("read status"))?;
+    let parent: Option<String> = row
+        .try_get("parent_session_id")
+        .map_err(db("read parent"))?;
+    Ok(SessionScope {
+        archived: status == "archived",
+        is_child: parent.is_some(),
+    })
 }
 
 struct SessionScope {

@@ -41,6 +41,8 @@ enum Behavior {
     Burst(usize),
     /// Progress chứa secret.
     LeakProgress,
+    /// Progress có phần trăm (kể cả giá trị vượt 100).
+    Percent,
     Sleep(Duration),
 }
 
@@ -100,6 +102,11 @@ impl HostTool for Probe {
                 for i in 0..*n {
                     ctx.progress(&format!("tick {i}"));
                 }
+            }
+            Behavior::Percent => {
+                ctx.progress("half");
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                ctx.progress_with_percent("done soon", 250);
             }
             Behavior::LeakProgress => ctx.progress(&format!("auth header {API_KEY} sent")),
             Behavior::Sleep(d) => tokio::time::sleep(*d).await,
@@ -1535,4 +1542,24 @@ async fn at27_st02_tool_runs_only_after_the_response_finished_and_calls_are_pers
     let done = position(&events, |e| e.event_type == "tool.completed");
     // Finished → persist assistant+invocation → mới dispatch tool.
     assert!(ended < committed && committed <= started && started < done);
+}
+
+#[tokio::test]
+async fn progress_percent_is_optional_and_clamped() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    gw.push_response(call("c1", "probe", probe_args()));
+    gw.push_text("done");
+    let (probe, _) = Probe::new("probe", ToolEffect::ReadOnly, Behavior::Percent);
+    let (o, sid) = single(&env, &gw, Some(probe)).await;
+    let col = collect(o.subscribe(&alice(), &sid).await.unwrap());
+    assert_eq!(run_turn(&o, &sid, "go").await, RunStatus::Completed);
+    col.wait_for("run.completed", |e| {
+        e.iter().any(|x| x.event_type == "run.completed")
+    })
+    .await;
+    let progress = col.of("tool.progress");
+    assert_eq!(progress.len(), 2);
+    assert!(progress[0].payload.get("percent").is_none());
+    assert_eq!(progress[1].payload["percent"], json!(100));
 }
