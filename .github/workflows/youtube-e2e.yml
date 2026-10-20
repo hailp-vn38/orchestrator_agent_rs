@@ -1,0 +1,44 @@
+name: YouTube E2E (offline)
+
+on:
+  push:
+    branches:
+      - feature/youtube-transcript-e2e
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - examples/youtube_flow.rs
+      - examples/youtube_flow/**
+      - tests/youtube_flow.rs
+      - .github/workflows/youtube-e2e.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - examples/youtube_flow.rs
+      - examples/youtube_flow/**
+      - tests/youtube_flow.rs
+      - .github/workflows/youtube-e2e.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy all targets
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Offline YouTube integration
+        run: cargo test --test youtube_flow -- --nocapture
+      - name: Build live example (no network call)
+        run: cargo build --example youtube_flow
