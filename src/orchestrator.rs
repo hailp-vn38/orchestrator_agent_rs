@@ -1,4 +1,4 @@
-//! Orchestrator handle + builder. M2: single-agent text + tool/skill loop trên SQLite store.
+//! Orchestrator handle + builder: single-agent text, tool/skill loop, parent–child trên SQLite store.
 //! Chỉ những gì đã hoạt động mới được expose. M5 thêm startup recovery, `cancel`,
 //! `resolve_interrupted_invocation` và shutdown nhiều pha.
 
@@ -226,7 +226,9 @@ impl Orchestrator {
         invocation_id: &str,
         decision: VerifiedToolResolution,
     ) -> Result<(), OrchestratorError> {
-        self.ensure_open()?;
+        // Resolution có thể tạo attempt mới: giữ cổng admission để shutdown không đóng giữa
+        // chừng và không có claim mồ côi sau khi supervisor đã dừng.
+        let _gate = self.supervisor.admission().await?;
         if !operator.can_resolve_interrupted {
             return Err(OrchestratorError::new(
                 ErrorCode::PermissionDenied,

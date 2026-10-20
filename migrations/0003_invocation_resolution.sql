@@ -4,3 +4,4 @@
 ALTER TABLE tool_invocations ADD COLUMN resolved_by TEXT;
 ALTER TABLE tool_invocations ADD COLUMN resolution_evidence TEXT;
 ALTER TABLE tool_invocations ADD COLUMN resolved_at INTEGER;
+
