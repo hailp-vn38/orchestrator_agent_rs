@@ -1,5 +1,7 @@
 # Spec triển khai baseline v5.0: gate GAP-04 → M0–M7
 
+> **Trạng thái G0: HOÀN THÀNH theo chấp thuận ngoại lệ của người dùng ngày 2026-10-20.** Người dùng yêu cầu “đánh dấu G0 hoàn thành” sau khi được thông báo các kiểm chứng còn thiếu. Compile, fake/fault 12/12 và OpenAI-compatible LAN smoke 6/6 đã đạt; provider thứ hai và operational validation còn thiếu được chấp nhận không chặn chuyển sang M0. Đây là ngoại lệ cho gate G0 trong lần triển khai này, không phải xác nhận toàn bộ GAP-04/AT-48 đã PASS. Giữ nguyên các yêu cầu acceptance provider thật và operational evidence của các mốc tiếp theo/final MVP. Xem [evidence G0](../evidence/g0-spike.md). Các điều kiện GO/NO-GO bên dưới là tiêu chí kỹ thuật gốc; ngoại lệ này thay thế việc dùng chúng để chặn M0.
+
 ## Problem Statement
 
 Host Rust cần một library điều phối Root/Subagent có thể nhúng vào Tokio hiện có, chạy tác vụ dài, phục hồi an toàn và truy vấn kết quả/artifacts sau disconnect hoặc restart. Baseline v5.0 đã Accepted về thiết kế nhưng repository hiện chỉ có tài liệu, chưa có Rust implementation, Cargo build, provider smoke hay fault-test evidence. Nếu triển khai thẳng toàn bộ roadmap dựa trên các Rust snippets minh họa, khác biệt API/capability của crate `llm` và provider có thể làm vô hiệu các giả định streaming, tool pairing và lifecycle.

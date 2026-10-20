@@ -1,0 +1,12 @@
+   Compiling g0-spike v0.0.0 (/Users/lamphuchai/Desktop/orchestrator_agent_rs/spikes/g0)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.29s
+     Running `target/debug/g0-spike live openai`
+== provider=openai backend=OpenAi model=gh/gpt-4o-mini endpoint=http://192.168.1.157:20128 fingerprint=2d74ed89cc46ab7b
+PASS text+system+finished: deltas=3 finish=end_turn
+PASS multi-turn: deltas=4
+PASS tool-call-assembly: calls=1 id_len=29 name=get_weather fragments_seen=6 finish=tool_use
+PASS tool-result-continuation: deltas=14 finish=end_turn
+PASS cancel: cancelled
+PASS timeout: llm_timeout
+elapsed_ms=5584
+live_overall=ALL_PASS
