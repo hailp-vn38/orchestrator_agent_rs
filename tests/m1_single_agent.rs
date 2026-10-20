@@ -338,13 +338,13 @@ async fn at50_second_instance_fails_until_owner_releases_safely() {
         ErrorCode::ShuttingDown
     );
 
-    let second = env.build(&gw).await;
-    // Run bị shutdown ngắt không bị replay và không kẹt session.
-    let r = second.result(&alice(), &sid, &t.turn_id).await.unwrap();
-    assert_eq!(r.status, RunStatus::Interrupted);
-    assert_eq!(r.output, None);
-    assert_eq!(r.error.unwrap().code, "SHUTTING_DOWN");
+    // M5: run bị shutdown ngắt (`interrupted`/SHUTTING_DOWN) được phục hồi an toàn ở lần khởi
+    // động sau bằng attempt mới giữ `turn_id` — không kẹt session, không chạy lại tool nào.
     gw.release();
+    let second = env.build(&gw).await;
+    let r = wait_terminal(&second, &alice(), &sid, &t.turn_id).await;
+    assert_eq!(r.status, RunStatus::Completed, "{:?}", r.error);
+    assert_eq!(r.attempt, 1, "the same turn resumes as a new attempt");
     let t2 = second.submit(&alice(), &sid, "next".into()).await.unwrap();
     assert_eq!(
         wait_terminal(&second, &alice(), &sid, &t2.turn_id)
@@ -356,30 +356,52 @@ async fn at50_second_instance_fails_until_owner_releases_safely() {
 }
 
 #[tokio::test]
-async fn running_runs_left_by_a_dead_process_are_interrupted_not_stuck() {
+async fn running_runs_left_by_a_dead_process_are_resumed_not_stuck() {
     let env = Env::new();
     let gw = ScriptedGateway::new();
     let o = env.build(&gw).await;
     let sid = o.create_session(&alice(), "root").await.unwrap();
+    let fingerprint = o.provider_fingerprint("fake").unwrap().to_owned();
     o.shutdown().await.unwrap();
     drop(o);
 
     // Giả lập process chết khi run còn `running` (không có shutdown).
     let mut conn = env.sql().await;
     sqlx::query(
-        "INSERT INTO agent_runs(id, session_id, agent_id, turn_id, provider_id, model_id, status) \
-         VALUES('stale', ?1, 'root', 'turn-stale', 'fake', 'model-x', 'running')",
+        "INSERT INTO messages(id, session_id, sequence, role, content_json) \
+         VALUES('m-stale', ?1, 1, 'user', '{\"text\":\"hello\"}')",
     )
     .bind(&sid)
     .execute(&mut conn)
     .await
     .unwrap();
+    sqlx::query("UPDATE sessions SET next_sequence = 2 WHERE id = ?1")
+        .bind(&sid)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO agent_runs(id, session_id, agent_id, turn_id, provider_id, model_id, \
+         provider_config_fingerprint, status) \
+         VALUES('stale', ?1, 'root', 'turn-stale', 'fake', 'model-x', ?2, 'running')",
+    )
+    .bind(&sid)
+    .bind(&fingerprint)
+    .execute(&mut conn)
+    .await
+    .unwrap();
 
+    // Không có tool dang dở và routing identity không đổi → attempt mới giữ `turn_id` (M5).
     let o2 = env.build(&gw).await;
-    let r = o2.result(&alice(), &sid, "turn-stale").await.unwrap();
-    assert_eq!(r.status, RunStatus::Interrupted);
-    assert_eq!(r.error.unwrap().code, "INTERRUPTED");
-    assert_eq!(gw.call_count(), 0, "unowned stale run must not be replayed");
+    let r = wait_terminal(&o2, &alice(), &sid, "turn-stale").await;
+    assert_eq!(r.status, RunStatus::Completed, "{:?}", r.error);
+    assert_eq!(r.attempt, 1);
+    assert_eq!(r.output.as_deref(), Some("echo: hello"));
+    assert_eq!(
+        gw.call_count(),
+        1,
+        "one model request for the resumed attempt"
+    );
     // Session không còn bị chặn bởi claim cũ.
     let t = o2.submit(&alice(), &sid, "ok".into()).await.unwrap();
     wait_terminal(&o2, &alice(), &sid, &t.turn_id).await;

@@ -869,13 +869,21 @@ async fn shutdown_waits_for_cooperative_tool_and_commits_its_result() {
     )
     .await
     .unwrap();
-    let r = o2.result(&alice(), &sid, &turn.turn_id).await.unwrap();
-    assert_eq!(r.status, RunStatus::Interrupted);
+    // M5: tool ReadOnly đã settle trước khi shutdown nên attempt bị ngắt được resume ở lần
+    // khởi động sau; result đã commit giữ nguyên và tool không bị chạy lại.
+    let r = wait_terminal(&o2, &sid, &turn.turn_id).await;
+    assert_eq!(r.status, RunStatus::Completed, "{:?}", r.error);
+    assert_eq!(r.attempt, 1);
     let h = history(&o2, &sid).await;
     assert_eq!(
         tool_messages(&h)[0].text,
         "stopped",
         "result of the cooperative tool committed"
+    );
+    assert_eq!(
+        tool_messages(&h).len(),
+        1,
+        "the tool result is not duplicated"
     );
     assert_eq!(gw.call_count(), 1, "no LLM step after cancel");
 }

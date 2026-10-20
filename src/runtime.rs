@@ -12,7 +12,11 @@
 //!
 //! Executor chỉ trả outcome; không module nào khác ghi transcript. Outcome không xác định
 //! (process chết giữa chừng, commit result lỗi, timeout/panic của tool Mutating) **không bao
-//! giờ** bị replay: run chuyển `interrupted` (reconcile đầy đủ thuộc M5).
+//! giờ** bị replay: run chuyển `interrupted`; phục hồi/reconcile nằm ở `store::recovery`
+//! (M5) và chỉ tạo attempt mới khi an toàn.
+//!
+//! M5: hủy hợp tác có hai nguồn — shutdown (`interrupted`/`SHUTTING_DOWN`, phục hồi được) và
+//! `cancel` của host (`cancelled`/`CANCELLED`, terminal).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -27,7 +31,9 @@ use crate::gateway::{
     GatewayError, LlmGateway, ModelMessage, ModelRequest, ModelResponse, ModelRole, StreamEvent,
 };
 use crate::prompt::{context_messages, PromptBuilder};
-use crate::store::{NewCheckpoint, PendingInvocation, RunRecord, SessionStore, StoredToolCall};
+use crate::store::{
+    NewCheckpoint, PendingInvocation, RunRecord, SessionStore, StoredToolCall, CODE_SHUTTING_DOWN,
+};
 use crate::tool::ToolScope;
 use crate::types::RunStatus;
 
@@ -64,6 +70,8 @@ pub(crate) struct AgentRuntime {
     /// Snapshot definition lúc build (không hot reload).
     agents: HashMap<String, AgentDefinition>,
     context: ContextPolicy,
+    /// Token shutdown của engine: phân biệt hủy do shutdown với `cancel` của host.
+    shutdown: CancellationToken,
 }
 
 /// Kết luận của một bước điều phối: tiếp tục vòng lặp hay kết thúc `execute`.
@@ -81,6 +89,7 @@ impl AgentRuntime {
         executor: ToolExecutor,
         agents: HashMap<String, AgentDefinition>,
         context: ContextPolicy,
+        shutdown: CancellationToken,
     ) -> Self {
         Self {
             store,
@@ -89,6 +98,7 @@ impl AgentRuntime {
             executor,
             agents,
             context,
+            shutdown,
         }
     }
 
@@ -452,11 +462,12 @@ impl AgentRuntime {
 
     async fn fail(&self, run_id: &str, error: GatewayError) -> bool {
         let (status, code, message) = match error {
-            GatewayError::Cancelled => (
+            GatewayError::Cancelled if self.shutdown.is_cancelled() => (
                 RunStatus::Interrupted,
-                "SHUTTING_DOWN",
+                CODE_SHUTTING_DOWN,
                 "the run was interrupted by shutdown",
             ),
+            GatewayError::Cancelled => (RunStatus::Cancelled, "CANCELLED", "the run was cancelled"),
             GatewayError::Timeout => (RunStatus::TimedOut, error.code(), error.message()),
             _ => (RunStatus::Failed, error.code(), error.message()),
         };

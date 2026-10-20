@@ -1,5 +1,7 @@
 //! Public value types của command/read interface (docs/18 §18.4.2).
 
+use crate::tool::ToolOutcome;
+
 /// Principal đã được host xác thực. Không bao giờ deserialize từ input của LLM/client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallerContext {
@@ -21,6 +23,55 @@ impl CallerContext {
 pub struct AcceptedTurn {
     pub session_id: String,
     pub turn_id: String,
+}
+
+/// Operator đã được host xác thực **và** cấp capability reconcile. Không bao giờ deserialize
+/// từ input của LLM/client: host mint sau khi kiểm tra AuthN/AuthZ; engine kiểm tra lại
+/// owner/workspace và capability trước khi chấp nhận [`VerifiedToolResolution`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OperatorContext {
+    /// Danh tính ghi vào audit (không secret).
+    pub operator_id: String,
+    pub owner_id: String,
+    pub workspace_id: String,
+    /// Capability reconcile tool outcome không xác định. Mặc định `false`.
+    pub can_resolve_interrupted: bool,
+}
+
+impl OperatorContext {
+    /// Operator **chưa** có capability; gọi [`Self::with_resolve_capability`] sau khi host
+    /// đã xác minh quyền.
+    pub fn new(
+        operator_id: impl Into<String>,
+        owner_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            operator_id: operator_id.into(),
+            owner_id: owner_id.into(),
+            workspace_id: workspace_id.into(),
+            can_resolve_interrupted: false,
+        }
+    }
+
+    pub fn with_resolve_capability(mut self) -> Self {
+        self.can_resolve_interrupted = true;
+        self
+    }
+}
+
+/// Kết luận reconcile do operator xác minh bằng hệ thống nguồn (không phải suy đoán của model).
+#[derive(Debug, Clone)]
+pub enum VerifiedToolResolution {
+    /// Tool đã hoàn tất: `outcome` thành tool-result (bounded như outcome thường).
+    /// `outcome.call_id` phải là provider call ID của chính invocation.
+    ConfirmedCompleted {
+        outcome: ToolOutcome,
+        evidence: String,
+    },
+    /// Tool không tạo effect: invocation thành technical failure, **không** auto replay.
+    ConfirmedNoEffect { evidence: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

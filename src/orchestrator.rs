@@ -1,25 +1,29 @@
 //! Orchestrator handle + builder. M2: single-agent text + tool/skill loop trên SQLite store.
-//! Chỉ những gì đã hoạt động mới được expose; child/compaction/recovery đầy đủ đến ở M3+.
+//! Chỉ những gì đã hoạt động mới được expose. M5 thêm startup recovery, `cancel`,
+//! `resolve_interrupted_invocation` và shutdown nhiều pha.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentDefinition, AgentMode, AgentRegistry};
 use crate::config::{OrchestratorConfig, RuntimeConfig};
 use crate::error::{ConfigReason, ErrorCode, OrchestratorError};
-use crate::executor::{ToolExecutor, ToolLimits};
+use crate::executor::{replay_safe_names, Settled, ToolExecutor, ToolLimits};
 use crate::gateway::{ClientGateway, LlmGateway};
 use crate::owner_lock::OwnerLock;
 use crate::prompt::PromptBuilder;
 use crate::runtime::{AgentRuntime, ContextPolicy};
 use crate::skill::SkillManager;
-use crate::store::{RunRoute, SessionStore, DB_FILE};
+use crate::store::{RecoveryPolicy, Resolution, RunRoute, SessionStore, CODE_NO_EFFECT, DB_FILE};
 use crate::subagent::TaskManager;
 use crate::supervisor::{AdmissionSignal, Supervisor};
 use crate::tool::{validate_descriptor, HostTool, ToolDescriptor};
 use crate::types::{
-    AcceptedTurn, AgentResult, CallerContext, MessageView, Page, PageRequest, SessionPolicy,
+    AcceptedTurn, AgentResult, CallerContext, MessageView, OperatorContext, Page, PageRequest,
+    RunStatus, SessionPolicy, VerifiedToolResolution,
 };
 
 const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 64 * 1024;
@@ -28,6 +32,9 @@ const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 64 * 1024;
 const BASE_INSTRUCTIONS: &str = include_str!("base_instructions.md");
 const BASE_VERSION_PREFIX: &str = "<!-- base-instructions-version: ";
 const OWNER_LOCK_FILE: &str = "owner.lock";
+/// Trần độ dài evidence/operator id trong audit (ký tự).
+const EVIDENCE_MAX_CHARS: usize = 2000;
+const OPERATOR_ID_MAX_CHARS: usize = 128;
 
 pub struct Orchestrator {
     base_version: u32,
@@ -37,6 +44,9 @@ pub struct Orchestrator {
     store: SessionStore,
     supervisor: Supervisor,
     runtime: RuntimeConfig,
+    /// Tool replay-safe (xem `replay_safe_names`) cho policy recovery sau operator resolve.
+    replay_safe: BTreeSet<String>,
+    limits: ToolLimits,
 }
 
 pub struct OrchestratorBuilder {
@@ -99,7 +109,7 @@ impl Orchestrator {
         agent_id: &str,
         policy: SessionPolicy,
     ) -> Result<String, OrchestratorError> {
-        self.ensure_open()?;
+        let _gate = self.supervisor.admission().await?;
         let agent = self
             .registry
             .get(agent_id)
@@ -123,7 +133,9 @@ impl Orchestrator {
         session_id: &str,
         text: String,
     ) -> Result<AcceptedTurn, OrchestratorError> {
-        self.ensure_open()?;
+        // Giữ cổng admission tới khi commit xong: shutdown không đóng giữa chừng và submit sau
+        // shutdown bị từ chối trước commit.
+        let _gate = self.supervisor.admission().await?;
         if text.trim().is_empty() {
             return Err(OrchestratorError::new(
                 ErrorCode::InvalidInput,
@@ -172,11 +184,132 @@ impl Orchestrator {
         self.store.archive_session(caller, session_id).await
     }
 
-    /// Dừng admission, hủy hợp tác run đang chạy (→ `interrupted`), join trong
-    /// `shutdown_grace`, đóng store rồi nhả owner lock. Quá grace trả lỗi và giữ lock.
-    /// Cancel/lifecycle đầy đủ (kể cả non-cooperative tool) hoàn thiện ở M5.
+    /// Hủy hợp tác run đang active của session (và child đang
+    /// được nó chờ), trả về khi yêu cầu hủy đã được chấp nhận. Run kết thúc `cancelled`
+    /// (terminal, không tự resume); tool Mutating đang chạy tự dừng theo cờ hợp tác và effect
+    /// ngoài hệ thống không được đảo ngược. Idempotent: không có run active thì `Ok`.
+    pub async fn cancel(
+        &self,
+        caller: &CallerContext,
+        session_id: &str,
+    ) -> Result<(), OrchestratorError> {
+        self.ensure_open()?;
+        self.store.check_scope(caller, session_id).await?;
+        // Parent trước child: parent dừng trước nên không ghi kết quả "child bị hủy" giả.
+        for run_id in self.store.active_run_family(session_id).await? {
+            if !self.supervisor.cancel_run(&run_id) {
+                // Claim chưa có worker: ghi terminal trực tiếp; nếu worker vừa spawn thì hủy nốt.
+                self.store
+                    .finish_run_without_final(
+                        &run_id,
+                        RunStatus::Cancelled,
+                        "CANCELLED",
+                        "the run was cancelled",
+                    )
+                    .await?;
+                self.supervisor.cancel_run(&run_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Operator-only: reconcile invocation `interrupted` (outcome không xác định) bằng kết luận
+    /// đã xác minh. Chỉ nhận **internal** `invocation_id`. Tool-result, terminal update và audit
+    /// commit trong một transaction **trước** khi supervisor resume; không bao giờ replay tool.
+    /// `ConfirmedNoEffect` thành technical failure. Resume bị chặn tiếp (vd. routing identity đổi,
+    /// còn invocation khác chưa resolve) thì resolution vẫn được ghi và trạng thái hiện trong
+    /// `result`.
+    pub async fn resolve_interrupted_invocation(
+        &self,
+        operator: &OperatorContext,
+        session_id: &str,
+        invocation_id: &str,
+        decision: VerifiedToolResolution,
+    ) -> Result<(), OrchestratorError> {
+        self.ensure_open()?;
+        if !operator.can_resolve_interrupted {
+            return Err(OrchestratorError::new(
+                ErrorCode::PermissionDenied,
+                "the operator is not allowed to resolve interrupted invocations",
+            ));
+        }
+        let invalid = |m: &str| OrchestratorError::new(ErrorCode::InvalidInput, m.to_owned());
+        let clean = |s: &str, max: usize| {
+            let t = s.trim();
+            !t.is_empty() && t.chars().count() <= max && !t.chars().any(char::is_control)
+        };
+        if !clean(&operator.operator_id, OPERATOR_ID_MAX_CHARS) {
+            return Err(invalid("operator_id must be 1..=128 printable characters"));
+        }
+        let (outcome_call_id, settled, evidence) = match decision {
+            VerifiedToolResolution::ConfirmedCompleted { outcome, evidence } => {
+                let call_id = outcome.call_id.clone();
+                let settled = self.limits.settle(Ok(outcome));
+                if settled.failed {
+                    return Err(invalid(
+                        "the confirmed outcome exceeds the persistence limits",
+                    ));
+                }
+                (Some(call_id), settled, evidence)
+            }
+            VerifiedToolResolution::ConfirmedNoEffect { evidence } => (
+                None,
+                Settled::failure(
+                    CODE_NO_EFFECT,
+                    "the operator confirmed the tool had no effect; it was not replayed",
+                ),
+                evidence,
+            ),
+        };
+        if !clean(&evidence, EVIDENCE_MAX_CHARS) {
+            return Err(invalid("evidence must be 1..=2000 printable characters"));
+        }
+        self.store
+            .resolve_invocation(
+                (&operator.owner_id, &operator.workspace_id),
+                session_id,
+                invocation_id,
+                &Resolution {
+                    operator_id: operator.operator_id.trim().to_owned(),
+                    evidence: evidence.trim().to_owned(),
+                    outcome_call_id,
+                    settled,
+                },
+            )
+            .await?;
+        tracing::info!(
+            session_id,
+            invocation_id,
+            operator_id = %operator.operator_id.trim(),
+            "interrupted invocation resolved by an operator"
+        );
+        let route = |agent_id: &str| route_of(self.registry.get(agent_id)?, &self.fingerprints);
+        let replay_safe = |tool: &str| self.replay_safe.contains(tool);
+        let policy = RecoveryPolicy {
+            max_resume_attempt: self.runtime.max_resume_attempts,
+            route: &route,
+            replay_safe: &replay_safe,
+        };
+        match self
+            .store
+            .recover_after_resolution(session_id, &policy)
+            .await
+        {
+            Ok(report) if report.resumed > 0 => self.supervisor.notify_admitted(),
+            Ok(_) => {}
+            // Resolution đã commit; lần startup sau sẽ tự phục hồi.
+            Err(_) => tracing::warn!(session_id, "resume after resolution could not be recorded"),
+        }
+        Ok(())
+    }
+
+    /// Dừng admission, drain có hạn, hủy hợp tác, quiesce/join rồi mới đóng store và nhả owner
+    /// lock. Quá `shutdown_grace` mà còn task có thể ghi: trả lỗi **incomplete** và giữ lock.
+    /// Run bị ngắt là `interrupted` (phục hồi ở lần khởi động sau); không giả completed/cancelled.
     pub async fn shutdown(&self) -> Result<(), OrchestratorError> {
-        self.supervisor.shutdown(self.runtime.shutdown_grace).await
+        self.supervisor
+            .shutdown(self.runtime.shutdown_drain, self.runtime.shutdown_grace)
+            .await
     }
 
     fn ensure_open(&self) -> Result<(), OrchestratorError> {
@@ -322,7 +455,9 @@ impl OrchestratorBuilder {
             .map_err(|e| OrchestratorError::storage("create store dir", &e))?;
         let owner_lock = OwnerLock::acquire(&store_dir.join(OWNER_LOCK_FILE))?;
         let store = SessionStore::open(&store_dir.join(DB_FILE)).await?;
-        let interrupted = store.interrupt_stale_runs().await?;
+        // Dưới owner lock không còn process nào khác: mọi run `running` còn lại là của process
+        // đã chết. Đánh dấu interrupted trước, rồi mới quyết định resume/block (không replay).
+        let interrupted = store.mark_stale_runs_interrupted().await?;
         if interrupted > 0 {
             tracing::warn!(
                 interrupted,
@@ -335,22 +470,39 @@ impl OrchestratorBuilder {
             .list()
             .filter_map(|d| route_of(d, &fingerprints).map(|r| (d.id.clone(), r)))
             .collect();
+        let replay_safe = replay_safe_names(&tools);
+        let limits = ToolLimits {
+            timeout: self.config.runtime.tool_timeout,
+            model_cap_bytes: self.config.runtime.tool_output_cap_bytes,
+            hard_cap_bytes: self.config.runtime.tool_result_hard_cap_bytes,
+        };
+
+        // Startup recovery bounded (docs/15 §15.7): attempt mới giữ turn_id khi an toàn; outcome
+        // không xác định hoặc routing identity đổi thì chặn. Chạy trước khi supervisor spawn.
+        let report = store
+            .recover_all(&RecoveryPolicy {
+                max_resume_attempt: self.config.runtime.max_resume_attempts,
+                route: &|agent_id| routes.get(agent_id).cloned(),
+                replay_safe: &|tool| replay_safe.contains(tool),
+            })
+            .await?;
+        if report != Default::default() {
+            tracing::info!(
+                resumed = report.resumed,
+                blocked = report.blocked,
+                exhausted = report.exhausted,
+                "startup recovery finished"
+            );
+        }
+
         let tasks = TaskManager::new(store.clone(), &agents, routes, signal.clone());
-        let executor = ToolExecutor::new(
-            tools.clone(),
-            Arc::new(skills),
-            tasks,
-            ToolLimits {
-                timeout: self.config.runtime.tool_timeout,
-                model_cap_bytes: self.config.runtime.tool_output_cap_bytes,
-                hard_cap_bytes: self.config.runtime.tool_result_hard_cap_bytes,
-            },
-        );
+        let executor = ToolExecutor::new(tools.clone(), Arc::new(skills), tasks, limits);
 
         let gateway: Arc<dyn LlmGateway> = match self.gateway {
             Some(g) => g,
             None => Arc::new(ClientGateway::new(&self.config.llm.providers)),
         };
+        let shutdown = CancellationToken::new();
         let runtime = AgentRuntime::new(
             store.clone(),
             gateway,
@@ -362,6 +514,7 @@ impl OrchestratorBuilder {
                 threshold_percent: self.config.runtime.compaction_threshold_percent,
                 keep_recent: self.config.runtime.compaction_keep_recent,
             },
+            shutdown.clone(),
         );
         let supervisor = Supervisor::start(
             store.clone(),
@@ -369,6 +522,7 @@ impl OrchestratorBuilder {
             self.config.runtime.supervisor_sweep,
             owner_lock,
             signal,
+            shutdown,
         );
 
         Ok(Orchestrator {
@@ -379,6 +533,8 @@ impl OrchestratorBuilder {
             store,
             supervisor,
             runtime: self.config.runtime,
+            replay_safe,
+            limits,
         })
     }
 }

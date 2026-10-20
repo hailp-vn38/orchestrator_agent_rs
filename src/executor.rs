@@ -321,6 +321,28 @@ impl ToolExecutor {
     }
 
     fn settle(&self, result: Result<ToolOutcome, ToolError>) -> Settled {
+        self.limits.settle(result)
+    }
+}
+
+/// Tên tool có thể chạy lại an toàn khi outcome của lần chạy trước không xác định: `skill`
+/// (đọc), `subagent` (idempotent theo invocation ID) và tool khai báo `ReadOnly`. Tool Mutating
+/// hoặc không còn đăng ký không nằm trong tập này: phải reconcile, không replay.
+pub(crate) fn replay_safe_names(tools: &BTreeMap<String, Arc<dyn HostTool>>) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = tools
+        .iter()
+        .filter(|(_, t)| t.descriptor().effect == ToolEffect::ReadOnly)
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.insert(SKILL_TOOL.to_owned());
+    names.insert(SUBAGENT_TOOL.to_owned());
+    names
+}
+
+impl ToolLimits {
+    /// Chốt một outcome thành `Settled` (hard cap, model cap, metadata cap). Dùng chung cho
+    /// tool chạy bình thường và outcome do operator xác minh.
+    pub(crate) fn settle(&self, result: Result<ToolOutcome, ToolError>) -> Settled {
         match result {
             Err(e) => {
                 let code = if valid_code(&e.code) {
@@ -332,12 +354,12 @@ impl ToolExecutor {
             }
             Ok(outcome) => {
                 let len = outcome.content.len();
-                if len > self.limits.hard_cap_bytes {
+                if len > self.hard_cap_bytes {
                     return Settled::failure(
                         CODE_TOO_LARGE,
                         &format!(
                             "tool output is {len} bytes, over the {} byte persistence limit",
-                            self.limits.hard_cap_bytes
+                            self.hard_cap_bytes
                         ),
                     );
                 }
@@ -348,7 +370,7 @@ impl ToolExecutor {
                 };
                 Settled {
                     failed: false,
-                    model_text: truncate_utf8(&outcome.content, self.limits.model_cap_bytes),
+                    model_text: truncate_utf8(&outcome.content, self.model_cap_bytes),
                     result_json: json!({ "content": outcome.content, "metadata": metadata })
                         .to_string(),
                     error_code: None,

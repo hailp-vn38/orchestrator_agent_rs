@@ -7,7 +7,8 @@
 //! M2 (tools & skills): ToolExecutor, SkillManager, PromptBuilder, tool loop tuần tự.
 //! M3 (parent–child): tool `subagent` foreground, child session riêng, admission atomic.
 //! M4 (continuous): steps cap tùy chọn, auto compaction trong active turn, stream assembly.
-//! Recovery đầy đủ đến ở M5+.
+//! M5 (recovery & lifecycle): startup recovery bounded, operator reconciliation, cancel
+//! (parent → active child), shutdown drain/quiesce/join.
 
 mod agent;
 mod compaction;
@@ -41,6 +42,7 @@ pub use tool::{
     HostTool, ToolContext, ToolDescriptor, ToolEffect, ToolError, ToolOutcome, ToolScope,
 };
 pub use types::{
-    AcceptedTurn, AgentResult, CallerContext, MessageRole, MessageToolCall, MessageView, Page,
-    PageRequest, ResultError, RunStatus, SessionPolicy,
+    AcceptedTurn, AgentResult, CallerContext, MessageRole, MessageToolCall, MessageView,
+    OperatorContext, Page, PageRequest, ResultError, RunStatus, SessionPolicy,
+    VerifiedToolResolution,
 };

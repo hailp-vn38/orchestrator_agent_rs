@@ -10,6 +10,9 @@ use std::time::Duration;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
+mod recovery;
+pub(crate) use recovery::{RecoveryPolicy, Resolution, CODE_NO_EFFECT, CODE_SHUTTING_DOWN};
+
 use crate::error::{ErrorCode, OrchestratorError};
 use crate::executor::Settled;
 use crate::types::{
@@ -87,6 +90,8 @@ pub(crate) enum ChildAdmitError {
     AgentMismatch,
     DepthLimit,
     Busy,
+    /// Child session có turn mới nhất đang chờ operator reconcile (M5).
+    Blocked,
     RouteUnavailable,
     /// Lỗi lưu trữ; chi tiết đã ghi tracing ở `OrchestratorError::storage`.
     Store,
@@ -354,6 +359,15 @@ impl SessionStore {
         };
         let seq: i64 = row.try_get("seq").map_err(db("read sequence"))?;
         let agent_id: String = row.try_get("agent_id").map_err(db("read agent"))?;
+        // Turn mới nhất đang chờ reconcile outcome không xác định: không được đi tiếp tới
+        // model request kế tiếp (docs/18 §18.4.2 `RECOVERY_BLOCKED`).
+        if recovery::session_awaits_reconciliation(&mut tx, session_id).await? {
+            let _ = tx.rollback().await;
+            return Err(OrchestratorError::new(
+                ErrorCode::RecoveryBlocked,
+                "the session has an interrupted tool call whose outcome must be resolved first",
+            ));
+        }
         let Some(route) = resolve(&agent_id) else {
             let _ = tx.rollback().await;
             return Err(OrchestratorError::new(
@@ -455,6 +469,15 @@ impl SessionStore {
             }
             Ok(_) => OrchestratorError::new(ErrorCode::Internal, "turn admission was rejected"),
         }
+    }
+
+    /// Kiểm tra session tồn tại và nằm trong scope của caller (không đọc/ghi gì thêm).
+    pub(crate) async fn check_scope(
+        &self,
+        caller: &CallerContext,
+        session_id: &str,
+    ) -> Result<(), OrchestratorError> {
+        self.authorize(caller, session_id).await.map(|_| ())
     }
 
     /// Kiểm tra owner/workspace; dùng cho mọi read công khai.
@@ -971,6 +994,10 @@ impl SessionStore {
     /// Terminal không-completed (failed/timed_out/interrupted/cancelled). `Ok(false)`:
     /// run không còn `running`. Invocation chưa settle của run được đưa về terminal cùng
     /// transaction (không để `requested`/`running` treo) mà **không** giả outcome.
+    ///
+    /// `interrupted` là trạng thái có thể phục hồi (M5): invocation `running` (outcome chưa
+    /// biết) thành `interrupted`, còn invocation `requested` (chưa từng chạy) được **giữ**
+    /// `requested` để attempt phục hồi kế tiếp chạy chúng, không mất.
     pub(crate) async fn finish_run_without_final(
         &self,
         run_id: &str,
@@ -1004,9 +1031,11 @@ impl SessionStore {
         .execute(&mut *tx)
         .await
         .map_err(db("finish run"))?;
+        // `requested` chỉ được giữ cho run `interrupted` (có thể resume); mọi terminal khác
+        // đưa chúng về terminal vì run đó sẽ không chạy lại.
         sqlx::query(
             "UPDATE tool_invocations SET status = ?1, error_code = ?2, finished_at = unixepoch() \
-             WHERE run_id = ?3 AND status IN ('requested', 'running')",
+             WHERE run_id = ?3 AND (status = 'running' OR (status = 'requested' AND ?4))",
         )
         .bind(if status == RunStatus::Cancelled {
             "cancelled"
@@ -1015,43 +1044,12 @@ impl SessionStore {
         })
         .bind(error_code)
         .bind(run_id)
+        .bind(status != RunStatus::Interrupted)
         .execute(&mut *tx)
         .await
         .map_err(db("interrupt invocations"))?;
         tx.commit().await.map_err(db("commit terminal"))?;
         Ok(true)
-    }
-
-    /// Lúc build (đã giữ owner lock): run còn `running` từ process trước không có owner
-    /// nào nữa. Đánh dấu `interrupted` (cả invocation dang dở) để session không kẹt;
-    /// auto-resume/reconcile thuộc M5, **không replay** tool.
-    pub(crate) async fn interrupt_stale_runs(&self) -> Result<u64, OrchestratorError> {
-        let mut tx = self.pool.begin().await.map_err(db("begin stale scan"))?;
-        sqlx::query(
-            "UPDATE sessions SET state_revision = state_revision + 1, updated_at = unixepoch() \
-             WHERE id IN (SELECT session_id FROM agent_runs WHERE status = 'running')",
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(db("bump stale sessions"))?;
-        let n = sqlx::query(
-            "UPDATE agent_runs SET status = 'interrupted', error_code = 'INTERRUPTED', \
-             error_message = 'the process stopped before the run finished', \
-             finished_at = unixepoch() WHERE status = 'running'",
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(db("interrupt stale runs"))?
-        .rows_affected();
-        sqlx::query(
-            "UPDATE tool_invocations SET status = 'interrupted', error_code = 'INTERRUPTED', \
-             finished_at = unixepoch() WHERE status IN ('requested', 'running')",
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(db("interrupt stale invocations"))?;
-        tx.commit().await.map_err(db("commit stale scan"))?;
-        Ok(n)
     }
 
     pub(crate) async fn history_page(
@@ -1321,6 +1319,9 @@ async fn admit_child_inner(
             let child_agent: String = row.try_get("agent_id").map_err(db("read agent"))?;
             if child_agent != agent_id {
                 return Err(ChildAdmitError::AgentMismatch);
+            }
+            if recovery::session_awaits_reconciliation(&mut *conn, session_id).await? {
+                return Err(ChildAdmitError::Blocked);
             }
             (session_id.to_owned(), child_agent)
         }

@@ -251,6 +251,10 @@ fn admit_failure(error: ChildAdmitError) -> Delegation {
             "that subagent session already has an active run; try again later",
         ),
         ChildAdmitError::Archived => ("SESSION_ARCHIVED", "that subagent session is archived"),
+        ChildAdmitError::Blocked => (
+            "RECOVERY_BLOCKED",
+            "that subagent session has an interrupted tool call that an operator must resolve first",
+        ),
         ChildAdmitError::AgentMismatch => (
             "AGENT_MISMATCH",
             "session_id belongs to a different agent; use the agent that created it",

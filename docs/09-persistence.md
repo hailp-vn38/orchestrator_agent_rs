@@ -72,3 +72,4 @@ WAL, FK per connection, busy timeout; pool nhỏ (1–5 connections) và transac
 - Parent invocation → child session + logical child turn được persist atomically cùng child admission. Child recovery attempt mới giữ `child_turn_id`.
 - Exclusive process owner lock bảo vệ one owner/store (khác unique partial index one run/session). Lock chỉ nhả sau local write-capable tasks quiesce/join; unresolved external mutation vẫn block.
 - `agent_runs.provider_config_fingerprint` non-secret so sánh routing identity khi recover.
+- Operator reconciliation (`resolve_interrupted_invocation`) ghi audit ngay trên `tool_invocations` (`resolved_by`, `resolution_evidence`, `resolved_at`, nullable) cùng transaction với tool-result message và terminal update; không có bảng audit riêng. Recovery tạo attempt mới chuyển invocation chưa settle sang `run_id` mới (về `requested`); message cũ giữ `run_id` của attempt tạo ra nó. Xem `docs/evidence/m5.md`.

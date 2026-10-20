@@ -70,8 +70,15 @@ pub struct RuntimeConfig {
     pub supervisor_sweep: Duration,
     /// Trần số item mỗi trang history; `limit` của host được clamp vào `1..=page_size`.
     pub page_size: u32,
-    /// Thời gian chờ các local task dừng khi `shutdown()`.
+    /// Thời gian chờ các local task quiesce/join **sau khi** đã yêu cầu cancel hợp tác trong
+    /// `shutdown()`. Hết hạn mà còn task có thể ghi: `shutdown` trả lỗi và giữ owner lock.
     pub shutdown_grace: Duration,
+    /// Thời gian drain trước khi cancel: admission mới đã bị từ chối, run đang chạy được tự
+    /// kết thúc. `0` = cancel hợp tác ngay (mặc định).
+    pub shutdown_drain: Duration,
+    /// Số lần recovery tối đa mỗi turn (`resume_attempt` lớn nhất được tạo tự động). Vượt thì
+    /// attempt cuối giữ `interrupted` với `RECOVERY_ATTEMPTS_EXHAUSTED` (cần người xử lý).
+    pub max_resume_attempts: u32,
     /// Timeout của *một* thao tác tool (không phải của cả run). Quá hạn: tool ReadOnly trả
     /// lỗi kỹ thuật `TOOL_TIMEOUT`; tool Mutating có outcome unknown → run `interrupted`.
     pub tool_timeout: Duration,
@@ -97,6 +104,8 @@ impl Default for RuntimeConfig {
             supervisor_sweep: Duration::from_secs(30),
             page_size: 50,
             shutdown_grace: Duration::from_secs(30),
+            shutdown_drain: Duration::ZERO,
+            max_resume_attempts: 10,
             tool_timeout: Duration::from_secs(300),
             tool_output_cap_bytes: 64 * 1024,
             tool_result_hard_cap_bytes: 8 * 1024 * 1024,
@@ -121,6 +130,9 @@ impl RuntimeConfig {
         }
         if self.shutdown_grace.is_zero() {
             return bad("shutdown_grace must be > 0");
+        }
+        if !(1..=100).contains(&self.max_resume_attempts) {
+            return bad("max_resume_attempts must be in 1..=100");
         }
         if self.tool_timeout.is_zero() {
             return bad("tool_timeout must be > 0");
