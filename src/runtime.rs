@@ -346,7 +346,7 @@ impl AgentRuntime {
         step_id: &str,
     ) -> Result<ModelResponse, GatewayError> {
         let feed = self.emitter.feed();
-        let root = run.parent_session_id.as_deref().unwrap_or(&run.session_id);
+        let root = run.root_session_id();
         let (session, run_id) = (run.session_id.as_str(), run.run_id.as_str());
         feed.ephemeral(
             root,
@@ -445,7 +445,7 @@ impl AgentRuntime {
             return Ok(false);
         };
         self.emitter.feed().ephemeral(
-            run.parent_session_id.as_deref().unwrap_or(&run.session_id),
+            run.root_session_id(),
             &run.session_id,
             Some(&run.run_id),
             "compaction.started",
@@ -604,10 +604,7 @@ impl AgentRuntime {
             owner_id: run.owner_id.clone(),
             workspace_id: run.workspace_id.clone(),
             session_id: run.session_id.clone(),
-            root_session_id: run
-                .parent_session_id
-                .clone()
-                .unwrap_or_else(|| run.session_id.clone()),
+            root_session_id: run.root_session_id().to_owned(),
             run_id: run_id.to_owned(),
             agent_id: run.agent_id.clone(),
             invocation_id: inv.id.clone(),

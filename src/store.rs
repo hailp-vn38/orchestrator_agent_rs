@@ -60,6 +60,15 @@ pub(crate) struct RunRecord {
     pub parent_session_id: Option<String>,
 }
 
+impl RunRecord {
+    /// Root của family (depth 1): parent nếu là child, ngược lại chính session.
+    pub(crate) fn root_session_id(&self) -> &str {
+        self.parent_session_id
+            .as_deref()
+            .unwrap_or(&self.session_id)
+    }
+}
+
 /// Đích của một child turn: tạo child mới hoặc tiếp tục child cũ của chính parent.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ChildTarget<'a> {

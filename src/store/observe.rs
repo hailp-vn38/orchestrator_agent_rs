@@ -12,6 +12,8 @@ use crate::types::{
 
 /// Trần số child trong một snapshot (bounded; vượt thì `children_truncated`).
 const MAX_SNAPSHOT_CHILDREN: i64 = 500;
+/// Số session đọc: Root + child + 1 để phát hiện bị cắt.
+const SNAPSHOT_SESSION_FETCH: i64 = MAX_SNAPSHOT_CHILDREN + 2;
 
 /// Danh tính + revision hiện tại của session nguồn event, đọc sau commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +30,7 @@ pub(crate) struct ClosedInvocation {
     pub id: String,
     pub tool_call_id: String,
     pub tool_name: String,
-    pub status: String,
+    pub status: InvocationStatus,
     pub error_code: Option<String>,
 }
 
@@ -92,7 +94,12 @@ impl SessionStore {
                     id: r.try_get("id").map_err(db("read invocation"))?,
                     tool_call_id: r.try_get("tool_call_id").map_err(db("read invocation"))?,
                     tool_name: r.try_get("tool_name").map_err(db("read invocation"))?,
-                    status: r.try_get("status").map_err(db("read invocation"))?,
+                    status: {
+                        let status: String = r.try_get("status").map_err(db("read invocation"))?;
+                        InvocationStatus::parse(&status).ok_or_else(|| {
+                            OrchestratorError::new(ErrorCode::Internal, "unknown invocation status")
+                        })?
+                    },
                     error_code: r.try_get("error_code").map_err(db("read invocation"))?,
                 })
             })
@@ -124,7 +131,7 @@ impl SessionStore {
         .bind(root_id)
         .bind(&caller.owner_id)
         .bind(&caller.workspace_id)
-        .bind(MAX_SNAPSHOT_CHILDREN + 2)
+        .bind(SNAPSHOT_SESSION_FETCH)
         .fetch_all(&mut *tx)
         .await
         .map_err(db("load family"))?;
@@ -264,4 +271,3 @@ async fn recent_invocations(
     items.reverse();
     Ok(items)
 }
-

@@ -1505,3 +1505,34 @@ async fn large_text_fragments_are_split_without_losing_order_or_text() {
     }
     assert_eq!(deltas_of(&events, &sid), format!("{big}tail"));
 }
+
+#[tokio::test]
+async fn at27_st02_tool_runs_only_after_the_response_finished_and_calls_are_persisted() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    // Gateway báo call đã ghép đủ (arguments từng mảnh đã được assemble) trước `Finished`.
+    gw.push_response_streamed(
+        vec![StreamEvent::ToolCallReady {
+            id: "c1".into(),
+            name: "probe".into(),
+        }],
+        call("c1", "probe", probe_args()),
+    );
+    gw.push_text("done");
+    let (probe, runs) = Probe::new("probe", ToolEffect::Mutating, Behavior::Echo);
+    let (o, sid) = single(&env, &gw, Some(probe)).await;
+    let col = collect(o.subscribe(&alice(), &sid).await.unwrap());
+    assert_eq!(run_turn(&o, &sid, "go").await, RunStatus::Completed);
+    col.wait_for("run.completed", |e| {
+        e.iter().any(|x| x.event_type == "run.completed")
+    })
+    .await;
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    let events = col.events();
+    let ended = position(&events, |e| e.event_type == "step.ended");
+    let committed = position(&events, |e| e.event_type == "message.committed");
+    let started = position(&events, |e| e.event_type == "tool.started");
+    let done = position(&events, |e| e.event_type == "tool.completed");
+    // Finished → persist assistant+invocation → mới dispatch tool.
+    assert!(ended < committed && committed <= started && started < done);
+}

@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::store::SessionStore;
-use crate::types::RunStatus;
+use crate::types::{InvocationStatus, RunStatus};
 
 /// Thay cho giá trị secret bị che.
 const REDACTED: &str = "[redacted]";
@@ -508,7 +508,7 @@ impl Emitter {
     ) {
         if let Ok(closed) = self.store.closed_invocations(run_id).await {
             for inv in closed {
-                let (event_type, payload) = if inv.status == "cancelled" {
+                let (event_type, payload) = if inv.status == InvocationStatus::Cancelled {
                     (
                         "tool.failed",
                         json!({
