@@ -15,7 +15,7 @@ use super::convert::to_chat_messages;
 use super::error::{map_error, GatewayError};
 use super::types::{LlmGateway, ModelRequest, ModelResponse, StreamSink};
 
-/// Trần output token mỗi request khi config provider chưa có tùy chọn riêng (M1).
+/// Trần output token mỗi request khi agent không đặt `ModelParams::max_output_tokens`.
 const MAX_OUTPUT_TOKENS: u32 = 4096;
 
 /// Gateway thật: dựng client `llm` lười theo `(provider, model, system)` và tái sử dụng.
@@ -44,7 +44,12 @@ impl ClientGateway {
             let mut h = Sha256::new();
             h.update(request.system.as_bytes());
             let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-            format!("{}\n{}\n{digest}", cfg.id.trim(), request.model_id)
+            format!(
+                "{}\n{}\n{digest}\n{}",
+                cfg.id.trim(),
+                request.model_id,
+                request.params.cache_key()
+            )
         };
         let mut clients = self.clients.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(c) = clients.get(&key) {
@@ -69,9 +74,23 @@ fn build_client(
     let mut builder = LLMBuilder::new()
         .backend(backend)
         .model(request.model_id.clone())
-        .max_tokens(MAX_OUTPUT_TOKENS)
+        .max_tokens(
+            request
+                .params
+                .max_output_tokens
+                .unwrap_or(MAX_OUTPUT_TOKENS),
+        )
         .timeout_seconds(cfg.request_timeout.as_secs().max(1))
         .system(request.system.clone());
+    if let Some(t) = request.params.temperature {
+        builder = builder.temperature(t);
+    }
+    if let Some(p) = request.params.top_p {
+        builder = builder.top_p(p);
+    }
+    if let Some(k) = request.params.top_k {
+        builder = builder.top_k(k);
+    }
     if let ProviderAuth::ApiKey(key) = &cfg.auth {
         builder = builder.api_key(key.expose());
     }

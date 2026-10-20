@@ -7,7 +7,9 @@ use llm::{FunctionCall, ToolCall};
 use super::collect::{collect, RawStream};
 use super::convert::to_chat_messages;
 use super::error::{map_error, GatewayError};
-use super::types::{ModelMessage, ModelResponse, ModelRole, ModelToolCall, StreamEvent};
+use super::types::{
+    ModelMessage, ModelParams, ModelResponse, ModelRole, ModelToolCall, StreamEvent,
+};
 
 async fn collect_q(raw: RawStream) -> Result<ModelResponse, GatewayError> {
     collect(raw, &|_| {}).await
@@ -251,4 +253,50 @@ fn context_overflow_is_classified_without_leaking_text() {
     assert_eq!(map_error(&plain), GatewayError::InvalidRequest);
     assert_eq!(GatewayError::ContextOverflow.code(), "CONTEXT_LIMIT");
     assert!(!GatewayError::ContextOverflow.message().contains("sk-"));
+}
+
+#[test]
+fn model_params_validation_and_cache_key() {
+    assert!(ModelParams::default().validate().is_ok());
+    let ok = ModelParams {
+        max_output_tokens: Some(256),
+        temperature: Some(0.0),
+        top_p: Some(1.0),
+        top_k: Some(40),
+    };
+    assert!(ok.validate().is_ok());
+    for bad in [
+        ModelParams {
+            max_output_tokens: Some(0),
+            ..Default::default()
+        },
+        ModelParams {
+            temperature: Some(2.5),
+            ..Default::default()
+        },
+        ModelParams {
+            temperature: Some(-0.1),
+            ..Default::default()
+        },
+        ModelParams {
+            top_p: Some(0.0),
+            ..Default::default()
+        },
+        ModelParams {
+            top_p: Some(1.5),
+            ..Default::default()
+        },
+        ModelParams {
+            top_k: Some(0),
+            ..Default::default()
+        },
+        ModelParams {
+            temperature: Some(f32::NAN),
+            ..Default::default()
+        },
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?}");
+    }
+    assert_ne!(ok.cache_key(), ModelParams::default().cache_key());
+    assert_eq!(ok.cache_key(), ok.cache_key());
 }

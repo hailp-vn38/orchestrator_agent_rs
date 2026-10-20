@@ -169,6 +169,11 @@ Mọi hàm async trả `Result<_, OrchestratorError>`. Sau `shutdown()` các hà
 | `.with_allowed_skills(iter)` | Skill được phép |
 | `.with_steps(n)` | Trần số bước (mặc định không giới hạn; `n > 0`) |
 | `.with_context_limit_tokens(n)` | Context window riêng, mặc định `RuntimeConfig::context_limit_tokens` |
+| `.with_max_output_tokens(n)` | Trần output token mỗi request LLM (`n > 0`); mặc định gateway 4096 |
+| `.with_temperature(t)` | Temperature `0.0..=2.0`; mặc định để provider quyết định |
+| `.with_top_p(p)` | Nucleus sampling, `0 < p <= 1` |
+| `.with_top_k(k)` | `top_k > 0`; backend không hỗ trợ sẽ bỏ qua |
+| `.with_model_params(ModelParams { .. })` | Đặt cả bốn tham số trên một lần |
 
 #### `RuntimeConfig` (giá trị mặc định)
 
@@ -442,6 +447,8 @@ cargo test                # test deterministic (fake gateway, SQLite/filesystem 
 
 # Test live với provider thật (cần .env.live)
 cargo test --test m1_live_provider -- --ignored --nocapture   # tương tự m2…m7_live_provider
+cargo test --test m8_live_hard_flow -- --ignored --nocapture  # flow khó: 2 child, retry tool, restart, recall
+cargo test --test m8_live_max_tokens -- --ignored --nocapture # trần tool output, compaction theo agent, max_output_tokens
 ```
 
 Output của `scripts/check.sh` rút gọn; đặt `CHECK_MAX_LINES` để tăng số dòng lỗi.
@@ -457,6 +464,8 @@ Output của `scripts/check.sh` rút gọn; đặt `CHECK_MAX_LINES` để tăng
 | `m6_observation` | `subscribe`/`snapshot` |
 | `m7_artifacts` | Artifact, quota, backup, fault injection |
 | `read_api` | Query API |
+| `m8_live_hard_flow` (live) | Root → 2 child, chuỗi tool phụ thuộc, retry lỗi tạm thời, restart engine, follow-up cùng child |
+| `m8_live_max_tokens` (live) | `tool_output_cap_bytes`, `tool_result_hard_cap_bytes`, compaction theo `context_limit_tokens` của agent, `max_output_tokens` |
 
 Bằng chứng từng milestone: [docs/evidence/](docs/evidence/) · Spec triển khai: [docs/specs/v5-implementation-m0-m7.md](docs/specs/v5-implementation-m0-m7.md).
 

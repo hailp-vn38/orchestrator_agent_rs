@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::config::LlmConfig;
 use crate::error::{ConfigReason, OrchestratorError};
+use crate::gateway::ModelParams;
 use crate::tool::RESERVED_TOOL_NAMES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +32,9 @@ pub struct AgentDefinition {
     /// `RuntimeConfig::context_limit_tokens`; `Some(n)` yêu cầu `n > 0`. Root và Child có thể
     /// dùng model có window khác nhau.
     pub context_limit_tokens: Option<usize>,
+    /// Tham số sinh của model (output token cap, temperature, ...). Mặc định: để provider quyết
+    /// định, riêng trần output giữ mặc định của gateway.
+    pub llm: ModelParams,
 }
 
 impl AgentDefinition {
@@ -52,6 +56,7 @@ impl AgentDefinition {
             allowed_skills: Vec::new(),
             steps: None,
             context_limit_tokens: None,
+            llm: ModelParams::default(),
         }
     }
 
@@ -95,6 +100,36 @@ impl AgentDefinition {
 
     pub fn with_context_limit_tokens(mut self, tokens: usize) -> Self {
         self.context_limit_tokens = Some(tokens);
+        self
+    }
+
+    /// Đặt toàn bộ tham số sinh của model cho agent này.
+    pub fn with_model_params(mut self, params: ModelParams) -> Self {
+        self.llm = params;
+        self
+    }
+
+    /// Trần output token của mỗi request LLM (`> 0`).
+    pub fn with_max_output_tokens(mut self, tokens: u32) -> Self {
+        self.llm.max_output_tokens = Some(tokens);
+        self
+    }
+
+    /// Temperature lấy mẫu (`0.0..=2.0`).
+    pub fn with_temperature(mut self, temperature: f32) -> Self {
+        self.llm.temperature = Some(temperature);
+        self
+    }
+
+    /// Nucleus sampling `top_p` (`0.0 < p <= 1.0`).
+    pub fn with_top_p(mut self, top_p: f32) -> Self {
+        self.llm.top_p = Some(top_p);
+        self
+    }
+
+    /// `top_k` (`> 0`); không phải backend nào cũng hỗ trợ.
+    pub fn with_top_k(mut self, top_k: u32) -> Self {
+        self.llm.top_k = Some(top_k);
         self
     }
 }
@@ -181,6 +216,12 @@ async fn validate_definition(
         return err(
             ConfigReason::InvalidRuntimeConfig,
             format!("agent '{id}': context_limit_tokens must be > 0 when set"),
+        );
+    }
+    if let Err(reason) = def.llm.validate() {
+        return err(
+            ConfigReason::InvalidRuntimeConfig,
+            format!("agent '{id}': {reason}"),
         );
     }
     for tool in &def.allowed_tools {

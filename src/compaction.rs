@@ -326,6 +326,7 @@ mod tests {
             system: "s".repeat(400),
             messages: vec![ModelMessage::text(ModelRole::User, "u".repeat(400))],
             tools: vec![],
+            params: Default::default(),
         };
         assert_eq!(estimate_tokens(&r), 200);
         r.messages

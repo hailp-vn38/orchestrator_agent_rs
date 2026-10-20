@@ -70,15 +70,55 @@ pub struct ModelTool {
     pub input_schema: serde_json::Value,
 }
 
+/// Tham số sinh của model; `None` = không gửi (provider tự chọn), riêng `max_output_tokens`
+/// `None` = trần mặc định của gateway.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ModelParams {
+    pub max_output_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+}
+
+impl ModelParams {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if self.max_output_tokens == Some(0) {
+            return Err("max_output_tokens must be > 0 when set");
+        }
+        if self.temperature.is_some_and(|t| !(0.0..=2.0).contains(&t)) {
+            return Err("temperature must be within 0.0..=2.0");
+        }
+        if self.top_p.is_some_and(|p| !(p > 0.0 && p <= 1.0)) {
+            return Err("top_p must be within (0.0, 1.0]");
+        }
+        if self.top_k == Some(0) {
+            return Err("top_k must be > 0 when set");
+        }
+        Ok(())
+    }
+
+    /// Khoá ổn định để tái sử dụng client theo tham số.
+    pub(crate) fn cache_key(&self) -> String {
+        format!(
+            "{:?}|{:?}|{:?}|{:?}",
+            self.max_output_tokens,
+            self.temperature.map(f32::to_bits),
+            self.top_p.map(f32::to_bits),
+            self.top_k
+        )
+    }
+}
+
 /// Request đã resolve theo agent: `system` = mandatory base + prompt của agent (+ project
 /// instructions + skill catalog được phép).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelRequest {
     pub provider_id: String,
     pub model_id: String,
     pub system: String,
     pub messages: Vec<ModelMessage>,
     pub tools: Vec<ModelTool>,
+    pub params: ModelParams,
 }
 
 /// Usage do provider báo; `None` ở cấp response nghĩa là provider không trả số liệu

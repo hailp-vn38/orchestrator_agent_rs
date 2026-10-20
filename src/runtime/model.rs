@@ -34,6 +34,11 @@ impl AgentRuntime {
             system,
             messages: context_messages(history),
             tools: self.executor.definitions(eff),
+            params: self
+                .agents
+                .get(&run.agent_id)
+                .map(|a| a.llm)
+                .unwrap_or_default(),
         })
     }
 

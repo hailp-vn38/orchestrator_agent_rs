@@ -40,6 +40,7 @@ impl AgentRuntime {
             system: SUMMARY_SYSTEM.to_owned(),
             messages: vec![ModelMessage::text(ModelRole::User, plan.input)],
             tools: Vec::new(),
+            params: Default::default(),
         };
         let response = self
             .gateway
