@@ -71,6 +71,21 @@ impl ArtifactStore {
         &self.staging_dir
     }
 
+    /// Xoá file committed của các artifact đã bị xoá khỏi SQLite (best-effort: file còn sót
+    /// không có row nên sẽ bị `sweep_orphans` dọn sau `staging_grace`).
+    pub(crate) async fn remove_committed(&self, keys: &[String]) {
+        for key in keys {
+            if !super::validate::is_safe_storage_key(key) {
+                continue;
+            }
+            match fs::remove_file(self.committed_dir.join(key)).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(error = %e, "failed to remove deleted artifact file"),
+            }
+        }
+    }
+
     /// Dọn các file mồ côi đã quá hạn `staging_grace` của store.
     pub(crate) async fn sweep_configured_orphans(&self) -> Result<u64, OrchestratorError> {
         self.sweep_orphans(self.limits.staging_grace).await

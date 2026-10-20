@@ -1245,3 +1245,92 @@ async fn shutdown_during_child_admission_creates_no_child() {
         0
     );
 }
+
+// ───────────────────────────── delete_session ─────────────────────────────
+
+#[tokio::test]
+async fn delete_session_removes_whole_family_and_only_that_family() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    gw.push_tool_calls(
+        "",
+        vec![("c1", "subagent", sub_new("reviewer", "Please review X"))],
+    );
+    gw.push_text("child answer");
+    gw.push_text("root done");
+    let (o, sid) = root_with_reviewer(&env, &gw, &["subagent"], &[], vec![]).await;
+    run_turn(&o, &sid, "review it").await;
+    let child = links(&env, &sid).await[0].child_session_id.clone().unwrap();
+    gw.push_text("other done");
+    let other = o.create_session(&alice(), "root").await.unwrap();
+    run_turn(&o, &other, "hi").await;
+
+    // Child không phải đích xoá; caller khác bị từ chối; không đổi gì.
+    assert_eq!(
+        o.delete_session(&alice(), &child).await.unwrap_err().code(),
+        ErrorCode::InvalidInput
+    );
+    let stranger = CallerContext::new("mallory", "ws1");
+    assert_eq!(
+        o.delete_session(&stranger, &sid).await.unwrap_err().code(),
+        ErrorCode::PermissionDenied
+    );
+    assert!(o.get_session(&alice(), &child).await.is_ok());
+
+    o.delete_session(&alice(), &sid).await.unwrap();
+    for id in [&sid, &child] {
+        assert_eq!(
+            o.get_session(&alice(), id).await.unwrap_err().code(),
+            ErrorCode::NotFound
+        );
+    }
+    assert_eq!(
+        o.delete_session(&alice(), &sid).await.unwrap_err().code(),
+        ErrorCode::NotFound
+    );
+    // Session khác còn nguyên.
+    assert!(o.get_session(&alice(), &other).await.is_ok());
+    assert_eq!(history(&o, &other).await.len(), 2);
+
+    let mut c = env.sql().await;
+    for table in ["messages", "agent_runs", "tool_invocations"] {
+        let n: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE session_id IN (?1, ?2)"
+        ))
+        .bind(&sid)
+        .bind(&child)
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "{table}");
+    }
+}
+
+#[tokio::test]
+async fn delete_session_is_busy_while_a_run_is_active() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    let (o, sid) = root_with_reviewer(&env, &gw, &[], &[], vec![]).await;
+    gw.hold();
+    gw.push_text("late");
+    let turn = o.submit(&alice(), &sid, "go".into()).await.unwrap();
+    assert_eq!(
+        o.delete_session(&alice(), &sid).await.unwrap_err().code(),
+        ErrorCode::SessionBusy
+    );
+    assert!(o.get_session(&alice(), &sid).await.is_ok());
+    o.cancel(&alice(), &sid).await.unwrap();
+    gw.release();
+    for _ in 0..500 {
+        if o.result(&alice(), &sid, &turn.turn_id)
+            .await
+            .unwrap()
+            .status
+            != RunStatus::Running
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    o.delete_session(&alice(), &sid).await.unwrap();
+}

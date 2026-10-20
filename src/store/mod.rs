@@ -8,6 +8,7 @@ use sqlx::SqlitePool;
 
 mod admission;
 mod codec;
+mod delete;
 mod invocation;
 mod observe;
 mod query;

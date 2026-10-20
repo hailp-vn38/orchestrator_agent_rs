@@ -105,4 +105,20 @@ impl Orchestrator {
             .search_history(caller, search, page, self.runtime.page_size)
             .await
     }
+
+    /// Xoá vĩnh viễn **Root** session cùng mọi Child, messages, runs, invocations và artifact
+    /// (cả file). Không hoàn tác được. `SESSION_BUSY` nếu family còn run active: host phải
+    /// [`Self::cancel`] và đợi run kết thúc trước. Subscriber của family không nhận event xoá;
+    /// `snapshot` sau đó trả `NOT_FOUND`. File artifact xoá sau commit; file còn sót (lỗi I/O)
+    /// do orphan sweep dọn.
+    pub async fn delete_session(
+        &self,
+        caller: &CallerContext,
+        root_session_id: &str,
+    ) -> Result<(), OrchestratorError> {
+        let _gate = self.supervisor.admission().await?;
+        let keys = self.store.delete_family(caller, root_session_id).await?;
+        self.artifacts.remove_committed(&keys).await;
+        Ok(())
+    }
 }
