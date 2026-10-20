@@ -187,13 +187,8 @@ impl OrchestratorBuilder {
         let artifact_fault = self.artifact_fault;
         #[cfg(not(feature = "test-support"))]
         let artifact_fault = None;
-        let artifacts = ArtifactStore::open(
-            store.pool().clone(),
-            store_dir,
-            artifact_limits,
-            artifact_fault,
-        )
-        .await?;
+        let artifacts =
+            ArtifactStore::open(store.clone(), store_dir, artifact_limits, artifact_fault).await?;
         let swept = artifacts.sweep_configured_orphans().await?;
         if swept > 0 {
             tracing::info!(

@@ -26,7 +26,6 @@ mod limits;
 mod listing;
 mod publish;
 mod reader;
-mod row;
 mod scope;
 mod store;
 mod validate;

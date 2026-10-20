@@ -5,7 +5,7 @@ use super::SessionStore;
 use crate::error::{ErrorCode, OrchestratorError};
 use crate::types::{CallerContext, SessionPolicy};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::Row;
 use std::path::Path;
 use std::time::Duration;
 
@@ -44,10 +44,6 @@ impl SessionStore {
 
     pub(crate) async fn close(&self) {
         self.pool.close().await;
-    }
-
-    pub(crate) fn pool(&self) -> &SqlitePool {
-        &self.pool
     }
 
     #[cfg(test)]

@@ -1,16 +1,15 @@
 //! Đọc artifact: kiểm tra scope (host/tool/session family) và xác minh toàn vẹn.
 
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 use tokio::fs::File;
 
 use super::errors::*;
 use super::reader::{ArtifactDownload, ArtifactReader};
-use super::row::{stored_from_row, StoredArtifact};
 use super::store::ArtifactStore;
 use super::validate::is_safe_storage_key;
 use super::STREAM_CHUNK_BYTES;
 use crate::error::{ErrorCode, OrchestratorError};
+use crate::store::StoredArtifact;
 use crate::tool::{ToolError, ToolScope};
 use crate::types::{ArtifactRef, CallerContext};
 
@@ -186,24 +185,15 @@ impl ArtifactStore {
             return Ok(());
         }
 
-        let inv_row = sqlx::query(
-            "SELECT arguments_json, checkpoint_artifact_id FROM tool_invocations \
-             WHERE id = ?1 AND session_id = ?2 AND run_id = ?3",
-        )
-        .bind(&scope.invocation_id)
-        .bind(&scope.session_id)
-        .bind(&scope.run_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|_| ToolError {
-            code: CODE_ARTIFACT_UNAVAILABLE.into(),
-            message: "could not verify invocation input scope".into(),
-        })?
-        .ok_or_else(|| deny("invocation is not active in this session"))?;
-
-        let args_json: String = inv_row.try_get("arguments_json").unwrap_or_default();
-        let checkpoint_id: Option<String> =
-            inv_row.try_get("checkpoint_artifact_id").unwrap_or(None);
+        let (args_json, checkpoint_id) = self
+            .db
+            .invocation_input_scope(&scope.invocation_id, &scope.session_id, &scope.run_id)
+            .await
+            .map_err(|_| ToolError {
+                code: CODE_ARTIFACT_UNAVAILABLE.into(),
+                message: "could not verify invocation input scope".into(),
+            })?
+            .ok_or_else(|| deny("invocation is not active in this session"))?;
 
         let target_id = stored.artifact.id.as_str();
         if json_mentions_id(&args_json, target_id) {
@@ -285,22 +275,7 @@ impl ArtifactStore {
         &self,
         artifact_id: &str,
     ) -> Result<Option<StoredArtifact>, OrchestratorError> {
-        let row = sqlx::query(
-            "SELECT a.id, a.owner_id, a.workspace_id, a.session_id, a.turn_id, \
-             a.producer_invocation_id, a.role, a.name, a.mime_type, a.size_bytes, \
-             a.sha256, a.storage_key, COALESCE(s.parent_session_id, s.id) AS root_session_id \
-             FROM artifacts a \
-             JOIN sessions s ON s.id = a.session_id \
-             WHERE a.id = ?1",
-        )
-        .bind(artifact_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| OrchestratorError::storage("load artifact metadata", &e))?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        Ok(Some(stored_from_row(&row)?))
+        self.db.artifact_load(artifact_id).await
     }
 
     /// Đọc một đoạn văn bản UTF-8 có giới hạn cho built-in tool `artifact_read` của model

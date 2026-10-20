@@ -32,7 +32,7 @@ async fn setup() -> (
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::open(&dir.path().join(DB_FILE)).await.unwrap();
     let limits = ArtifactLimits::from_runtime(&RuntimeConfig::default());
-    let artifacts = ArtifactStore::open(store.pool().clone(), dir.path(), limits, None)
+    let artifacts = ArtifactStore::open(store.clone(), dir.path(), limits, None)
         .await
         .unwrap();
     let sid = store.create_root_session(&caller(), "root").await.unwrap();

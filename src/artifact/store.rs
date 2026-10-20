@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use sqlx::SqlitePool;
 use tokio::fs;
 
 use super::fault::ArtifactFault;
@@ -13,10 +12,11 @@ use super::fsutil::is_expired;
 use super::limits::ArtifactLimits;
 use super::{ARTIFACTS_DIR, COMMITTED_DIR, STAGING_DIR};
 use crate::error::OrchestratorError;
+use crate::store::SessionStore;
 
 #[derive(Clone)]
 pub(crate) struct ArtifactStore {
-    pub(super) pool: SqlitePool,
+    pub(super) db: SessionStore,
     pub(super) staging_dir: PathBuf,
     pub(super) committed_dir: PathBuf,
     pub(super) limits: ArtifactLimits,
@@ -34,7 +34,7 @@ impl fmt::Debug for ArtifactStore {
 impl ArtifactStore {
     /// Khởi tạo thư mục `artifacts/staging` và `artifacts/committed` bên dưới `store_dir`.
     pub(crate) async fn open(
-        pool: SqlitePool,
+        db: SessionStore,
         store_dir: &Path,
         limits: ArtifactLimits,
         fault: Option<Arc<ArtifactFault>>,
@@ -49,7 +49,7 @@ impl ArtifactStore {
             .await
             .map_err(|e| OrchestratorError::storage("create artifact committed dir", &e))?;
         Ok(Self {
-            pool,
+            db,
             staging_dir,
             committed_dir,
             limits,
@@ -128,13 +128,8 @@ impl ArtifactStore {
             let Some(key) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            let known: Option<i64> =
-                sqlx::query_scalar("SELECT 1 FROM artifacts WHERE storage_key = ?1")
-                    .bind(&key)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|e| OrchestratorError::storage("check committed key", &e))?;
-            if known.is_none() && fs::remove_file(entry.path()).await.is_ok() {
+            let known = self.db.artifact_storage_key_known(&key).await?;
+            if !known && fs::remove_file(entry.path()).await.is_ok() {
                 removed += 1;
             }
         }

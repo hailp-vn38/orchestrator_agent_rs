@@ -14,7 +14,7 @@ use super::scope::ArtifactWriteScope;
 use super::store::ArtifactStore;
 use super::validate::{validate_mime, validate_name};
 use super::STREAM_CHUNK_BYTES;
-use crate::store::new_id;
+use crate::store::{new_id, PublishError, PublishScope};
 use crate::tool::ToolError;
 use crate::types::ArtifactRef;
 
@@ -212,19 +212,15 @@ impl ArtifactStore {
         owner_id: &str,
         workspace_id: &str,
     ) -> Result<u64, ToolError> {
-        let used: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(size_bytes), 0) FROM artifacts \
-             WHERE owner_id = ?1 AND workspace_id = ?2",
-        )
-        .bind(owner_id)
-        .bind(workspace_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|_| ToolError {
-            code: CODE_ARTIFACT_UNAVAILABLE.into(),
-            message: "could not query workspace artifact quota".into(),
-        })?;
-        Ok(used.max(0) as u64)
+        let used = self
+            .db
+            .artifact_workspace_used_bytes(owner_id, workspace_id)
+            .await
+            .map_err(|_| ToolError {
+                code: CODE_ARTIFACT_UNAVAILABLE.into(),
+                message: "could not query workspace artifact quota".into(),
+            })?;
+        Ok(used)
     }
 
     pub(super) async fn publish_metadata(
@@ -233,129 +229,43 @@ impl ArtifactStore {
         reference: &ArtifactRef,
         storage_key: &str,
     ) -> Result<(), ToolError> {
-        let mut tx = self.pool.begin().await.map_err(|_| ToolError {
-            code: CODE_ARTIFACT_UNAVAILABLE.into(),
-            message: "could not begin artifact metadata transaction".into(),
-        })?;
-
-        // Ghi đầu tiên để lấy write lock ngay và tăng revision của session sở hữu.
-        let bumped = sqlx::query(
-            "UPDATE sessions SET state_revision = state_revision + 1, updated_at = unixepoch() \
-             WHERE id = ?1 AND owner_id = ?2 AND workspace_id = ?3",
-        )
-        .bind(&scope.session_id)
-        .bind(&scope.owner_id)
-        .bind(&scope.workspace_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| ToolError {
-            code: CODE_ARTIFACT_UNAVAILABLE.into(),
-            message: "could not lock session for artifact publication".into(),
-        })?
-        .rows_affected();
-        if bumped != 1 {
-            let _ = tx.rollback().await;
-            return Err(ToolError {
-                code: CODE_ARTIFACT_PERMISSION_DENIED.into(),
-                message: "session is outside the tool's authorized scope".into(),
-            });
-        }
-
-        if let Some(inv_id) = &scope.producer_invocation_id {
-            let valid_inv: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM tool_invocations ti \
-                 JOIN agent_runs r ON r.id = ti.run_id \
-                 WHERE ti.id = ?1 AND ti.session_id = ?2 AND ti.run_id = ?3 \
-                   AND ti.status = 'running' AND r.turn_id = ?4 AND r.status = 'running'",
+        let publish_scope = PublishScope {
+            owner_id: &scope.owner_id,
+            workspace_id: &scope.workspace_id,
+            session_id: &scope.session_id,
+            turn_id: &scope.turn_id,
+            run_id: &scope.run_id,
+            producer_invocation_id: scope.producer_invocation_id.as_deref(),
+        };
+        self.db
+            .artifact_publish(
+                &publish_scope,
+                reference,
+                storage_key,
+                self.limits.workspace_quota_bytes,
             )
-            .bind(inv_id)
-            .bind(&scope.session_id)
-            .bind(&scope.run_id)
-            .bind(&scope.turn_id)
-            .fetch_optional(&mut *tx)
             .await
-            .map_err(|_| ToolError {
-                code: CODE_ARTIFACT_UNAVAILABLE.into(),
-                message: "could not verify producer invocation state".into(),
-            })?;
-            if valid_inv.is_none() {
-                let _ = tx.rollback().await;
-                return Err(ToolError {
+            .map_err(|e| match e {
+                PublishError::Db(message) => ToolError {
+                    code: CODE_ARTIFACT_UNAVAILABLE.into(),
+                    message: message.into(),
+                },
+                PublishError::SessionOutOfScope => ToolError {
+                    code: CODE_ARTIFACT_PERMISSION_DENIED.into(),
+                    message: "session is outside the tool's authorized scope".into(),
+                },
+                PublishError::InvocationInactive => ToolError {
                     code: CODE_ARTIFACT_PERMISSION_DENIED.into(),
                     message: "producer invocation is no longer active for this turn".into(),
-                });
-            }
-        } else {
-            let valid_turn: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM agent_runs WHERE session_id = ?1 AND turn_id = ?2 LIMIT 1",
-            )
-            .bind(&scope.session_id)
-            .bind(&scope.turn_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|_| ToolError {
-                code: CODE_ARTIFACT_UNAVAILABLE.into(),
-                message: "could not verify turn ownership".into(),
-            })?;
-            if valid_turn.is_none() {
-                let _ = tx.rollback().await;
-                return Err(ToolError {
+                },
+                PublishError::TurnNotInSession => ToolError {
                     code: CODE_ARTIFACT_PERMISSION_DENIED.into(),
                     message: "turn does not belong to the session".into(),
-                });
-            }
-        }
-
-        let used: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(size_bytes), 0) FROM artifacts \
-             WHERE owner_id = ?1 AND workspace_id = ?2",
-        )
-        .bind(&scope.owner_id)
-        .bind(&scope.workspace_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|_| ToolError {
-            code: CODE_ARTIFACT_UNAVAILABLE.into(),
-            message: "could not verify workspace quota".into(),
-        })?;
-        if (used.max(0) as u64).saturating_add(reference.size_bytes)
-            > self.limits.workspace_quota_bytes
-        {
-            let _ = tx.rollback().await;
-            return Err(ToolError {
-                code: CODE_WORKSPACE_QUOTA_EXCEEDED.into(),
-                message: "workspace artifact storage quota exceeded".into(),
-            });
-        }
-
-        sqlx::query(
-            "INSERT INTO artifacts(id, owner_id, workspace_id, session_id, turn_id, \
-             producer_invocation_id, role, name, mime_type, size_bytes, sha256, storage_key) \
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        )
-        .bind(&reference.id)
-        .bind(&scope.owner_id)
-        .bind(&scope.workspace_id)
-        .bind(&scope.session_id)
-        .bind(&scope.turn_id)
-        .bind(&scope.producer_invocation_id)
-        .bind(reference.role.as_str())
-        .bind(&reference.name)
-        .bind(&reference.mime_type)
-        .bind(reference.size_bytes as i64)
-        .bind(&reference.sha256)
-        .bind(storage_key)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| ToolError {
-            code: CODE_ARTIFACT_UNAVAILABLE.into(),
-            message: "could not insert artifact metadata".into(),
-        })?;
-
-        tx.commit().await.map_err(|_| ToolError {
-            code: CODE_ARTIFACT_UNAVAILABLE.into(),
-            message: "could not commit artifact metadata".into(),
-        })?;
-        Ok(())
+                },
+                PublishError::QuotaExceeded => ToolError {
+                    code: CODE_WORKSPACE_QUOTA_EXCEEDED.into(),
+                    message: "workspace artifact storage quota exceeded".into(),
+                },
+            })
     }
 }

@@ -7,6 +7,7 @@
 use sqlx::SqlitePool;
 
 mod admission;
+mod artifact;
 mod codec;
 mod delete;
 mod invocation;
@@ -22,6 +23,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use artifact::{PublishError, PublishScope, StoredArtifact};
 pub(crate) use codec::new_id;
 pub(crate) use observe::EventInfo;
 pub(crate) use recovery::{

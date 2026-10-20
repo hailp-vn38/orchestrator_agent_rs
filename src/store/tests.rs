@@ -585,3 +585,30 @@ async fn concurrent_resumes_of_one_child_admit_exactly_one() {
     let q = "SELECT COUNT(*) FROM agent_runs WHERE session_id = ?1 AND status = 'running'";
     assert_eq!(count(&s, q, &a.session_id).await, 1);
 }
+
+/// Mọi SQL phải nằm trong `src/store/` (ADR-007/ADR-016): module khác chỉ gọi `SessionStore`.
+#[test]
+fn sql_is_confined_to_store_module() {
+    fn walk(dir: &std::path::Path, offenders: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "store") {
+                    continue;
+                }
+                walk(&path, offenders);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                if text.contains("sqlx::query") || text.contains("sqlx::Row") {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    let mut offenders = Vec::new();
+    walk(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut offenders,
+    );
+    assert!(offenders.is_empty(), "SQL ngoài src/store: {offenders:?}");
+}
