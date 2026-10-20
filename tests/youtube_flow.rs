@@ -159,12 +159,16 @@ async fn url_to_verified_markdown_survives_reopen() {
     ));
     gw.push_with(|req| {
         assert_transcript_reached_model(req);
-        let transcript_result = req.messages.iter().find(|m| {
-            m.role == ModelRole::Tool
-                && m.tool_name.as_deref() == Some("fetch_youtube_transcript")
-        }).expect("transcript tool result is required");
-        let payload: serde_json::Value = serde_json::from_str(&transcript_result.text)
-            .expect("tool returned JSON");
+        let transcript_result = req
+            .messages
+            .iter()
+            .find(|m| {
+                m.role == ModelRole::Tool
+                    && m.tool_name.as_deref() == Some("fetch_youtube_transcript")
+            })
+            .expect("transcript tool result is required");
+        let payload: serde_json::Value =
+            serde_json::from_str(&transcript_result.text).expect("tool returned JSON");
         let transcript_id = payload["transcript_artifact_id"]
             .as_str()
             .expect("transcript artifact id");
@@ -347,13 +351,17 @@ async fn publishing_without_a_verified_transcript_is_denied() {
     let turn = o.submit(&caller(), &sid, VIDEO_URL.into()).await.unwrap();
     let result = terminal(&o, &sid, &turn.turn_id).await;
     assert_eq!(result.status, RunStatus::Completed);
-    assert!(result.artifact_preview.is_empty(), "unverified summary was published");
+    assert!(
+        result.artifact_preview.is_empty(),
+        "unverified summary was published"
+    );
     let history = o
         .history(&caller(), &sid, PageRequest::first(20))
         .await
         .unwrap();
-    assert!(history.items.iter().any(|m| {
-        m.role == MessageRole::Tool && m.text.contains("ARTIFACT_NOT_FOUND")
-    }));
+    assert!(history
+        .items
+        .iter()
+        .any(|m| { m.role == MessageRole::Tool && m.text.contains("ARTIFACT_NOT_FOUND") }));
     o.shutdown().await.unwrap();
 }
