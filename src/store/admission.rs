@@ -83,13 +83,14 @@ impl SessionStore {
         }
 
         sqlx::query(
-            "INSERT INTO messages(id, session_id, sequence, role, content_json) \
-             VALUES(?1, ?2, ?3, 'user', ?4)",
+            "INSERT INTO messages(id, session_id, sequence, role, content_json, turn_id) \
+             VALUES(?1, ?2, ?3, 'user', ?4, ?5)",
         )
         .bind(new_id())
         .bind(session_id)
         .bind(seq)
         .bind(text_json(text))
+        .bind(&turn_id)
         .execute(&mut *tx)
         .await
         .map_err(db("insert user message"))?;
@@ -325,13 +326,14 @@ pub(super) async fn admit_child_inner(
         Err(e) => return Err(db("claim child run")(e).into()),
     }
     sqlx::query(
-        "INSERT INTO messages(id, session_id, sequence, role, content_json) \
-         VALUES(?1, ?2, ?3, 'user', ?4)",
+        "INSERT INTO messages(id, session_id, sequence, role, content_json, turn_id) \
+         VALUES(?1, ?2, ?3, 'user', ?4, ?5)",
     )
     .bind(new_id())
     .bind(&child_session)
     .bind(seq)
     .bind(text_json(prompt))
+    .bind(&turn_id)
     .execute(&mut *conn)
     .await
     .map_err(db("insert child input"))?;

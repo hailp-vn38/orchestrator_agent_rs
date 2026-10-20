@@ -423,3 +423,109 @@ impl FamilySnapshot {
             .is_some_and(|s| s.state_revision >= revision)
     }
 }
+
+/// Bộ lọc metadata cho `list_sessions`/`search_sessions`. Mặc định: không lọc.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionFilter {
+    /// Chỉ Root session của agent này.
+    pub agent_id: Option<String>,
+    /// `Some(true)`: chỉ session đã archive; `Some(false)`: chỉ session đang mở.
+    pub archived: Option<bool>,
+}
+
+/// Truy vấn `search_sessions`: từ khóa (không phân biệt hoa/thường với ASCII) khớp `agent_id`
+/// hoặc nội dung user/assistant của bất kỳ session nào trong family, kết hợp với metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSearch {
+    pub text: String,
+    pub filter: SessionFilter,
+}
+
+impl SessionSearch {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            filter: SessionFilter::default(),
+        }
+    }
+}
+
+/// Metadata của một session (không kèm message/run). Thời gian là unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub session_id: String,
+    /// `None` với Root.
+    pub parent_session_id: Option<String>,
+    pub agent_id: String,
+    pub archived: bool,
+    pub state_revision: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Một attempt (run) đã persist, kể cả attempt phục hồi sau restart (`attempt > 0`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSummary {
+    pub run_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub agent_id: String,
+    /// `resume_attempt`: 0 là lần chạy đầu của turn.
+    pub attempt: u32,
+    pub provider_id: String,
+    pub model_id: String,
+    pub status: RunStatus,
+    pub steps: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub final_message_id: Option<String>,
+    pub error: Option<ResultError>,
+}
+
+/// Một lượt yêu cầu logic (`turn_id` ổn định qua các attempt) và kết quả mới nhất.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnSummary {
+    pub session_id: String,
+    pub turn_id: String,
+    /// Yêu cầu của user; `None` với turn ghi trước khi hệ thống liên kết input với turn.
+    pub input: Option<String>,
+    /// Số attempt đã persist của turn (≥ 1).
+    pub attempts: u32,
+    /// Attempt mới nhất.
+    pub latest_run: RunSummary,
+    /// Chỉ có khi attempt mới nhất đã commit final message (như `AgentResult::output`).
+    pub output: Option<String>,
+}
+
+/// Truy vấn `search_history` trong mọi session thuộc scope của caller (Root lẫn Child).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorySearch {
+    pub text: String,
+    /// Giới hạn trong một family (Root + Child của nó). `None`: toàn bộ scope của caller.
+    pub root_session_id: Option<String>,
+    /// Giới hạn theo vai trò message. `None`: user, assistant và tool.
+    pub role: Option<MessageRole>,
+}
+
+impl HistorySearch {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            root_session_id: None,
+            role: None,
+        }
+    }
+}
+
+/// Message khớp của `search_history`, kết quả mới nhất trước.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryHit {
+    pub session_id: String,
+    /// Root của family chứa `session_id`.
+    pub root_session_id: String,
+    pub message: MessageView,
+    /// Đoạn text quanh vị trí khớp đầu tiên (bounded).
+    pub snippet: String,
+}

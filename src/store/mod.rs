@@ -10,6 +10,7 @@ mod admission;
 mod codec;
 mod invocation;
 mod observe;
+mod query;
 mod recovery;
 mod run;
 mod session;

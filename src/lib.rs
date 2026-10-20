@@ -53,7 +53,8 @@ pub use tool::{
 };
 pub use types::{
     AcceptedTurn, AgentResult, ArtifactRef, ArtifactRole, CallerContext, FamilySnapshot,
-    InvocationSnapshot, InvocationStatus, MessageRole, MessageToolCall, MessageView,
-    OperatorContext, Page, PageRequest, ResultError, RunSnapshot, RunStatus, SessionPolicy,
-    SessionSnapshot, VerifiedToolResolution,
+    HistoryHit, HistorySearch, InvocationSnapshot, InvocationStatus, MessageRole, MessageToolCall,
+    MessageView, OperatorContext, Page, PageRequest, ResultError, RunSnapshot, RunStatus,
+    RunSummary, SessionFilter, SessionPolicy, SessionSearch, SessionSnapshot, SessionSummary,
+    TurnSummary, VerifiedToolResolution,
 };

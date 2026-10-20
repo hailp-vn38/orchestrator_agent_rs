@@ -24,6 +24,7 @@ mod artifacts;
 mod builder;
 mod lifecycle;
 mod observe;
+mod query;
 mod session;
 
 #[cfg(test)]
