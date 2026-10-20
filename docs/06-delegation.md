@@ -25,7 +25,7 @@ pub struct SubagentOutput {
 }
 ```
 
-`SubagentOutput` là **envelope do runtime tạo**, không do child LLM viết. Lỗi quyền, timeout, model và cancellation được trả qua ToolError, có child session ID nếu đã tạo. **Không có `background` input hay `running` output trong schema MVP**; tránh quảng cáo một tính năng chưa hỗ trợ.
+`SubagentOutput` là **envelope do runtime tạo**, không do child LLM viết. Lỗi quyền, timeout **của LLM/tool operation**, model và cancellation được trả qua ToolError, có child session ID nếu đã tạo. Không có deadline tổng cho child. **Không có `background` input hay `running` output trong schema MVP**; tránh quảng cáo một tính năng chưa hỗ trợ.
 
 ## 6.3. Foreground delegation
 
@@ -42,7 +42,7 @@ sequenceDiagram
     Tool->>TM: delegate(parent, invocation, runtime_ref)
     TM->>TM: mode / permission / ownership / depth / budgets
     TM->>Store: create/resume child + link invocation.child_session_id
-    TM->>Child: run(childSession, prompt)
+    TM->>Child: submit(childSession, prompt) + wait(turn_id)
     Child->>Store: persist child transcript + child run
     Child-->>TM: final assistant text
     TM-->>Tool: SubagentOutput(session_id, completed, output)
@@ -89,7 +89,7 @@ Nếu child hoàn thành nhưng không có text, dùng `"Subagent completed with
 | `PERMISSION_DENIED` / `DEPTH_LIMIT` | Policy chặn | ToolError, không tạo child. |
 | `SESSION_NOT_CHILD` / `SESSION_BUSY` | Resume sai parent/child đang chạy | ToolError. |
 | `MODEL_UNAVAILABLE` | Lỗi model/credential | ToolError được sanitize. |
-| `CHILD_TIMEOUT` / `CHILD_CANCELLED` | Timeout hoặc cancel | Child run cập nhật trạng thái; tool error. |
+| `PROVIDER_TIMEOUT` / `TOOL_TIMEOUT` / `CHILD_CANCELLED` | Timeout theo từng request/tool hoặc explicit cancel | Không áp overall child deadline 120 giây; child có thể chạy hàng giờ. |
 | `CHILD_FAILED` | Runtime/provider error | ToolError kèm child session ID nếu có. |
 
 Không lộ secrets trong error. Việc Root retry là **quyết định của Root**, không là runtime-loop tự động.
@@ -103,3 +103,7 @@ Background (`background=true`), output `running`, durable synthetic notification
 - https://github.com/anomalyco/opencode/blob/dev/packages/core/src/tool/plugin/subagent.ts
 - https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/subagent-job.ts
 - https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/subagent-completion.ts
+
+## 6.9. Subagent chạy hàng giờ
+
+`TaskManager.delegate` foreground chờ child session execution hoàn thành, không dùng `child_timeout_s` cho toàn chuỗi. Child có thể thực hiện nhiều model/tool steps và auto compaction trước khi trả final text. Client HTTP disconnect **không** tự cancel parent; explicit cancel propagate parent → child. Sau restart, child phải recover/reconcile an toàn trước khi parent nhận final. Nếu `steps` được cấu hình trên child, report tại cap chỉ là execution outcome; Root vẫn tự đánh giá và có thể follow-up cùng `session_id`. Xem [15](15-long-running-sessions.md).

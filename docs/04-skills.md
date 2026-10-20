@@ -87,4 +87,4 @@ Base directory: /project/skills/rust-review
 
 ### Sau MVP
 
-Nguồn skills user/global, URL pull, hot reload, version/hash lineage và smart compaction-aware reinjection. Chỉ triển khai khi có nhu cầu thực.
+Nguồn skills user/global, URL pull, hot reload và version/hash lineage bổ sung khi cần. **Compaction ở MVP:** agent có thể gọi lại `skill(id)` khi instruction cũ bị compact khỏi context; không cần riêng một Reinjection Manager.

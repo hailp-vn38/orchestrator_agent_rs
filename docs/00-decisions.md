@@ -20,38 +20,44 @@ Xây **Multi-Agent Orchestrator** hỗ trợ Root Agent chủ động phân vi�
 | D-10 | Root có thể tiếp tục child session cũ bằng `session_id`; không sao chép toàn bộ Root history sang child. |
 | D-11 | Prompt gồm base/agent/project instructions, skill catalog và session history. |
 | D-12 | Skill discovery theo metadata; toàn bộ `SKILL.md` nạp qua `skill(id)` khi agent cần, trong đúng session. |
-| D-13 | Foreground delegation làm trước; background, parallel children, nested depth >1 và distributed sau MVP. |
+| D-13 | Foreground delegation làm trước; background Subagent notification, parallel child và distributed sau MVP. |
+| D-14 | `steps` tùy chọn và mặc định unset; đạt cap thì text-only progress report, không báo lỗi hay tự tạo run mới. |
+| D-15 | Không đặt deadline cho toàn child/session; chỉ timeout từng LLM/tool operation. |
+| D-16 | Auto summary compaction với SQLite checkpoint khi context gần đầy, giữ nguyên full transcript. |
+| D-17 | Session restart recovery bounded, an toàn với uncertain tool side effects; không có business `Task` scheduler cho MVP. |
 
 ## 0.3. MVP bao gồm
 
-- Axum endpoint gửi message và nhận kết quả; streaming là tối ưu hoá sau khi text/tool calling đã chạy được.
-- Registry định nghĩa Root/Subagent, model, tools, skills, permissions.
-- Prompt Builder, project instructions, skill catalog, `skill` loader.
-- LLM tool-calling loop có persist messages/tool call/tool result.
-- `subagent` tạo child session, chạy foreground, trả final text, tiếp tục session cũ.
-- Các lỗi kỹ thuật và resource budgets cơ bản.
-- SQLite migrations, một active run/session, crash-safe transcript writes, tracing tối thiểu.
+- Axum nhận input bền vững, trả Accepted cùng session/turn ID; Tokio managed execution chạy độc lập với HTTP request.
+- Registry, Prompt Builder, Tool Executor, Skill Loader, SQLite history và multi-provider LlmGateway.
+- LLM → Tools/Subagents → LLM **liên tục, không step cap mặc định**.
+- Foreground `subagent`, child history riêng, Root tự đánh giá final text và follow-up qua session ID.
+- Auto summary compaction, durable checkpoint, keeping original messages.
+- Startup safe recovery (bounded), cancellation, technical errors và tracing.
 
 ## 0.4. Không thuộc MVP
 
-- Semantic validation bắt buộc, auto-repair kết quả nghiệp vụ.
-- Agent-to-agent peer messaging trực tiếp; Redis, Kafka, remote workers.
-- Arbitrary nested subagents; mặc định depth = 1.
-- Durable background notification pipeline, scheduling graph, distributed HA, hot reload skill, automatic compaction.
-- Agent auto-execute nội dung shell/code bên trong skill mà không qua tool permission.
+- Semantic validation/auto-repair bắt buộc cho kết quả Subagent.
+- Business `tasks` table, task scheduler độc lập, Redis/Kafka và distributed agents.
+- Background Subagent notification/inbox, parallel child runs, arbitrarily deep nesting, skill hot reload.
+- Provider-native compaction (MVP dùng summary). Không bảo đảm exactly-once cho mutating tools.
 
-## 0.5. Các tham số **mặc định đề xuất**, cần benchmark
+## 0.5. Giới hạn và cấu hình
 
-| Tham số | Đề xuất | Diễn giải |
-|---|---:|---|
-| `max_subagent_depth` | 1 | Root depth 0, child depth 1; child không spawn tiếp. |
-| `max_steps_per_run` | 20 | Mỗi LLM/tool cycle tính theo quy tắc runtime thống nhất. |
-| `max_child_steps` | 15 | Giới hạn child run. |
-| `max_concurrent_children` | 1 | Foreground MVP thực hiện một child tại một thời điểm trên mỗi Root run; song song sau MVP. |
-| `child_timeout_s` | 120 | Timeout tính theo đồng hồ tường (wall-clock). |
-| `max_tool_output_bytes` | 50 KiB | Giới hạn phần text đưa vào model; raw result giữ trong SQLite tới hard size cap. |
-| `max_tool_output_lines` | 2.000 | Giới hạn phần text đưa vào model, không giới hạn child session. |
-| `max_children_per_root_run` | 10 | Tránh vòng phân việc vô hạn. |
+| Policy | Mặc định | Ý nghĩa |
+|---|---|---|
+| `agent.steps` | **Unset** | Không giới hạn steps mặc định. Nếu set, đến cap thì text-only summary, dừng gọi tool. |
+| `max_subagent_depth` | 1 | Root→child, child không gọi grandchild ở MVP. |
+| `child_timeout_s` | **Không có** | Không timeout toàn child dù chạy hàng giờ. |
+| `llm_request_timeout_s` | Ví dụ 120 | Timeout từng model request, không phải cả run. |
+| `tool_timeout_s` | Tool-specific | Timeout từng operation, không mặc định 120s cho shell dài. |
+| `compaction.auto` | true | Auto summary khi context gần đầy. |
+| `compaction.keep_recent_tokens` | Ví dụ 15.000 | Giữ complete recent turns cạnh summary. |
+| `recovery.max_attempts_per_turn` | Ví dụ 10 | Chống crash-loop. |
+| `max_concurrent_children` | 1 ở MVP | Không phải giới hạn tổng số child gọi **tuần tự**. |
+| `max_tool_output_bytes/lines` | 50 KiB / 2.000 | Giới hạn model-visible result, không giới hạn full history. |
+
+Các số tham chiếu là cấu hình gợi ý cho **dự án Rust**, không phải hard defaults của OpenCode. Cost/quota cap nếu được cấu hình, permission và explicit cancellation vẫn bắt buộc.
 
 ## 0.6. Định nghĩa thành công
 

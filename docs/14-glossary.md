@@ -7,7 +7,7 @@
 | **Subagent** | Agent chạy trong child session, được gọi qua tool `subagent`. |
 | **Session** | Hội thoại bền vững có `session_id`, agent, parent ID và history. |
 | **Child Session** | Session có `parent_session_id`; quyền sở hữu gắn với parent/workspace. |
-| **Run** | Một execution attempt của AgentRuntime trong session cụ thể. |
+| **Run** | Một execution attempt của AgentRuntime trong session, có thể gồm rất nhiều LLM/tool steps. |
 | **Delegation** | Một `subagent` tool invocation của parent; `child_session_id` có thể trỏ tới child được resume nhiều lần. MVP không có bảng `tasks` riêng. |
 | **Tool** | Chức năng mà LLM có thể yêu cầu hệ thống thực thi qua ToolExecutor. |
 | **Tool Call ID** | Mã ghép tool call/result trong model history; phải giữ nguyên. |
@@ -29,4 +29,12 @@
 | **Adapter** | Implementation khớp interface ở seam (ví dụ SQLiteSessionStore). |
 | **Transcript Writer** | `AgentRuntime` là owner việc ghi user/assistant/tool call/tool result qua SessionStore. |
 | **Run Admission** | Unique partial index trên `agent_runs` ngăn hai `running` runs cùng `session_id`. |
+| **Turn** | Một user/delegation input; `turn_id` ổn định qua restart recovery attempts. |
+| **Step** | Một iteration LLM và tools; không tương đương Run hay business Task. |
+| **Optional Steps Limit** | `agent.steps` mặc định unset; nếu set sẽ buộc model text-only progress tại giới hạn. |
+| **Continuous Execution** | Session runner lặp LLM → Tool/Subagent → LLM đến final/cancel/error, không tự giới hạn 20 steps. |
+| **Compaction Checkpoint** | Summary lưu SQLite, model thấy summary + recent turns; full history vẫn ở DB. |
+| **Synthetic Message** | Lời nhắc kỹ thuật của runtime, không phải user input. |
+| **Recovery Attempt** | Run mới cùng `turn_id` sau restart, `resume_attempt` bounded để tránh crash-loop. |
+| **Execution Claim** | Durable `agent_runs.status=running` dùng cho startup recovery + single-run admission. |
 | **Outcome Unknown** | Trạng thái tool side-effect đã được yêu cầu nhưng chưa có durable result sau crash; không tự replay. |

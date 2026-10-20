@@ -1,50 +1,42 @@
 # 08 — Shared AgentRuntime & LlmGateway
 
-## 8.1. Runtime loop
+## 8.1. Continuous runtime loop
 
 ```mermaid
 flowchart TD
-    A[AgentRuntime.run(session, input)] --> B[SessionStore.start_run - unique index admission]
-    B --> C[Persist input message]
-    C --> D[PromptBuilder.build]
-    D --> E[LlmGateway.complete]
-    E --> F{Tool calls?}
-    F -->|No| G[Persist final + finish run]
-    G --> H[Return final text]
-    F -->|Yes| I[Persist assistant calls + requested invocations]
-    I --> J[ToolExecutor.execute]
-    J --> K[Persist tool result/error + finish invocation]
-    K --> L{Budget left?}
-    L -->|Yes| D
-    L -->|No| M[Fail run with technical error]
+    A[Durable user / child input + execution claim] --> B[Managed session runner]
+    B --> C[PromptBuilder.build from checkpoint + history]
+    C --> D{Near context limit?}
+    D -->|Yes| E[Persist summary compaction checkpoint]
+    E --> C
+    D -->|No| F[LlmGateway.complete]
+    F --> G{Tool calls?}
+    G -->|Yes| H[Persist calls then execute ToolExecutor]
+    H --> I[Persist tool result/error]
+    I --> B
+    G -->|Final| J[Persist final + complete run]
+    F -->|Terminal error| K[Persist failure / cancel]
 ```
 
-`AgentRuntime` dùng chung cho Root và mọi Subagent, sở hữu LLM/tool loop **và mọi transcript writes**; `ToolExecutor` chỉ thực thi tools và trả outcomes. Nếu gặp dangling invocation sau restart, không gọi LLM lại khi tool outcome chưa được reconcile.
+**Một user turn có thể chạy hàng giờ với nhiều model/tool/subagent steps; không có `steps` cap mặc định.** Step cap tùy chọn đưa agent về text-only progress response và dừng tool, không tự fail hay spawn run mới. Context checkpoint được compact tự động, full SQLite transcript được giữ.
 
-## 8.2. Interface
+## 8.2. Interface và HTTP-independent execution
 
 ```rust
-pub struct RunRequest {
-    pub session_id: String,
-    pub input: String,
-}
+pub struct SubmitRequest { pub session_id: String, pub text: String }
+pub struct AcceptedTurn { pub session_id: String, pub turn_id: String }
 
-pub struct RunResult {
-    pub run_id: String,
-    pub session_id: String,
-    pub final_text: String,
-}
-
-pub struct AgentRuntime { /* injected deps */ }
-
+pub struct RunResult { pub session_id: String, pub turn_id: String, pub final_text: String }
+pub struct AgentRuntime { /* injected dependencies, managed execution */ }
 impl AgentRuntime {
-    pub async fn run(&self, req: RunRequest) -> Result<RunResult, RuntimeError> {
-        todo!()
-    }
+    pub async fn submit(&self, req: SubmitRequest) -> Result<AcceptedTurn, RuntimeError> { todo!() }
+    pub async fn wait(&self, session_id: &str, turn_id: &str) -> Result<RunResult, RuntimeError> { todo!() }
+    pub async fn resume(&self, session_id: &str) -> Result<(), RuntimeError> { todo!() }
+    pub async fn cancel(&self, session_id: &str) -> Result<(), RuntimeError> { todo!() }
 }
 ```
 
-`Completed` là execution success, không hàm ý semantic quality. Empty final child text được biến thành fallback string **tại `subagent` boundary**, history lưu đúng trạng thái text gốc.
+`submit` persist input và run claim **trước khi trả Accepted**; managed Tokio execution tiếp tục ngoài vòng đời của HTTP request. `AgentRuntime` sở hữu transcript writes, ToolExecutor chỉ trả outcome. Root và child dùng cùng runtime: foreground `TaskManager` gọi `submit(child, prompt)` rồi `wait(child, turn_id)` để nhận final text mà không giữ HTTP request. Child recursion được box tại call seam nếu cần. `TaskManager` không sở hữu self-referential Arc.
 
 ## 8.3. LlmGateway — seam nhỏ
 
@@ -78,8 +70,8 @@ Adapter chuyển mô hình messages/tool calls/results sang crate `llm`. Tránh 
 ## 8.5. Tokio và resource limits
 
 - MVP foreground: `TaskManager.delegate` await child run; **không spawn untracked tasks**. Runtime có thể box recursive future tại nhánh `subagent` để thỏa Rust async sizing.
-- `CancellationToken` và `tokio::time::timeout` áp dụng cho run/tool với propagation parent → child. Không giữ SQLite transaction qua LLM latency.
-- Budget: max steps, depth=1, children per root run, wall-clock timeout và output display bytes/lines. Global child semaphore và parallelism chỉ cần thêm khi triển khai concurrent children.
+- `CancellationToken` propagate explicit cancel parent → child; per-request LLM timeout và per-tool operation timeout. **Không có overall child/session timeout mặc định**. Không giữ SQL transaction xuyên provider latency.
+- `agent.steps: Option<u32>` mặc định None. Depth=1, tool output visibility cap, optional quota/cost policy; không giới hạn tổng child calls tuần tự mặc định. Global child semaphore thêm khi triển khai concurrent children.
 - Usage có thể ước lượng nếu provider không trả số liệu; ghi rõ measured/estimated.
 
 ## 8.6. Provider spike bắt buộc
@@ -92,3 +84,12 @@ Trước khi phụ thuộc sâu crate `llm`, khóa phiên bản rồi kiểm ch�
 4. Token usage; streaming khảo sát cho giai đoạn sau.
 
 Ví dụ Rust trong tài liệu là **illustrative interface**, chưa phải code đã compile.
+
+## 8.7. Compaction, retry và recovery cho long-running execution
+
+- Auto compaction khi context gần đầy, ghi durable `messages.role='compaction'` (summary + frontier) rồi build model context lại; original transcript không bị xóa. Khi provider từ chối vì overflow trước output, compact/retry **tối đa một lần** ở logical step.
+- Optional `steps` cap (`None` theo mặc định) khiến model nhận final text-only guidance và `tool_choice=none`, báo việc còn lại; session vẫn `open`.
+- Restart scan stale active claim, mark old run `interrupted`, nếu safe tạo new run cùng `turn_id`, `resume_attempt+1` (giới hạn ví dụ 10) và synthetic continuation marker. Unknown mutating tool outcome **block**, không replay.
+- Session status/history theo dõi được ngay cả khi client HTTP disconnect. Background Subagent notification dành cho sau MVP.
+
+Chi tiết: [15 — Long-running sessions](15-long-running-sessions.md).

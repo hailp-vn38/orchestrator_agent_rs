@@ -24,11 +24,11 @@ Các sự kiện hữu ích: `run.started/finished`, `tool.started/finished`, `s
 
 ## 10.5. Runtime limits
 
-Depth=1, max steps, delegation count, timeout và tool-result visibility limits. Foreground child cancellation phải truyền từ parent; không spawn task không có owner. **Không semantic auto-retry**. Transient provider retry có thể thêm sau, nhưng không tự retry mutating tool khi kết quả không chắc chắn.
+Depth=1 trong MVP. `agent.steps` tùy chọn, mặc định không có step cap. Timeout chỉ áp dụng **từng** LLM request hoặc tool operation, không mặc định áp cho toàn session/child. Giữ permissions, output visibility cap, configurable quota/cost budget, explicit user cancellation và managed Tokio task ownership. **Không semantic auto-retry** hoặc tự replay mutating tool outcome unknown.
 
 ## 10.6. Recovery & safety tests
 
 - Trace nối được Root → Subagent → Skill → Tool, kiểm tra secrets không bị leak.
 - Parent cancel dừng child (nếu provider/tool hỗ trợ cancel) và persist trạng thái interrupted/cancelled thích hợp.
-- Restart đánh dấu run cũ `interrupted`, giữ incomplete tool invocation để reconcile, không tự replay side effects.
+- Restart có thể tự resume safe execution cùng `turn_id` qua new attempt (bounded). Nếu pending mutating-tool outcome unknown thì **block và reconcile** trước khi chạy tiếp; không tự replay.
 - SQLite admission bằng unique partial index: hai run đồng thời trên cùng session chỉ một được chấp nhận.

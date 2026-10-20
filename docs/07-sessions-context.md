@@ -5,7 +5,8 @@
 | Identity | Mục đích | Lưu trữ |
 |---|---|---|
 | `session_id` | Hội thoại bền vững, có `parent_session_id`, có thể resume nhiều lần | `sessions` |
-| `run_id` | Một attempt của AgentRuntime, có status/usage riêng | `agent_runs` |
+| `run_id` | Một execution attempt gồm nhiều LLM/tool steps | `agent_runs` |
+| `turn_id` | User/delegation input identity, giữ nguyên khi restart recovery | `agent_runs.turn_id` |
 | `tool_call_id` | Pair tool call/result trong một session | `tool_invocations` + `messages` |
 | `child_session_id` | Child được gắn với một `subagent` tool invocation | `tool_invocations.child_session_id` |
 
@@ -30,7 +31,7 @@ stateDiagram-v2
     Archived --> [*]
 ```
 
-**Session status chỉ `open` hoặc `archived`** để tránh lưu trùng running state. **Run status** mới là `running/completed/failed/cancelled/timed_out/interrupted`. Session lỗi run vẫn có thể `open` và resume; archived không nhận run mới. Có thể truy vấn một session đang thực thi qua `agent_runs.status='running'`.
+**Session status chỉ `open` hoặc `archived`** để tránh lưu trùng running state. **Run status** là `running/completed/failed/cancelled/timed_out/interrupted`. Session lỗi run vẫn có thể `open` và resume; archived không nhận run mới. Có thể truy vấn một session đang thực thi qua `agent_runs.status='running'`.
 
 ## 7.4. Message model
 
@@ -43,15 +44,15 @@ stateDiagram-v2
 
 `SessionStore.start_run()` thực hiện SQLite `INSERT INTO agent_runs(status='running')` trong transaction ngắn. **Unique partial index** `(session_id) WHERE status='running'` quyết định admission; khi xung đột trả `SESSION_BUSY` thay vì đợi khóa ngầm. Không cần `sessions.active_run_id` hoặc per-session Tokio mutex thứ hai ở MVP.
 
-Khi run hoàn thành, `finish_run()` ghi final message và cập nhật run status trong transaction thích hợp. Khi process restart (MVP single instance), trước khi nhận request mới: reconcile các run cũ `running -> interrupted`, invocation `requested/running -> interrupted`. Không tự replay mutation tool có thể đã tạo side effects.
+Khi run hoàn thành, `finish_run()` persist final text + terminal status. **Safe restart recovery**: scan stale `agent_runs.running`; nếu không có ambiguous mutating tools, mark attempt cũ `interrupted`, thêm attempt mới cùng `turn_id` + `resume_attempt` tăng và continuation marker, rồi tiếp tục session. Nếu tool outcome unknown thì block để reconcile, không tự replay side effects. Startup recovery chỉ khi previous instance đã ngừng.
 
 ## 7.6. Context construction
 
 Chỉ **PromptBuilder.build(session_id)** tạo model context (base + agent + project instructions, skills catalog, history, available tools). Không tạo `ContextManager` riêng. Skill content đã load xuất hiện nhờ tool result trong history cùng session.
 
-## 7.7. Context limit MVP / sau MVP
+## 7.7. Continuous execution, context checkpoint và HTTP lifecycle
 
-MVP ước lượng context và dự trữ output tokens. Nếu vượt, trả `CONTEXT_LIMIT` rõ ràng và vẫn giữ transcript bền vững. Không tự ý xóa history hoặc chèn summary suy đoán. Giai đoạn sau có thể thiết kế compaction preserving tool-call pairs, user intent và skill reinjection.
+User turn có thể chạy nhiều giờ; `steps` không đặt mặc định. API persist input + active execution claim rồi có thể trả `202 Accepted`; managed Tokio runtime tiếp tục độc lập với HTTP disconnect. Tại context threshold, **automatic summary compaction** tạo message `role='compaction'` với `summary`, `keep_from_sequence`, `version`, rồi `PromptBuilder` dựng lại model context; original transcript vẫn ở SQLite. Không cắt giữa tool call và result, không tự bịa outcome missing. Có thể load lại skill sau compaction. Xem [15](15-long-running-sessions.md).
 
 ## 7.8. Ownership
 

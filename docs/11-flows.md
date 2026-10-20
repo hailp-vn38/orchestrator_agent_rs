@@ -12,17 +12,18 @@ sequenceDiagram
     participant PB as PromptBuilder
     participant L as LlmGateway
     User->>API: POST /sessions/{id}/messages
-    API->>RT: run(session_id, text)
-    RT->>Store: start_run (unique admission)
-    RT->>Store: append user message
+    API->>RT: submit(session_id, text)
+    RT->>Store: durable input + start_run (unique admission)
+    RT-->>API: Accepted(session_id, turn_id)
+    API-->>User: 202 Accepted
+    Note over RT: Managed execution survives HTTP disconnect
     RT->>PB: build(session_id)
     PB->>Store: load history
     PB-->>RT: system + messages + tools
     RT->>L: completion request
     L-->>RT: final text
     RT->>Store: append assistant final + finish run
-    RT-->>API: response
-    API-->>User: result
+    Note over User,Store: User fetches session status/history after completion
 ```
 
 ## 11.2. Root → Child → Resume (foreground)
@@ -39,7 +40,7 @@ sequenceDiagram
     R->>T: execute subagent(reviewer, prompt)
     T->>TM: delegate(request, borrowed runtime)
     TM->>S: create child + link invocation.child_session_id
-    TM->>C: run(child_session, prompt)
+    TM->>C: submit(child_session, prompt) + wait(turn_id)
     C->>S: persist child messages + run
     C-->>TM: final text
     TM-->>T: {session_id, completed, output}
@@ -49,7 +50,7 @@ sequenceDiagram
     R->>T: subagent(reviewer, session_id, followup)
     T->>TM: delegate/resume
     TM->>S: verify ownership + link new invocation to same child
-    TM->>C: run(child_session, followup)
+    TM->>C: submit(child_session, followup) + wait(turn_id)
     C-->>TM: final text
     TM-->>T: SubagentOutput
     T-->>R: ToolOutcome
@@ -83,18 +84,18 @@ sequenceDiagram
 Persist assistant tool call + invocation(requested)
   → execute tool (write_file/shell)
   → process crashes BEFORE durable tool result
-  → startup marks run/tool invocation interrupted
-  → do NOT replay / pretend succeeded
-  → operator or Root/User reconciles outcome before LLM continuation
+  → startup scans stale run and pending invocation
+  → mark invocation interrupted; do NOT replay / pretend succeeded
+  → block for reconciliation; once safe, resume same turn in a new attempt
 ```
 
 ## 11.5. Errors
 
 - Invalid tool input / permission denied → ToolError, LLM có thể sửa request nếu run vẫn còn budget.
-- Child failed/timeout/cancelled → ToolError; giữ child session ID nếu đã tạo.
+- Child failed/provider operation timeout/cancelled → ToolError; không có tổng `child_timeout_s`, giữ child session ID nếu đã tạo.
 - Child trả text sai ý → **không là runtime error**; Root có thể follow up same child session.
 - Child không có text → placeholder, Root tự đánh giá.
-- Context vượt giới hạn → error có thể khôi phục; không tự tóm tắt/xóa lịch sử trong MVP.
+- Context gần đầy → automatic summary compaction + bounded overflow retry; giữ full original history, trả recoverable error nếu compact thất bại.
 - Incomplete side-effect call sau crash → yêu cầu reconciliation; không chạy lại mù quáng.
 
 ## 11.6. Prompt lifecycle
@@ -107,9 +108,40 @@ Resolve Agent Definition + permission snapshot
   → attach tool definitions
   → LlmGateway converts request for chosen provider
   → Model emits final text or tool calls
-  → AgentRuntime writes transcript and loops until finished/budget exhausted
+  → AgentRuntime writes transcript and loops while model asks for tools
+  → auto-compaction/recovery at safe boundaries; no default step cap
+  → final text / explicit cancel / terminal error
 ```
 
-## 11.7. Sau MVP
+## 11.7. Long-running + safe restart
 
-Background subagent notification + synthetic parent inbox, parallel child execution, advanced compaction and artifact store. Không có đường chạy ẩn nào cho các features này trong MVP.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant API as Client
+    participant RT as Managed AgentRuntime
+    participant S as SQLite
+    API->>RT: submit(session, objective)
+    RT->>S: persist input + run claim
+    RT-->>API: 202 Accepted
+    loop Model continues requesting tools
+        RT->>S: persist tool calls/results
+        opt Near context limit
+            RT->>S: persist compaction checkpoint
+        end
+    end
+    Note over RT,S: Server restart may interrupt
+    RT->>S: scan stale running run
+    alt Safe to resume
+        RT->>S: mark interrupted; create same turn new attempt
+        RT->>RT: resume session runner
+    else Unknown side effect
+        RT->>S: mark invocation interrupted; block
+    end
+```
+
+Xem [15](15-long-running-sessions.md) cho admission/stop/recovery.
+
+## 11.8. Sau MVP
+
+Background Subagent notification + durable parent inbox, parallel child jobs, provider-native compaction và artifact store. Summary compaction và restart recovery thuộc lõi MVP.

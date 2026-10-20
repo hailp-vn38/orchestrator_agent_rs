@@ -82,7 +82,7 @@ Mỗi quyết định dưới đây có trạng thái **Accepted** theo thảo l
 
 **Why:** Ưu tiên luồng cơ bản đúng, tránh run races và event duplication sớm.
 
-**Consequences:** Parent đợi child; hệ thống cần timeout và cancel propagation.
+**Consequences:** Parent đợi child, nhưng không có deadline tổng cho child; request/tool-level timeout và explicit cancel propagation.
 
 ## ADR-009 — Deep Modules, One Transcript Writer
 
@@ -102,4 +102,34 @@ Mỗi quyết định dưới đây có trạng thái **Accepted** theo thảo l
 
 **Why:** Một cơ chế concurrency rõ ràng và không gây replay nguy hiểm sau crash.
 
-**Consequences:** Một số session sẽ cần thao tác phục hồi thủ công; background lease và resumable queued jobs chỉ triển khai ở giai đoạn sau.
+**Consequences:** Safe session có thể tự resume từ durable claim; uncertain side-effect tool phải block/reconcile. Multi-instance lease và background inbox dành cho sau MVP.
+
+## ADR-011 — Continuous Sessions Without Default Step Limit
+
+**Status:** Accepted (2026-10-20)
+
+**Decision:** Shared AgentRuntime chạy session-driven LLM/tool loop, `agent.steps` là `Option` mặc định unset. Nếu set, tại cap buộc text-only progress/remaining report, không fail hoặc auto create run mới. Không đặt wall-clock deadline cho toàn child, chỉ timeout mỗi operation.
+
+**Why:** Task nhiều giờ cần nhiều LLM/tool/subagent calls; 20/15 steps hoặc child 120s gây dừng giả.
+
+**Consequences:** Cần cost/usage guardrails, cancel propagation, compaction và crash recovery. Final text không chứng minh mục tiêu nghiệp vụ đạt.
+
+## ADR-012 — Durable Summary Compaction
+
+**Status:** Accepted (2026-10-20)
+
+**Decision:** Auto compact context near model limit, ghi `messages.role=compaction` checkpoint rồi dùng summary + recent complete turns. Original transcript giữ nguyên; provider overflow được compact/retry có giới hạn. MVP dùng summary, native provider compaction để sau.
+
+**Why:** Session dài không thể gửi full context vô hạn.
+
+**Consequences:** Summary lossy; phải giữ user goal, evidence, important decisions và có đường load skill lại.
+
+## ADR-013 — Safe Automatic Restart Recovery
+
+**Status:** Accepted (2026-10-20)
+
+**Decision:** Durable `agent_runs.running` là execution claim. Startup chỉ bởi one-owner server, tự resume run bị interrupted khi safe qua new run cùng `turn_id`, tăng `resume_attempt` tối đa theo config. Nếu mutating tool outcome unknown thì block/reconcile, không auto replay. HTTP disconnect không mặc định hủy execution.
+
+**Why:** Task nhiều giờ phải sống qua disconnect/restart, tránh crash loops và side-effect duplication.
+
+**Consequences:** Cần admission, checkpoints, recovery idempotence và cơ chế unblock. Không cần business Task scheduler chỉ để vượt step cap.

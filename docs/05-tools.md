@@ -65,7 +65,7 @@ flowchart TD
 - Sau khi tool trả: runtime ghi tool result/error và cập nhật invocation `completed/failed` **trong cùng transaction**. Luôn bảo toàn `tool_call_id`.
 - Technical schema checks chỉ kiểm tra input/output envelope. `subagent.output` là text string; không buộc JSON nghiệp vụ.
 - **Không cam kết exactly-once cho side effects.** Sau crash giữa thực thi và xác nhận, outcome có thể **unknown**. Đánh dấu `interrupted`, không auto-replay; cần xác minh thủ công hoặc thao tác idempotent trước khi thực thi lại.
-- Khi restart gặp pending tool call không có result: không gửi transcript thiếu cặp call/result vào LLM một cách mù quáng. Runtime dừng với recoverable error cho tới khi reconciliation hoàn tất.
+- Khi restart gặp pending invocation chưa có confirmed result: tuyệt đối không gửi dangling call/result pair vào LLM. Read-only/idempotent tool có thể reconcile theo policy; mutating tool với outcome unknown thì **block execution** cho tới khi xác minh. Sau reconciliation an toàn, session có thể resume nếu còn recovery budget.
 
 ## 5.5. Text output lớn
 

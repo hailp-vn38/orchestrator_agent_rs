@@ -5,13 +5,14 @@
 ```mermaid
 flowchart TB
     U[Client / Axum API] --> AR[Shared AgentRuntime]
-    AR --> PB[PromptBuilder]
+    AR --> PB[PromptBuilder + Compaction]
     PB --> A[AgentRegistry - concrete]
     PB --> SK[SkillManager]
     PB --> S[SessionStore]
     AR --> LL[LlmGateway / crate llm]
     LL --> P[OpenAI / Anthropic / Gemini / Ollama]
     AR --> TX[ToolExecutor]
+    AR --> EX[Managed Session Execution]
     TX --> ST[skill tool]
     ST --> SK
     TX --> DT[subagent tool]
@@ -21,15 +22,15 @@ flowchart TB
     S --> DB[(SQLite WAL)]
 ```
 
-**Không có `OrchestratorEngine` riêng trong MVP.** Root là `AgentDefinition(mode=primary)` chạy qua cùng `AgentRuntime::run()` như Subagent. Parent và child **không chia sẻ history**, chỉ chia sẻ runtime, modules và storage.
+**Không có `OrchestratorEngine` hoặc business task scheduler riêng trong MVP.** Root và Subagent đều dùng `AgentRuntime` với session-driven continuous execution. Parent và child **không chia sẻ history**, chỉ chia sẻ runtime, modules và storage.
 
 ## 1.2. Modules và interfaces
 
 | Module | Interface public nhỏ | Implementation nằm bên trong |
 |---|---|---|
-| `AgentRuntime` | `run(session_id, input)` | Admission, LLM/tool loop, **persist transcript/run**, budgets, stop/error. |
-| `PromptBuilder` | `build(session_id)` | Base + agent prompt, project instructions, skill catalog, history, tool definitions, context budget. |
-| `SessionStore` | `create`, `append`, `history`, `start_run`, `finish_run` | SQLite transactions, sequencing, single-running-run invariant, recovery. |
+| `AgentRuntime` | `submit(session_id, input)`, `wait(session_id, turn_id)`, `resume(session_id)`, `cancel(session_id)` | Admission, managed continuous LLM/tool loop, **persist transcript/run**, cancel/recovery. |
+| `PromptBuilder` | `build(session_id)` | Base + agent prompt, project/skill instructions, latest compaction checkpoint + recent history, context budget. |
+| `SessionStore` | `create`, `append`, `history`, `start_run`, `finish_run` | SQLite transactions, durable claims, compaction checkpoint, startup recovery. |
 | `ToolExecutor` | `execute(call, context)` | Validate input, permissions, dispatch, normalize/truncate result; **không persist message**. |
 | `SkillManager` | `available(agent)`, `load(session, skill_id)` | Scan `skills/` lúc startup, permission, safe local file reads. |
 | `TaskManager` | `delegate(request, runtime_ref)` | Check mode/ownership/depth, create/resume child, invoke child runtime, return final text. |
@@ -40,8 +41,8 @@ flowchart TB
 
 ## 1.3. Ownership và dependency rules
 
-- **`AgentRuntime` là nơi duy nhất điều phối việc ghi user/assistant/tool-call/tool-result vào transcript** qua `SessionStore`. `ToolExecutor` chỉ trả `ToolOutcome`.
-- `TaskManager` sở hữu logic tạo/tiếp tục child và chờ child; liên kết `child_session_id` với tool invocation thông qua `SessionStore`. Nó **không** ghi bản sao output vào bảng `tasks`.
+- **`AgentRuntime` là nơi duy nhất điều phối việc ghi user/assistant/tool-call/tool-result/synthetic/compaction vào transcript** qua `SessionStore`. `ToolExecutor` chỉ trả `ToolOutcome`.
+- `TaskManager` sở hữu logic tạo/tiếp tục child và chờ child qua `AgentRuntime.submit` + `wait`; liên kết `child_session_id` với tool invocation thông qua `SessionStore`. Nó **không** ghi bản sao output vào bảng `tasks`.
 - `ToolExecutor` gọi `TaskManager` cho `subagent`; chuyển borrowed `&AgentRuntime` ở execution time để tránh vòng sở hữu `Arc`. Nếu compiler yêu cầu do async recursion, box future **tại nhánh child invocation**, không thiết kế một tầng abstraction mới.
 - `PromptBuilder` là owner duy nhất của context construction; **không tạo `ContextManager` thứ hai**.
 - Không giữ transaction SQLite trong lúc đợi provider, child run hoặc tool I/O.
@@ -81,6 +82,10 @@ Khởi đầu **một Cargo package**. Tách file/trait/crate khi thay đổi th
 
 **Không có bảng `tasks` riêng ở MVP**: một lần delegation được biểu diễn bằng `tool_invocations(tool_name='subagent')` thuộc parent run. `task_id` nếu cần để tracing có thể dùng `tool_invocations.id`. Xem [09 — Persistence](09-persistence.md).
 
-## 1.6. Sau MVP
+## 1.6. Continuous execution
 
-Background subagent + inbox, parallel child jobs, session compaction, artifact store, skill hot reload/multi-source và distributed workers. Không đưa interfaces chưa dùng vào đường code chính.
+`durably admit input → run LLM/tool loop → final/cancel/error`. Một user turn có thể chạy hàng giờ; không tự cắt run vì 20/15 steps. HTTP disconnect không mặc định cancel session. Auto compaction và safe startup recovery là một phần nền tảng, không phải plugin job scheduler. Xem [15](15-long-running-sessions.md).
+
+## 1.7. Sau MVP
+
+Background Subagent + durable parent inbox, parallel child jobs, provider-native compaction, artifact store, skill hot reload/multi-source và distributed workers.

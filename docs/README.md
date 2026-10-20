@@ -1,15 +1,18 @@
 # Orchestrator Agent RS — Tài liệu thiết kế
 
-**Trạng thái:** Baseline **v2 — sau Ponytail + Codebase Design review** · **Ngày:** 2026-10-20 · **Đích:** Repository `hailp-vn38/orchestrator_agent_rs`
+**Trạng thái:** Baseline **v3 — OpenCode-style continuous session execution** · **Ngày:** 2026-10-20 · **Đích:** Repository `hailp-vn38/orchestrator_agent_rs`
 
 Bộ tài liệu là **thiết kế dự kiến**, không khẳng định source code đã được triển khai. Mô hình tham khảo: OpenCode `anomalyco/opencode`, nhưng implementation mới sử dụng Rust, Tokio, crate `llm`, SQLx và SQLite.
 
-## Thay đổi chính trong bản v2
+## Thay đổi chính trong bản v3
 
 - Không còn `OrchestratorEngine` và `ContextManager` riêng; `PromptBuilder` tạo context, `AgentRuntime` persist transcript.
 - Chỉ 4 bảng SQLite: `sessions`, `messages`, `agent_runs`, `tool_invocations`; delegation liên kết child bằng `tool_invocations.child_session_id`.
 - Một active run/session nhờ unique partial index; `session` chỉ `open/archived`, lỗi nằm ở `run`.
-- MVP skill chỉ load từ `skills/` lúc startup, foreground delegation, không hot reload, background, semantic validation hoặc auto-compaction.
+- Agent `steps` là tùy chọn; **không giới hạn bước mặc định** cho Root/Child, không có `child_timeout_s: 120` cho toàn child.
+- Continuous execution không bị ràng buộc bởi tuổi thọ HTTP request; giữ session và history bền vững.
+- Auto summary compaction trước khi context đầy; recovery bounded sau restart ở safe point.
+- Foreground child trước; background subagent notifications sau MVP. Không bắt buộc semantic validation.
 - Side-effect tool outcome sau crash có thể unknown: không tự replay.
 
 ## Mục lục
@@ -31,6 +34,7 @@ Bộ tài liệu là **thiết kế dự kiến**, không khẳng định source
 | [12. MVP & Test Plan](12-mvp-test-plan.md) | Increment, acceptance tests, non-goals |
 | [13. ADRs](13-adrs.md) | Quyết định kiến trúc và alternatives |
 | [14. Glossary](14-glossary.md) | Thuật ngữ chung trong codebase |
+| [15. Long-running Sessions](15-long-running-sessions.md) | Continuous run, compaction, recovery, step limit tùy chọn, cancellation |
 
 ## Tài liệu mẫu
 
@@ -49,7 +53,7 @@ Bộ tài liệu là **thiết kế dự kiến**, không khẳng định source
 1. **Đọc [00](00-decisions.md) và [01](01-architecture.md)** để hiểu phương án.
 2. Khi hiện thực module, đọc riêng file của module đó và các giao ước tại [06](06-delegation.md), [07](07-sessions-context.md).
 3. Khi thay đổi hành vi, cập nhật file module, [13 ADR](13-adrs.md) và các test tương ứng.
-4. Các giá trị mặc định (timeout, depth, token...) là **đề xuất MVP**, không phải giới hạn của OpenCode hay crate `llm`.
+4. Phân biệt **timeout của từng LLM/tool operation** và **deadline toàn Subagent** (không đặt mặc định). `steps` chỉ áp dụng nếu người vận hành cấu hình. Xem [15](15-long-running-sessions.md).
 
 ## Nguồn tham khảo
 
@@ -61,3 +65,12 @@ Bộ tài liệu là **thiết kế dự kiến**, không khẳng định source
 - Rust `llm`: https://docs.rs/llm/latest/llm/
 
 **Lưu ý:** Thiết kế tham khảo hành vi OpenCode, không sao chép mã nguồn hoặc bảo đảm tương thích binary/API. Trước khi code cần khoá phiên bản crate và chạy spike xác minh tool calling, streaming của các provider thực tế.
+
+## OpenCode long-running references
+
+- Session runner: https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/runner/llm.ts
+- Max steps: https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/runner/max-steps.ts
+- Context compaction: https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/compaction.ts
+- Restart recovery: https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/execution/restart.ts
+
+Thiết kế v3 là mục tiêu triển khai trong Rust; chưa khẳng định source code Rust đã hiện thực các tính năng trên.

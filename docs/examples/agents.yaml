@@ -1,12 +1,17 @@
-# SCHEMA MINH HOA CHO PROJECT NAY — KHONG PHAI CONFIG CUA OPENCODE
+# Rust project's example schema; NOT OpenCode's official config.
 runtime:
   max_subagent_depth: 1
-  max_children_per_root_run: 10
-  max_concurrent_children: 1
-  child_timeout_s: 120
+  max_concurrent_children: 1       # foreground MVP; no cap on sequential delegations
+  llm_request_timeout_s: 120       # per LLM request, not entire agent/session
   max_tool_output_bytes: 51200
   max_tool_output_lines: 2000
-  # Foreground-only MVP: no background or auto-compaction
+  compaction:
+    auto: true
+    keep_recent_tokens: 15000
+    reserve_output_tokens: 16000   # example; clamp to model capabilities
+  recovery:
+    max_attempts_per_turn: 10
+  # No child_timeout_s and no default max_steps.
 
 agents:
   root:
@@ -15,7 +20,7 @@ agents:
     prompt: prompts/root.md
     provider: openai
     model: gpt-4.1-mini
-    max_steps: 20
+    # steps: 20  # OPTIONAL. Unset = no step cap.
     tools: [subagent, skill, read_file, search_code]
     skills: [task-planning]
 
@@ -25,7 +30,6 @@ agents:
     prompt: prompts/explorer.md
     provider: google
     model: gemini-2.5-flash
-    max_steps: 15
     tools: [skill, read_file, search_code]
     skills: [rust-review]
 
@@ -35,8 +39,7 @@ agents:
     prompt: prompts/reviewer.md
     provider: anthropic
     model: claude-sonnet-4-20250514
-    max_steps: 15
     tools: [skill, read_file, search_code]
     skills: [rust-review]
 
-# Model IDs can change; resolve availability against configured providers at startup.
+# Model IDs are illustrative; verify availability/tool capability at startup.

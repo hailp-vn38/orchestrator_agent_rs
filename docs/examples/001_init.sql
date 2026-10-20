@@ -1,4 +1,4 @@
--- Orchestrator Agent RS: MVP example migration (not executed on production)
+-- Orchestrator Agent RS: v3 continuous-session example migration (not executed on production)
 -- Application connection setup: PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
     sequence INTEGER NOT NULL CHECK (sequence >= 1),
-    role TEXT NOT NULL CHECK (role IN ('user','assistant','tool')),
+    role TEXT NOT NULL CHECK (role IN ('user','assistant','tool','synthetic','compaction')),
     content_json TEXT NOT NULL CHECK (json_valid(content_json)),
     tool_call_id TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
     agent_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL, -- stable across restart recovery attempts
+    resume_attempt INTEGER NOT NULL DEFAULT 0 CHECK (resume_attempt >= 0),
     provider_id TEXT NOT NULL,
     model_id TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'running'
@@ -43,6 +45,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     error_message TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_session ON agent_runs(session_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_runs_turn ON agent_runs(session_id, turn_id, resume_attempt);
 -- The only admission guard for concurrent runs in MVP.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_running_run_per_session
     ON agent_runs(session_id) WHERE status = 'running';
@@ -74,3 +77,10 @@ CREATE INDEX IF NOT EXISTS idx_invocations_child ON tool_invocations(child_sessi
 -- 4) message sequence allocated + inserted atomically
 -- 5) append result and finish invocation in the same transaction
 -- 6) unknown side-effect outcomes MUST NOT be replayed after crash
+
+-- Recovery/compaction invariants enforced in Rust SessionStore:
+-- 7) durable input + active run claim before 202 Accepted
+-- 8) old running -> interrupted, then new attempt with same turn_id and resume_attempt+1
+-- 9) mutating tool outcome unknown => block; never replay without reconciliation
+-- 10) messages.role='compaction' JSON has summary/keep_from_sequence/version;
+--     original messages remain stored and checkpoint frontier preserves complete tool pairs

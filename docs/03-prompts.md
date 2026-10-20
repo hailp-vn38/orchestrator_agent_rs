@@ -67,11 +67,13 @@ impl PromptBuilder {
 - Không tự chuyển Root history, loaded skills hoặc internal reasoning sang child. Root phải cung cấp context liên quan trong `prompt` hoặc artifact references.
 - Resume child: giữ history trước đó rồi append prompt follow-up, không replace system prompt trừ khi bắt đầu một run mới với cấu hình mới đã được chủ ý phê duyệt.
 
-## 3.7. Context size (MVP)
+## 3.7. Automatic context compaction
 
-PromptBuilder dự trữ output budget và ước lượng message + tool schema tokens. Khi vượt giới hạn model, **trả context-limit error rõ ràng và có thể khôi phục**, không tự tóm tắt/xóa history trong MVP. Không gửi tool call thiếu tool result tương ứng vào provider. Root/User có thể mở session mới hoặc rút gọn yêu cầu theo quyết định của họ.
+`PromptBuilder` dự trữ output budget, tính system + tool schemas + session history. Khi gần đầy context, `AgentRuntime` sinh summary checkpoint bền vững trong SQLite và rebuild context bằng `mandatory system + latest summary + recent complete turns`. **Không xóa full history**. Frontier không được cắt giữa assistant tool call và tool result.
 
-Compaction tự động với durable summary, lineage và khả năng nạp lại skills chỉ là phần mở rộng sau MVP; nó không thuộc interface hiện tại.
+Nếu provider từ chối vì context overflow trước khi phát output, được compact/retry một lần; nếu vẫn không đủ chỗ, trả `CONTEXT_LIMIT` recoverable, không âm thầm bỏ dữ liệu. Summary có thể mất chi tiết, do đó phải giữ user objective, decisions, evidence và artifact refs. Nếu skill instructions không còn model-visible, agent có thể gọi lại `skill(id)`.
+
+Tham khảo [15 — Long-running Sessions](15-long-running-sessions.md).
 
 ## 3.8. OpenCode reference
 

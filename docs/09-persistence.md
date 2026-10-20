@@ -11,8 +11,8 @@ SQLite + SQLx, WAL, `foreign_keys=ON`, `busy_timeout`, một shared Rust process
 | Bảng | Dữ liệu |
 |---|---|
 | `sessions` | `id`, `parent_session_id`, agent, owner/workspace, `status=open/archived`, `next_sequence`. |
-| `messages` | Ordered transcript, `role`, `content_json`, optional tool call ID. |
-| `agent_runs` | Attempt, model/provider, `running/completed/failed/cancelled/timed_out/interrupted`, usage. |
+| `messages` | Ordered transcript, gồm `user/assistant/tool/synthetic/compaction` và optional tool call ID. |
+| `agent_runs` | Attempt, model/provider, `turn_id`, `resume_attempt`, `running/completed/failed/cancelled/timed_out/interrupted`, usage. |
 | `tool_invocations` | Tool call input, execution state, result/error và optional `child_session_id` cho `subagent`. |
 
 **Không có `tasks` table**: `tool_invocations` với `tool_name='subagent'` chính là một delegation record. Một child session có thể được liên kết tới nhiều invocations ở các lần resume. Không có trùng lặp task status/output.
@@ -27,9 +27,9 @@ SQLite + SQLx, WAL, `foreign_keys=ON`, `busy_timeout`, một shared Rust process
 
 ## 9.4. Transactions quan trọng
 
-### Start run
+### Durable admission và start run
 
-Một transaction ngắn: assert session `open`, insert `agent_runs(status='running')`. Nếu vi phạm partial unique index trả `SESSION_BUSY`. **Không await LLM/tool trong transaction**.
+Một transaction ngắn: assert session `open`, atomically persist incoming user/delegation message và `agent_runs(status='running', turn_id, resume_attempt=0)` execution claim. Trả `SESSION_BUSY` nếu partial unique index xung đột. **API có thể trả `202 Accepted` trước khi LLM hoàn thành**, managed Tokio execution chạy ngoài HTTP request. Không await LLM/tool trong transaction.
 
 ### Append message
 
@@ -44,7 +44,7 @@ Một transaction: lấy và tăng `sessions.next_sequence`, insert message đú
 
 ## 9.5. Startup recovery (single instance)
 
-Trước khi cho phép request: update các `agent_runs.running` còn sót thành `interrupted`, cùng các tool invocations `requested/running` thành `interrupted`. Dữ liệu gốc không bị xóa. Run mới không bị mở khi transcript chứa side-effect tool outcome chưa xác định. Nếu sau này nhiều process cùng chạy, cần lease/heartbeat thay cho startup-only reconciliation.
+Khi startup (chỉ một owner SQLite), scan stale `agent_runs.running`. Nếu không có unresolved mutating tool outcome, old run → `interrupted`, new run cùng `turn_id` và `resume_attempt+1`, synthetic continuation marker; tiếp tục runner. Giới hạn attempts/turn (ví dụ 10) chống crash-loop. Nếu tool đang `requested/running` với uncertain side effects, invocation → `interrupted`, block execution và yêu cầu reconciliation; không tự replay. Data gốc được giữ. Multi-process cần lease/heartbeat riêng.
 
 ## 9.6. Tool outputs và retention
 
@@ -53,3 +53,7 @@ MVP lưu final text/tool result vào SQLite (`result_json`) cùng những metada
 ## 9.7. SQLite config
 
 WAL, FK per connection, busy timeout; pool nhỏ (1–5 connections) và transactions ngắn. Backup qua SQLite backup API/VACUUM INTO, không copy một `.db` đang được ghi mà bỏ qua WAL.
+
+## 9.8. Compaction checkpoint (không thêm bảng)
+
+`messages.role='compaction'` chứa JSON gồm `summary`, `keep_from_sequence`, `version`, `model_ref`. `PromptBuilder` dùng checkpoint mới nhất + recent **complete** turns, original messages vẫn còn. `messages.role='synthetic'` chứa internal restart continuation marker, không giả danh user input. `agent_runs.turn_id` và `resume_attempt` hỗ trợ recovery bounded. SQLite migration ví dụ đã cập nhật tương ứng. Xem [15](15-long-running-sessions.md).

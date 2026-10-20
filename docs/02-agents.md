@@ -22,11 +22,11 @@ pub struct AgentDefinition {
     pub model_id: String,
     pub allowed_tools: Vec<String>,
     pub allowed_skills: Vec<String>,
-    pub max_steps: u32,
+    pub steps: Option<u32>, // None = no cap; Some(n>0) = text-only stop at limit
 }
 ```
 
-Có thể thêm model variant và per-agent overrides khi adapter thực tế hỗ trợ. `max_depth`, `max_tasks_per_run` và session budget thuộc orchestration policy, không nhất thiết trong mỗi AgentDefinition.
+Có thể thêm model variant và per-agent overrides khi adapter thực tế hỗ trợ. `steps` là tùy chọn, validate `n > 0`; không đặt mặc định 20/15. Depth và cost/quota guardrails là runtime policy.
 
 ## 2.3. Agent Registry
 
@@ -52,23 +52,22 @@ MVP chỉ có YAML-backed registry. Không tạo trait với một implementatio
 - Cấu hình được load tại startup; thay đổi file cần restart. Mỗi run dùng snapshot definition đã resolve, không hot reload trong MVP.
 - MVP mỗi AgentDefinition cấu hình `(provider_id, model_id)` tường minh; child dùng model riêng, không hỗ trợ model override qua tool. Model inheritance/override theo OpenCode chỉ bổ sung khi có use case và đã kiểm chứng adapter.
 
-## 2.4. Run lifecycle
+## 2.4. Run lifecycle và stop semantics
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Created
-    Created --> Running
-    Running --> Completed
-    Running --> Failed
-    Running --> Cancelled
-    Running --> TimedOut
-    Failed --> [*]
+    [*] --> Running
+    Running --> Completed: final text
+    Running --> Cancelled: explicit cancel
+    Running --> Failed: terminal error
+    Running --> Interrupted: shutdown / crash
+    Interrupted --> Running: new attempt same turn after safe recovery
     Completed --> [*]
     Cancelled --> [*]
-    TimedOut --> [*]
+    Failed --> [*]
 ```
 
-`Completed` là **hoàn thành execution**, không đảm bảo đúng nghiệp vụ. Root đánh giá `output` sau đó mới quyết định hành động tiếp.
+Một run có thể gồm hàng trăm model/tool steps trong một turn. `steps=None` không đặt cap. Nếu cấu hình `steps=n`, runtime thêm max-steps guidance, đặt `tool_choice=none` rồi trả **text-only progress report** (không auto-spawn run mới). `Completed` nghĩa execution final, không phải tiêu chí nghiệp vụ đã đạt. Xem [15](15-long-running-sessions.md).
 
 ## 2.5. Invariants
 
