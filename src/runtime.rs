@@ -79,7 +79,8 @@ impl AgentRuntime {
         let Some(agent) = self.agents.get(&run.agent_id) else {
             return self.fail(run_id, GatewayError::NotConfigured).await;
         };
-        let eff = Effective::resolve(agent, &run.policy);
+        let eff =
+            Effective::resolve(agent, &run.policy).for_session(run.parent_session_id.is_some());
 
         // Run được sweep lại sau khi worker trước kết thúc mà chưa terminal. Invocation đã
         // `running` mà chưa có result nghĩa là outcome không xác định → chặn, không replay.
@@ -235,6 +236,9 @@ impl AgentRuntime {
                 let scope = self.scope(run, eff, inv, run_id);
                 match self.executor.run(runnable, scope, eff, cancel).await {
                     Dispatch::Settled(s) => s,
+                    Dispatch::Cancelled => {
+                        return Some(self.fail(run_id, GatewayError::Cancelled).await)
+                    }
                     Dispatch::Unknown(code) => {
                         return Some(
                             self.finish(

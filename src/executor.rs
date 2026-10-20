@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::AgentDefinition;
 use crate::gateway::ModelTool;
 use crate::skill::{render, SkillManager};
+use crate::subagent::{self, Delegation, SubagentInput, TaskManager, SUBAGENT_TOOL};
 use crate::tool::{
     HostTool, ToolContext, ToolDescriptor, ToolEffect, ToolError, ToolOutcome, ToolScope,
     RESERVED_TOOL_NAMES,
@@ -29,6 +30,8 @@ pub(crate) const SKILL_TOOL: &str = "skill";
 pub(crate) const CODE_NOT_ALLOWED: &str = "TOOL_NOT_ALLOWED";
 pub(crate) const CODE_UNAVAILABLE: &str = "TOOL_UNAVAILABLE";
 pub(crate) const CODE_INVALID_ARGS: &str = "INVALID_ARGUMENTS";
+/// Child (depth 1) không được ủy quyền tiếp.
+pub(crate) const CODE_DEPTH_LIMIT: &str = "DEPTH_LIMIT";
 pub(crate) const CODE_TIMEOUT: &str = "TOOL_TIMEOUT";
 pub(crate) const CODE_PANICKED: &str = "TOOL_PANICKED";
 pub(crate) const CODE_TOO_LARGE: &str = "TOOL_OUTPUT_TOO_LARGE";
@@ -44,6 +47,8 @@ const MAX_SCHEMA_DEPTH: usize = 16;
 pub(crate) struct Effective {
     pub tools: BTreeSet<String>,
     pub skills: BTreeSet<String>,
+    /// Session là child (depth 1): `subagent` không được quảng bá và bị chặn.
+    pub child: bool,
 }
 
 impl Effective {
@@ -57,7 +62,13 @@ impl Effective {
         Self {
             tools: narrow(&agent.allowed_tools, &policy.allowed_tools),
             skills: narrow(&agent.allowed_skills, &policy.allowed_skills),
+            child: false,
         }
+    }
+
+    pub(crate) fn for_session(mut self, is_child: bool) -> Self {
+        self.child = is_child;
+        self
     }
 }
 
@@ -100,6 +111,9 @@ pub(crate) enum Runnable {
         effect: ToolEffect,
         args: Value,
     },
+    Subagent {
+        input: SubagentInput,
+    },
 }
 
 pub(crate) enum Prepared {
@@ -112,12 +126,16 @@ pub(crate) enum Dispatch {
     Settled(Settled),
     /// Không biết tool đã tạo side effect hay chưa; runtime phải dừng run, không replay.
     Unknown(&'static str),
+    /// Run bị hủy hợp tác (shutdown) khi đang ủy quyền: không có result để ghi, run
+    /// `interrupted`. Child turn đã admit vẫn được giữ và đọc được qua invocation link.
+    Cancelled,
 }
 
 pub(crate) struct ToolExecutor {
     tools: BTreeMap<String, Arc<dyn HostTool>>,
     descriptors: BTreeMap<String, ToolDescriptor>,
     skills: Arc<SkillManager>,
+    tasks: TaskManager,
     limits: ToolLimits,
 }
 
@@ -125,6 +143,7 @@ impl ToolExecutor {
     pub(crate) fn new(
         tools: BTreeMap<String, Arc<dyn HostTool>>,
         skills: Arc<SkillManager>,
+        tasks: TaskManager,
         limits: ToolLimits,
     ) -> Self {
         let descriptors = tools
@@ -135,6 +154,7 @@ impl ToolExecutor {
             tools,
             descriptors,
             skills,
+            tasks,
             limits,
         }
     }
@@ -159,7 +179,16 @@ impl ToolExecutor {
         if eff.tools.contains(SKILL_TOOL) && !self.skills.available(&eff.skills).is_empty() {
             out.push(skill_tool());
         }
+        if self.subagent_offered(eff) {
+            out.push(self.tasks.tool_definition());
+        }
         out
+    }
+
+    /// `subagent` chỉ được quảng bá khi session được phép, không phải child và có agent
+    /// làm child được.
+    fn subagent_offered(&self, eff: &Effective) -> bool {
+        eff.tools.contains(SUBAGENT_TOOL) && !eff.child && self.tasks.has_candidates()
     }
 
     /// Resolve + kiểm quyền + validate schema. Chưa có side effect nào.
@@ -180,8 +209,22 @@ impl ToolExecutor {
                 Err(e) => reject(CODE_INVALID_ARGS, format!("invalid arguments: {e}")),
             };
         }
+        if name == SUBAGENT_TOOL {
+            if eff.child {
+                return reject(CODE_DEPTH_LIMIT, "subagents cannot delegate further".into());
+            }
+            if !self.tasks.has_candidates() {
+                return reject(CODE_UNAVAILABLE, format!("tool '{shown}' is not available"));
+            }
+            return match validate_args(&subagent::input_schema(), &args) {
+                Ok(()) => Prepared::Run(Runnable::Subagent {
+                    input: SubagentInput::from_args(&args),
+                }),
+                Err(e) => reject(CODE_INVALID_ARGS, format!("invalid arguments: {e}")),
+            };
+        }
         let (Some(tool), Some(desc)) = (self.tools.get(name), self.descriptors.get(name)) else {
-            // Tên built-in dành riêng nhưng chưa triển khai (vd. `subagent` đến ở M3).
+            // Tên built-in dành riêng nhưng chưa có handler.
             let code = if RESERVED_TOOL_NAMES.contains(&name) {
                 CODE_UNAVAILABLE
             } else {
@@ -228,6 +271,14 @@ impl ToolExecutor {
             }),
             Runnable::Host { tool, effect, args } => {
                 self.run_host(tool, effect, args, scope, cancel).await
+            }
+            // Không áp `tool_timeout` lên cả child (không deadline tổng); timeout theo từng
+            // request/tool diễn ra bên trong run của child.
+            Runnable::Subagent { input } => {
+                match self.tasks.delegate(&scope, input, cancel).await {
+                    Delegation::Done(result) => Dispatch::Settled(self.settle(result)),
+                    Delegation::Cancelled => Dispatch::Cancelled,
+                }
             }
         }
     }

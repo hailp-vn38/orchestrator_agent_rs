@@ -20,14 +20,40 @@ use crate::owner_lock::OwnerLock;
 use crate::runtime::AgentRuntime;
 use crate::store::SessionStore;
 
+/// Kênh đánh thức supervisor sau khi một claim vừa commit (root submit hoặc child admission).
+/// Clone được chia sẻ giữa `Orchestrator` (submit) và `TaskManager` (child admission).
+#[derive(Clone)]
+pub(crate) struct AdmissionSignal {
+    wake: Arc<Notify>,
+    /// Fault hook: bỏ qua trigger sau admission (mô phỏng crash window commit→spawn).
+    drop_triggers: Arc<AtomicBool>,
+}
+
+impl AdmissionSignal {
+    pub(crate) fn new(drop_triggers: Arc<AtomicBool>) -> Self {
+        Self {
+            wake: Arc::new(Notify::new()),
+            drop_triggers,
+        }
+    }
+
+    /// Gọi sau khi một claim vừa commit. `Notify` giữ permit nên trigger không bị mất nếu
+    /// loop đang bận; claim bị bỏ trigger vẫn được sweep định kỳ cứu.
+    pub(crate) fn admitted(&self) {
+        if self.drop_triggers.load(Ordering::Acquire) {
+            debug!("admission trigger suppressed by fault hook");
+            return;
+        }
+        self.wake.notify_one();
+    }
+}
+
 struct Shared {
     store: SessionStore,
     runtime: AgentRuntime,
     owned: Mutex<HashMap<String, JoinHandle<()>>>,
-    wake: Notify,
+    signal: AdmissionSignal,
     cancel: CancellationToken,
-    /// Fault hook: bỏ qua trigger sau admission (mô phỏng crash window commit→spawn).
-    drop_admission_triggers: Arc<AtomicBool>,
     sweep: Duration,
     /// Chỉ nhả sau khi mọi local write-capable task đã join (hoặc khi Shared bị drop).
     owner_lock: Mutex<Option<OwnerLock>>,
@@ -49,15 +75,14 @@ impl Supervisor {
         runtime: AgentRuntime,
         sweep: Duration,
         owner_lock: OwnerLock,
-        drop_admission_triggers: Arc<AtomicBool>,
+        signal: AdmissionSignal,
     ) -> Self {
         let shared = Arc::new(Shared {
             store,
             runtime,
             owned: Mutex::new(HashMap::new()),
-            wake: Notify::new(),
+            signal,
             cancel: CancellationToken::new(),
-            drop_admission_triggers,
             sweep,
             owner_lock: Mutex::new(Some(owner_lock)),
         });
@@ -72,14 +97,9 @@ impl Supervisor {
         self.shared.cancel.is_cancelled()
     }
 
-    /// Đánh thức supervisor sau khi một claim vừa commit. `Notify` giữ permit nên
-    /// trigger không bị mất nếu loop đang bận.
+    /// Đánh thức supervisor sau khi một claim vừa commit.
     pub(crate) fn notify_admitted(&self) {
-        if self.shared.drop_admission_triggers.load(Ordering::Acquire) {
-            debug!("admission trigger suppressed by fault hook");
-            return;
-        }
-        self.shared.wake.notify_one();
+        self.shared.signal.admitted();
     }
 
     /// Dừng admission/loop, hủy hợp tác các run, join trong `grace`, đóng store rồi nhả
@@ -132,7 +152,7 @@ impl Shared {
             tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => break,
-                () = self.wake.notified() => {}
+                () = self.signal.wake.notified() => {}
                 _ = tick.tick() => {}
             }
             self.reconcile().await;
@@ -167,7 +187,7 @@ impl Shared {
                 lock(&me.owned).remove(&run_id);
                 if settled {
                     // Có thể còn claim khác đang chờ owner.
-                    me.wake.notify_one();
+                    me.signal.wake.notify_one();
                 }
             });
             owned.insert(id, handle);

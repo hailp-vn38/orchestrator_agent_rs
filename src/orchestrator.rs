@@ -15,7 +15,8 @@ use crate::prompt::PromptBuilder;
 use crate::runtime::AgentRuntime;
 use crate::skill::SkillManager;
 use crate::store::{RunRoute, SessionStore, DB_FILE};
-use crate::supervisor::Supervisor;
+use crate::subagent::TaskManager;
+use crate::supervisor::{AdmissionSignal, Supervisor};
 use crate::tool::{validate_descriptor, HostTool, ToolDescriptor};
 use crate::types::{
     AcceptedTurn, AgentResult, CallerContext, MessageView, Page, PageRequest, SessionPolicy,
@@ -189,15 +190,20 @@ impl Orchestrator {
     }
 
     fn route(&self, agent_id: &str) -> Option<RunRoute> {
-        let def = self.registry.get(agent_id)?;
-        let provider_id = def.provider_id.trim().to_string();
-        let fingerprint = self.fingerprints.get(&provider_id)?.clone();
-        Some(RunRoute {
-            model_id: def.model_id.trim().to_string(),
-            provider_id,
-            fingerprint,
-        })
+        route_of(self.registry.get(agent_id)?, &self.fingerprints)
     }
+}
+
+/// Routing đã resolve của một agent theo provider/model của **chính nó** (Root và Child có
+/// thể dùng provider khác nhau).
+fn route_of(def: &AgentDefinition, fingerprints: &BTreeMap<String, String>) -> Option<RunRoute> {
+    let provider_id = def.provider_id.trim().to_string();
+    let fingerprint = fingerprints.get(&provider_id)?.clone();
+    Some(RunRoute {
+        model_id: def.model_id.trim().to_string(),
+        provider_id,
+        fingerprint,
+    })
 }
 
 impl OrchestratorBuilder {
@@ -300,16 +306,6 @@ impl OrchestratorBuilder {
         );
         let agents: HashMap<String, AgentDefinition> =
             registry.list().map(|d| (d.id.clone(), d.clone())).collect();
-        let executor = ToolExecutor::new(
-            tools.clone(),
-            Arc::new(skills),
-            ToolLimits {
-                timeout: self.config.runtime.tool_timeout,
-                model_cap_bytes: self.config.runtime.tool_output_cap_bytes,
-                hard_cap_bytes: self.config.runtime.tool_result_hard_cap_bytes,
-            },
-        );
-
         let fingerprints: BTreeMap<String, String> = self
             .config
             .llm
@@ -334,6 +330,23 @@ impl OrchestratorBuilder {
             );
         }
 
+        let signal = AdmissionSignal::new(self.drop_admission_triggers);
+        let routes: HashMap<String, RunRoute> = registry
+            .list()
+            .filter_map(|d| route_of(d, &fingerprints).map(|r| (d.id.clone(), r)))
+            .collect();
+        let tasks = TaskManager::new(store.clone(), &agents, routes, signal.clone());
+        let executor = ToolExecutor::new(
+            tools.clone(),
+            Arc::new(skills),
+            tasks,
+            ToolLimits {
+                timeout: self.config.runtime.tool_timeout,
+                model_cap_bytes: self.config.runtime.tool_output_cap_bytes,
+                hard_cap_bytes: self.config.runtime.tool_result_hard_cap_bytes,
+            },
+        );
+
         let gateway: Arc<dyn LlmGateway> = match self.gateway {
             Some(g) => g,
             None => Arc::new(ClientGateway::new(&self.config.llm.providers)),
@@ -344,7 +357,7 @@ impl OrchestratorBuilder {
             runtime,
             self.config.runtime.supervisor_sweep,
             owner_lock,
-            self.drop_admission_triggers,
+            signal,
         );
 
         Ok(Orchestrator {

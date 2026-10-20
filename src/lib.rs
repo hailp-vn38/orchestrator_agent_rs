@@ -5,7 +5,8 @@
 //! M1 (single agent): SQLite execution store + owner lock, durable admission (`submit`),
 //! managed supervisor, single-agent text run, `result`/`history`.
 //! M2 (tools & skills): ToolExecutor, SkillManager, PromptBuilder, tool loop tuần tự.
-//! Child, compaction, recovery đầy đủ đến ở M3+.
+//! M3 (parent–child): tool `subagent` foreground, child session riêng, admission atomic.
+//! Compaction, recovery đầy đủ đến ở M4+.
 
 mod agent;
 mod config;
@@ -20,6 +21,7 @@ mod runtime;
 mod secret;
 mod skill;
 mod store;
+mod subagent;
 mod supervisor;
 #[cfg(feature = "test-support")]
 pub mod test_support;

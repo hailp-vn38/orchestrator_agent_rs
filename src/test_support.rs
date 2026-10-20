@@ -18,8 +18,16 @@ pub use crate::gateway::{
 /// spawn). Chỉ sweep định kỳ của supervisor mới cứu được claim.
 pub type DropAdmissionTriggers = Arc<AtomicBool>;
 
+type Responder = Box<dyn Fn(&ModelRequest) -> ModelResponse + Send + Sync>;
+
+enum Step {
+    Fixed(Result<ModelResponse, GatewayError>),
+    /// Dựng response từ request thật (vd. lấy `session_id` child mà runtime vừa sinh).
+    Dynamic(Responder),
+}
+
 struct State {
-    script: VecDeque<Result<ModelResponse, GatewayError>>,
+    script: VecDeque<Step>,
     requests: Vec<ModelRequest>,
 }
 
@@ -70,11 +78,21 @@ impl ScriptedGateway {
     }
 
     pub fn push_response(&self, response: ModelResponse) {
-        self.state().script.push_back(Ok(response));
+        self.state().script.push_back(Step::Fixed(Ok(response)));
     }
 
     pub fn push_error(&self, error: GatewayError) {
-        self.state().script.push_back(Err(error));
+        self.state().script.push_back(Step::Fixed(Err(error)));
+    }
+
+    /// Response được tính từ request tại thời điểm gateway được gọi.
+    pub fn push_with(
+        &self,
+        responder: impl Fn(&ModelRequest) -> ModelResponse + Send + Sync + 'static,
+    ) {
+        self.state()
+            .script
+            .push_back(Step::Dynamic(Box::new(responder)));
     }
 
     /// Các lần gọi sau đó chặn (sau khi đã được ghi nhận) cho tới `release`.
@@ -120,7 +138,8 @@ impl LlmGateway for ScriptedGateway {
         }
         let next = self.state().script.pop_front();
         match next {
-            Some(result) => result,
+            Some(Step::Fixed(result)) => result,
+            Some(Step::Dynamic(responder)) => Ok(responder(request)),
             None => {
                 let last_user = request
                     .messages
