@@ -135,6 +135,12 @@ pub struct MessageToolCall {
 pub struct SessionPolicy {
     pub allowed_tools: Option<Vec<String>>,
     pub allowed_skills: Option<Vec<String>>,
+    /// Trần quyền cho child do session này tạo: quyền của child là
+    /// `AgentDefinition(child) ∩ trần`. `None` = child dùng đủ quyền của định nghĩa agent
+    /// (do host duyệt lúc cấu hình). `allowed_tools`/`allowed_skills` ở trên chỉ áp cho chính
+    /// session này, không tự áp xuống child.
+    pub child_allowed_tools: Option<Vec<String>>,
+    pub child_allowed_skills: Option<Vec<String>>,
 }
 
 impl SessionPolicy {
@@ -153,6 +159,26 @@ impl SessionPolicy {
         S: Into<String>,
     {
         self.allowed_skills = Some(skills.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Trần tool cho mọi child do session này tạo (xem [`SessionPolicy::child_allowed_tools`]).
+    pub fn with_child_allowed_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.child_allowed_tools = Some(tools.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Trần skill cho mọi child do session này tạo.
+    pub fn with_child_allowed_skills<I, S>(mut self, skills: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.child_allowed_skills = Some(skills.into_iter().map(Into::into).collect());
         self
     }
 }

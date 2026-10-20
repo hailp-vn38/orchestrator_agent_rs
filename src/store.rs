@@ -141,6 +141,19 @@ fn text_json(text: &str) -> String {
     serde_json::json!({ "text": text }).to_string()
 }
 
+/// JSON của policy để lưu vào `sessions.permissions_json`; `None` khi không thu hẹp gì.
+fn policy_json(policy: &SessionPolicy) -> Option<String> {
+    (policy != &SessionPolicy::default()).then(|| {
+        serde_json::json!({
+            "allowed_tools": policy.allowed_tools,
+            "allowed_skills": policy.allowed_skills,
+            "child_allowed_tools": policy.child_allowed_tools,
+            "child_allowed_skills": policy.child_allowed_skills,
+        })
+        .to_string()
+    })
+}
+
 fn parse_policy(permissions_json: Option<&str>) -> SessionPolicy {
     let list = |v: &serde_json::Value, key: &str| {
         v.get(key).and_then(|a| a.as_array()).map(|a| {
@@ -154,6 +167,8 @@ fn parse_policy(permissions_json: Option<&str>) -> SessionPolicy {
         .map(|v| SessionPolicy {
             allowed_tools: list(&v, "allowed_tools"),
             allowed_skills: list(&v, "allowed_skills"),
+            child_allowed_tools: list(&v, "child_allowed_tools"),
+            child_allowed_skills: list(&v, "child_allowed_skills"),
         })
         .unwrap_or_default()
 }
@@ -228,13 +243,7 @@ impl SessionStore {
         policy: &SessionPolicy,
     ) -> Result<String, OrchestratorError> {
         let id = new_id();
-        let permissions = (policy != &SessionPolicy::default()).then(|| {
-            serde_json::json!({
-                "allowed_tools": policy.allowed_tools,
-                "allowed_skills": policy.allowed_skills,
-            })
-            .to_string()
-        });
+        let permissions = policy_json(policy);
         sqlx::query(
             "INSERT INTO sessions(id, agent_id, owner_id, workspace_id, permissions_json) \
              VALUES(?1, ?2, ?3, ?4, ?5)",
@@ -291,6 +300,7 @@ impl SessionStore {
             "UPDATE sessions SET next_sequence = next_sequence + 1, \
              state_revision = state_revision + 1, updated_at = unixepoch() \
              WHERE id = ?1 AND owner_id = ?2 AND workspace_id = ?3 AND status = 'open' \
+             AND parent_session_id IS NULL \
              RETURNING next_sequence - 1 AS seq, agent_id",
         )
         .bind(session_id)
@@ -396,6 +406,11 @@ impl SessionStore {
     ) -> OrchestratorError {
         match self.authorize(caller, session_id).await {
             Err(e) => e,
+            // Child chỉ nhận input qua `subagent` của parent (có link + idempotency key).
+            Ok(s) if s.is_child => OrchestratorError::new(
+                ErrorCode::PermissionDenied,
+                "a child session only accepts input through its parent",
+            ),
             Ok(s) if s.archived => {
                 OrchestratorError::new(ErrorCode::SessionArchived, "the session is archived")
             }
@@ -410,7 +425,8 @@ impl SessionStore {
         session_id: &str,
     ) -> Result<SessionScope, OrchestratorError> {
         let row = sqlx::query(
-            "SELECT owner_id, workspace_id, status, agent_id FROM sessions WHERE id = ?1",
+            "SELECT owner_id, workspace_id, status, agent_id, parent_session_id \
+             FROM sessions WHERE id = ?1",
         )
         .bind(session_id)
         .fetch_optional(&self.pool)
@@ -431,8 +447,12 @@ impl SessionStore {
             ));
         }
         let status: String = row.try_get("status").map_err(db("read status"))?;
+        let parent: Option<String> = row
+            .try_get("parent_session_id")
+            .map_err(db("read parent"))?;
         Ok(SessionScope {
             archived: status == "archived",
+            is_child: parent.is_some(),
         })
     }
 
@@ -1072,14 +1092,22 @@ async fn admit_child_inner(
     let workspace: String = parent
         .try_get("workspace_id")
         .map_err(db("read workspace"))?;
-    let permissions: Option<String> = parent
+    let parent_permissions: Option<String> = parent
         .try_get("permissions_json")
         .map_err(db("read policy"))?;
+    // Quyền của child = AgentDefinition(child) ∩ trần do host đặt cho child ở root session;
+    // policy dành cho chính Root không áp xuống child.
+    let parent_policy = parse_policy(parent_permissions.as_deref());
+    let permissions = policy_json(&SessionPolicy {
+        allowed_tools: parent_policy.child_allowed_tools,
+        allowed_skills: parent_policy.child_allowed_skills,
+        ..SessionPolicy::default()
+    });
 
     let (child_session, agent_id) = match target {
         ChildTarget::New { agent_id } => {
             let id = new_id();
-            // Child kế thừa policy thu hẹp của parent: ủy quyền không bao giờ mở rộng quyền.
+            // Child chỉ mang trần quyền host đặt cho child (không kế thừa policy của Root).
             sqlx::query(
                 "INSERT INTO sessions(id, parent_session_id, agent_id, owner_id, workspace_id, \
                  permissions_json) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1227,6 +1255,7 @@ async fn claim_sequence(
 
 struct SessionScope {
     archived: bool,
+    is_child: bool,
 }
 
 const CURSOR_VERSION: &str = "h1";
@@ -1721,14 +1750,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn child_inherits_the_parents_narrowed_policy() {
+    async fn child_gets_only_the_hosts_child_ceiling_not_the_roots_own_policy() {
         let (_d, s) = store().await;
+        let policy = SessionPolicy::default()
+            .with_allowed_tools(["subagent"])
+            .with_child_allowed_tools(["read_note"])
+            .with_child_allowed_skills::<_, String>([]);
         let sid = s
-            .create_root_session_with(
-                &caller(),
-                "root",
-                &SessionPolicy::default().with_allowed_tools(["subagent"]),
-            )
+            .create_root_session_with(&caller(), "root", &policy)
             .await
             .unwrap();
         s.admit_turn(&caller(), &sid, "go", route).await.unwrap();
@@ -1743,8 +1772,51 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(rec.policy.allowed_tools, Some(vec!["subagent".to_string()]));
+        assert_eq!(
+            rec.policy.allowed_tools,
+            Some(vec!["read_note".to_string()])
+        );
+        assert_eq!(rec.policy.allowed_skills, Some(Vec::new()));
+        assert_eq!(rec.policy.child_allowed_tools, None);
         assert_eq!(rec.parent_session_id.as_deref(), Some(sid.as_str()));
+
+        // Không đặt trần: child dùng đủ quyền của AgentDefinition (không policy).
+        let (_p2, _r2, inv2) = parent_invocation(&s, &caller()).await;
+        let b = s
+            .admit_child_turn(&inv2, new_child("rev"), "x", route)
+            .await
+            .unwrap();
+        let rec = s
+            .load_run(&run_of(&s, &b.session_id).await)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.policy, SessionPolicy::default());
+    }
+
+    #[tokio::test]
+    async fn child_session_rejects_direct_admission_but_stays_readable() {
+        let (_d, s) = store().await;
+        let (_p, _r, inv) = parent_invocation(&s, &caller()).await;
+        let a = s
+            .admit_child_turn(&inv, new_child("rev"), "x", route)
+            .await
+            .unwrap();
+        s.complete_run(&run_of(&s, &a.session_id).await, "ok")
+            .await
+            .unwrap();
+        let e = s
+            .admit_turn(&caller(), &a.session_id, "direct", route)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::PermissionDenied);
+        let q = "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND role = 'user'";
+        assert_eq!(count(&s, q, &a.session_id).await, 1);
+        let h = s
+            .history_page(&caller(), &a.session_id, PageRequest::first(10), 50)
+            .await
+            .unwrap();
+        assert_eq!(h.items.len(), 2);
     }
 
     #[tokio::test]

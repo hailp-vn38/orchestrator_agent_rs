@@ -657,33 +657,100 @@ async fn at08_at09_child_skill_lands_in_child_history_and_denied_skill_errors() 
 }
 
 #[tokio::test]
-async fn child_inherits_parent_session_policy_so_delegation_never_widens_permissions() {
+async fn child_uses_its_own_definition_and_only_the_hosts_child_ceiling() {
+    // AT-39 cho child: hai session cùng agent, quyền hiệu lực của child khác nhau theo trần.
     let env = Env::new();
     let gw = ScriptedGateway::new();
     let (write, write_runs) = Probe::new("write_file", ToolEffect::Mutating, Behavior::Echo);
     let (read, _) = Probe::new("read_note", ToolEffect::ReadOnly, Behavior::Echo);
-    gw.push_tool_calls("", vec![("c1", "subagent", sub_new("reviewer", "do it"))]);
-    gw.push_tool_calls("", vec![("k1", "write_file", json!({"text": "x"}))]);
-    gw.push_text("child done");
-    gw.push_text("root done");
     let cfg = env.config(vec![
         env.root(&["subagent", "read_note"], &[]),
         env.reviewer(&["read_note", "write_file"], &[]),
     ]);
     let o = build(cfg, &gw, vec![write, read]).await;
-    let sid = o
+
+    // Policy của Root chỉ thu hẹp Root: child vẫn dùng tool của chính nó (write_file chạy).
+    let root_only = o
         .create_session_with_policy(
             &alice(),
             "root",
-            SessionPolicy::default().with_allowed_tools(["subagent", "read_note"]),
+            SessionPolicy::default().with_allowed_tools(["subagent"]),
         )
         .await
         .unwrap();
-    let r = run_turn(&o, &sid, "go").await;
+    gw.push_tool_calls("", vec![("c1", "subagent", sub_new("reviewer", "do it"))]);
+    gw.push_tool_calls("", vec![("k1", "write_file", json!({"text": "x"}))]);
+    gw.push_text("child done");
+    gw.push_text("root done");
+    let r = run_turn(&o, &root_only, "go").await;
     assert_eq!(r.status, RunStatus::Completed, "{:?}", r.error);
-    assert_eq!(write_runs.load(Ordering::SeqCst), 0);
-    let child = links(&env, &sid).await[0].child_session_id.clone().unwrap();
+    assert_eq!(write_runs.load(Ordering::SeqCst), 1);
+    let child = links(&env, &root_only).await[0]
+        .child_session_id
+        .clone()
+        .unwrap();
+    assert!(tool_texts(&history(&o, &child).await)[0].contains("write_file:x"));
+
+    // Trần child do host đặt: write_file bị chặn, chỉ read_note được quảng bá.
+    let capped = o
+        .create_session_with_policy(
+            &alice(),
+            "root",
+            SessionPolicy::default().with_child_allowed_tools(["read_note"]),
+        )
+        .await
+        .unwrap();
+    gw.push_tool_calls("", vec![("c1", "subagent", sub_new("reviewer", "do it"))]);
+    gw.push_tool_calls("", vec![("k1", "write_file", json!({"text": "y"}))]);
+    gw.push_text("child done");
+    gw.push_text("root done");
+    let r = run_turn(&o, &capped, "go").await;
+    assert_eq!(r.status, RunStatus::Completed, "{:?}", r.error);
+    assert_eq!(
+        write_runs.load(Ordering::SeqCst),
+        1,
+        "denied under the ceiling"
+    );
+    let child = links(&env, &capped).await[0]
+        .child_session_id
+        .clone()
+        .unwrap();
     assert!(tool_texts(&history(&o, &child).await)[0].contains("TOOL_NOT_ALLOWED"));
+    let child_req = gw.requests().into_iter().rfind(is_child_request).unwrap();
+    let names: Vec<_> = child_req.tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["read_note"]);
+}
+
+#[tokio::test]
+async fn host_cannot_submit_directly_into_a_child_session() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    gw.push_tool_calls("", vec![("c1", "subagent", sub_new("reviewer", "work"))]);
+    gw.push_text("child final");
+    gw.push_text("root done");
+    let (o, sid) = root_with_reviewer(&env, &gw, &["subagent"], &[], vec![]).await;
+    run_turn(&o, &sid, "go").await;
+    let child = links(&env, &sid).await[0].child_session_id.clone().unwrap();
+    let before = history(&o, &child).await;
+
+    // Child đang rảnh vẫn không nhận input trực tiếp từ host.
+    let e = o
+        .submit(&alice(), &child, "direct".into())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), ErrorCode::PermissionDenied);
+    assert_eq!(history(&o, &child).await, before);
+    assert_eq!(gw.call_count(), 3);
+    // Đọc vẫn được; child vẫn resume được qua parent.
+    let child_for_script = child.clone();
+    gw.push_with(move |_| {
+        tool_call_response("c2", sub_resume("reviewer", &child_for_script, "more"))
+    });
+    gw.push_text("child more");
+    gw.push_text("root again");
+    let r = run_turn(&o, &sid, "again").await;
+    assert_eq!(r.status, RunStatus::Completed, "{:?}", r.error);
+    assert_eq!(links(&env, &sid).await.len(), 2);
 }
 
 // ─────────────────────────────── AT-10 ───────────────────────────────
@@ -763,7 +830,7 @@ async fn at13_fake_proves_routing_selection_follows_the_child_definition() {
 // ─────────────────────────────── AT-14 ───────────────────────────────
 
 #[tokio::test]
-async fn at14_second_run_on_an_active_child_is_rejected_and_history_stays_clean() {
+async fn at14_no_second_run_can_enter_an_active_child_and_history_stays_clean() {
     let env = Env::new();
     let gw = ScriptedGateway::new();
     let (slow, slow_runs) = Probe::new(
@@ -778,7 +845,9 @@ async fn at14_second_run_on_an_active_child_is_rejected_and_history_stays_clean(
     let (o, sid) = root_with_reviewer(&env, &gw, &["subagent"], &["slow_ro"], vec![slow]).await;
 
     let turn = o.submit(&alice(), &sid, "go".into()).await.unwrap();
-    // Chờ child đang chạy (tool chậm) rồi cố submit trực tiếp vào child session.
+    // Chờ child đang chạy (tool chậm) rồi cố submit trực tiếp vào child session: bị từ chối
+    // (child chỉ nhận input qua parent). Tranh chấp giữa hai parent invocation được chứng minh
+    // ở store (`concurrent_resumes_of_one_child_admit_exactly_one`).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while slow_runs.load(Ordering::SeqCst) == 0 {
         assert!(
@@ -792,7 +861,7 @@ async fn at14_second_run_on_an_active_child_is_rejected_and_history_stays_clean(
         .submit(&alice(), &child, "intruder".into())
         .await
         .unwrap_err();
-    assert_eq!(e.code(), ErrorCode::SessionBusy);
+    assert_eq!(e.code(), ErrorCode::PermissionDenied);
 
     let r = wait_terminal(&o, &alice(), &sid, &turn.turn_id).await;
     assert_eq!(r.status, RunStatus::Completed, "{:?}", r.error);
