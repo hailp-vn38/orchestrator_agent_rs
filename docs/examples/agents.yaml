@@ -1,0 +1,42 @@
+# SCHEMA MINH HOA CHO PROJECT NAY — KHONG PHAI CONFIG CUA OPENCODE
+runtime:
+  max_subagent_depth: 1
+  max_children_per_root_run: 10
+  max_concurrent_children: 1
+  child_timeout_s: 120
+  max_tool_output_bytes: 51200
+  max_tool_output_lines: 2000
+  # Foreground-only MVP: no background or auto-compaction
+
+agents:
+  root:
+    mode: primary
+    description: Root orchestrator
+    prompt: prompts/root.md
+    provider: openai
+    model: gpt-4.1-mini
+    max_steps: 20
+    tools: [subagent, skill, read_file, search_code]
+    skills: [task-planning]
+
+  explorer:
+    mode: subagent
+    description: Explore codebase and report findings
+    prompt: prompts/explorer.md
+    provider: google
+    model: gemini-2.5-flash
+    max_steps: 15
+    tools: [skill, read_file, search_code]
+    skills: [rust-review]
+
+  reviewer:
+    mode: subagent
+    description: Review code correctness
+    prompt: prompts/reviewer.md
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    max_steps: 15
+    tools: [skill, read_file, search_code]
+    skills: [rust-review]
+
+# Model IDs can change; resolve availability against configured providers at startup.
