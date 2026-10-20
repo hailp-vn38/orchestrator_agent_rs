@@ -22,6 +22,13 @@ pub(crate) const DB_FILE: &str = "orchestrator.db";
 /// SQLite busy timeout cho writer contention (profile G0: transaction ngắn, pool nhỏ).
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_MAX_CONNECTIONS: u32 = 5;
+/// Timeout chờ connection từ pool. Với feature `test-support` clock tokio có thể bị pause
+/// (AT-11): clock ảo nhảy tới timer gần nhất mỗi khi runtime chờ thread của SQLite, nên
+/// timer này phải luôn là timer xa nhất để không gây lỗi giả.
+#[cfg(not(feature = "test-support"))]
+const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "test-support")]
+const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 /// Trần độ dài `error_message` được persist.
 const MAX_ERROR_MESSAGE: usize = 500;
 
@@ -35,6 +42,7 @@ pub(crate) struct RunRoute {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RunRecord {
+    pub run_id: String,
     pub session_id: String,
     pub agent_id: String,
     pub provider_id: String,
@@ -112,6 +120,36 @@ pub(crate) enum TranscriptEntry {
         text: String,
     },
 }
+
+/// Checkpoint compaction mới nhất của session (docs/09 §9.8). Transcript gốc không bị xóa;
+/// model context = summary + các entry có `sequence >= keep_from_sequence`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Checkpoint {
+    pub summary: String,
+    pub keep_from_sequence: u64,
+    /// Yêu cầu của user cho turn đang chạy, chỉ có khi message gốc nằm trong phần đã nén.
+    pub objective: Option<String>,
+}
+
+/// Dữ liệu để ghi một checkpoint mới.
+#[derive(Debug, Clone)]
+pub(crate) struct NewCheckpoint {
+    pub summary: String,
+    pub keep_from_sequence: u64,
+    pub objective: Option<String>,
+    /// `provider/model` đã sinh summary (không chứa secret).
+    pub model_ref: String,
+}
+
+/// Context của một session đã áp checkpoint mới nhất: entry kèm `sequence`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Context {
+    pub checkpoint: Option<Checkpoint>,
+    pub entries: Vec<(u64, TranscriptEntry)>,
+}
+
+/// Version của encoding checkpoint trong `messages.content_json`.
+const CHECKPOINT_VERSION: u32 = 1;
 
 /// Invocation đã persist nhưng chưa settle. `started=false`: `requested` (chưa từng chạy);
 /// `started=true`: `running` (outcome chưa biết nếu process chết giữa chừng).
@@ -212,6 +250,7 @@ impl SessionStore {
             .busy_timeout(BUSY_TIMEOUT);
         let pool = SqlitePoolOptions::new()
             .max_connections(POOL_MAX_CONNECTIONS)
+            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .connect_with(options)
             .await
             .map_err(db("open pool"))?;
@@ -483,6 +522,7 @@ impl SessionStore {
         let permissions: Option<String> =
             row.try_get("permissions_json").map_err(db("read policy"))?;
         Ok(Some(RunRecord {
+            run_id: run_id.to_owned(),
             session_id: row.try_get("session_id").map_err(db("read run"))?,
             agent_id: row.try_get("agent_id").map_err(db("read run"))?,
             provider_id: row.try_get("provider_id").map_err(db("read run"))?,
@@ -498,26 +538,33 @@ impl SessionStore {
         }))
     }
 
-    /// Transcript user/assistant/tool của session theo thứ tự (toàn bộ; compaction ở M4).
+    /// Context của session: checkpoint compaction mới nhất (nếu có) và các entry
+    /// user/assistant/tool từ `keep_from_sequence` trở đi theo thứ tự `sequence`.
     pub(crate) async fn conversation(
         &self,
         session_id: &str,
-    ) -> Result<Vec<TranscriptEntry>, OrchestratorError> {
+    ) -> Result<Context, OrchestratorError> {
+        let checkpoint = self.latest_checkpoint(session_id).await?;
+        let from = checkpoint.as_ref().map_or(0, |c| c.keep_from_sequence);
         let rows = sqlx::query(
-            "SELECT m.role, m.content_json, m.tool_call_id, ti.tool_name \
+            "SELECT m.sequence, m.role, m.content_json, m.tool_call_id, ti.tool_name \
              FROM messages m LEFT JOIN tool_invocations ti ON ti.id = m.tool_invocation_id \
-             WHERE m.session_id = ?1 AND m.role IN ('user', 'assistant', 'tool') \
+             WHERE m.session_id = ?1 AND m.sequence >= ?2 \
+             AND m.role IN ('user', 'assistant', 'tool') \
              ORDER BY m.sequence",
         )
         .bind(session_id)
+        .bind(from as i64)
         .fetch_all(&self.pool)
         .await
         .map_err(db("load conversation"))?;
-        rows.iter()
+        let entries = rows
+            .iter()
             .map(|r| {
                 let role: String = r.try_get("role").map_err(db("read role"))?;
+                let seq: i64 = r.try_get("sequence").map_err(db("read sequence"))?;
                 let json: String = r.try_get("content_json").map_err(db("read content"))?;
-                Ok(match role.as_str() {
+                let entry = match role.as_str() {
                     "user" => TranscriptEntry::User(text_of(&json)),
                     "tool" => {
                         let call_id: Option<String> =
@@ -534,9 +581,125 @@ impl SessionStore {
                         text: text_of(&json),
                         calls: calls_of(&json),
                     },
-                })
+                };
+                Ok((seq as u64, entry))
             })
-            .collect()
+            .collect::<Result<Vec<_>, OrchestratorError>>()?;
+        Ok(Context {
+            checkpoint,
+            entries,
+        })
+    }
+
+    async fn latest_checkpoint(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Checkpoint>, OrchestratorError> {
+        let json: Option<String> = sqlx::query_scalar(
+            "SELECT content_json FROM messages WHERE session_id = ?1 AND role = 'compaction' \
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db("load checkpoint"))?;
+        Ok(json.and_then(|j| {
+            let parsed = serde_json::from_str::<serde_json::Value>(&j).ok();
+            if parsed.is_none() {
+                tracing::warn!("latest compaction checkpoint is unreadable; ignoring it");
+            }
+            let v = parsed?;
+            Some(Checkpoint {
+                summary: v.get("summary")?.as_str()?.to_owned(),
+                keep_from_sequence: v.get("keep_from_sequence")?.as_u64()?,
+                objective: v
+                    .get("objective")
+                    .and_then(|o| o.as_str())
+                    .map(str::to_owned),
+            })
+        }))
+    }
+
+    /// Ghi checkpoint compaction của session mà run đang chạy (một transaction, một sequence).
+    /// Original messages không bị đụng tới. `Ok(false)`: run không còn `running`, hoặc
+    /// frontier không tiến so với checkpoint trước / vượt quá message cuối.
+    pub(crate) async fn append_compaction(
+        &self,
+        run_id: &str,
+        checkpoint: &NewCheckpoint,
+    ) -> Result<bool, OrchestratorError> {
+        let mut tx = self.pool.begin().await.map_err(db("begin compaction"))?;
+        let Some((session_id, seq)) = claim_sequence(&mut tx, run_id).await? else {
+            let _ = tx.rollback().await;
+            return Ok(false);
+        };
+        let previous: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(CAST(json_extract(content_json, '$.keep_from_sequence') AS INTEGER)) \
+             FROM messages WHERE session_id = ?1 AND role = 'compaction'",
+        )
+        .bind(&session_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db("read previous frontier"))?;
+        let frontier = checkpoint.keep_from_sequence as i64;
+        if frontier <= previous.unwrap_or(0) || frontier >= seq {
+            let _ = tx.rollback().await;
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO messages(id, session_id, sequence, role, content_json, run_id) \
+             VALUES(?1, ?2, ?3, 'compaction', ?4, ?5)",
+        )
+        .bind(new_id())
+        .bind(&session_id)
+        .bind(seq)
+        .bind(
+            serde_json::json!({
+                "text": checkpoint.summary,
+                "summary": checkpoint.summary,
+                "keep_from_sequence": checkpoint.keep_from_sequence,
+                "objective": checkpoint.objective,
+                "version": CHECKPOINT_VERSION,
+                "model_ref": checkpoint.model_ref,
+            })
+            .to_string(),
+        )
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db("insert compaction"))?;
+        tx.commit().await.map_err(db("commit compaction"))?;
+        Ok(true)
+    }
+
+    /// Số step đã commit của run (assistant message có tool call hoặc final).
+    pub(crate) async fn run_steps(&self, run_id: &str) -> Result<u32, OrchestratorError> {
+        let steps: Option<i64> = sqlx::query_scalar("SELECT steps FROM agent_runs WHERE id = ?1")
+            .bind(run_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db("read run steps"))?;
+        Ok(steps.unwrap_or(0).max(0) as u32)
+    }
+
+    /// Cộng usage provider báo (chỉ số đo được, không ước lượng) vào run đang chạy.
+    pub(crate) async fn add_usage(
+        &self,
+        run_id: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<(), OrchestratorError> {
+        sqlx::query(
+            "UPDATE agent_runs SET input_tokens = input_tokens + ?2, \
+             output_tokens = output_tokens + ?3 WHERE id = ?1 AND status = 'running'",
+        )
+        .bind(run_id)
+        .bind(input_tokens.min(i64::MAX as u64) as i64)
+        .bind(output_tokens.min(i64::MAX as u64) as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(db("add usage"))?;
+        Ok(())
     }
 
     /// Final assistant message, `final_message_id` và terminal `completed` cùng transaction.

@@ -12,7 +12,7 @@ use crate::executor::{ToolExecutor, ToolLimits};
 use crate::gateway::{ClientGateway, LlmGateway};
 use crate::owner_lock::OwnerLock;
 use crate::prompt::PromptBuilder;
-use crate::runtime::AgentRuntime;
+use crate::runtime::{AgentRuntime, ContextPolicy};
 use crate::skill::SkillManager;
 use crate::store::{RunRoute, SessionStore, DB_FILE};
 use crate::subagent::TaskManager;
@@ -351,7 +351,18 @@ impl OrchestratorBuilder {
             Some(g) => g,
             None => Arc::new(ClientGateway::new(&self.config.llm.providers)),
         };
-        let runtime = AgentRuntime::new(store.clone(), gateway, prompt_builder, executor, agents);
+        let runtime = AgentRuntime::new(
+            store.clone(),
+            gateway,
+            prompt_builder,
+            executor,
+            agents,
+            ContextPolicy {
+                limit_tokens: self.config.runtime.context_limit_tokens,
+                threshold_percent: self.config.runtime.compaction_threshold_percent,
+                keep_recent: self.config.runtime.compaction_keep_recent,
+            },
+        );
         let supervisor = Supervisor::start(
             store.clone(),
             runtime,

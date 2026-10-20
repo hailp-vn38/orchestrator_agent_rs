@@ -9,9 +9,10 @@ use std::collections::HashMap;
 
 use tracing::warn;
 
+use crate::compaction::summary_message;
 use crate::gateway::{ModelMessage, ModelRole, ModelToolCall};
 use crate::skill::{xml_escape, SkillSummary};
-use crate::store::TranscriptEntry;
+use crate::store::{Context, TranscriptEntry};
 
 /// Ghép system prompt tĩnh: base luôn đứng đầu, prompt của agent không thay thế được.
 pub(crate) fn build_system(base: &str, agent_prompt: &str) -> String {
@@ -63,6 +64,19 @@ impl PromptBuilder {
         }
         Some(system)
     }
+}
+
+/// Context của session → model messages: summary của checkpoint (nếu có) rồi các exchange
+/// settled từ frontier. Transcript gốc trong SQLite không bị thay đổi.
+pub(crate) fn context_messages(context: Context) -> Vec<ModelMessage> {
+    let mut out = Vec::new();
+    if let Some(checkpoint) = &context.checkpoint {
+        out.push(summary_message(checkpoint));
+    }
+    out.extend(model_messages(
+        context.entries.into_iter().map(|(_, e)| e).collect(),
+    ));
+    out
 }
 
 /// Transcript → model messages. Một assistant tool-call message chỉ được gửi khi **mọi** call

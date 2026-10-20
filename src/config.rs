@@ -82,6 +82,12 @@ pub struct RuntimeConfig {
     pub tool_result_hard_cap_bytes: usize,
     /// Trần byte của một `SKILL.md`; vượt thì `skill(id)` trả lỗi rõ, không cắt âm thầm.
     pub skill_max_bytes: usize,
+    /// Context window (token, **ước lượng** ~4 byte/token) dùng để quyết định compaction.
+    pub context_limit_tokens: usize,
+    /// Phần trăm `context_limit_tokens` mà request ước lượng chạm tới thì auto compaction.
+    pub compaction_threshold_percent: u8,
+    /// Số exchange settled gần nhất luôn giữ nguyên văn (không đưa vào summary).
+    pub compaction_keep_recent: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -95,6 +101,9 @@ impl Default for RuntimeConfig {
             tool_output_cap_bytes: 64 * 1024,
             tool_result_hard_cap_bytes: 8 * 1024 * 1024,
             skill_max_bytes: 64 * 1024,
+            context_limit_tokens: 100_000,
+            compaction_threshold_percent: 80,
+            compaction_keep_recent: 2,
         }
     }
 }
@@ -123,6 +132,15 @@ impl RuntimeConfig {
         }
         if self.skill_max_bytes == 0 {
             return bad("skill_max_bytes must be > 0");
+        }
+        if self.context_limit_tokens == 0 {
+            return bad("context_limit_tokens must be > 0");
+        }
+        if !(1..=99).contains(&self.compaction_threshold_percent) {
+            return bad("compaction_threshold_percent must be in 1..=99");
+        }
+        if self.compaction_keep_recent == 0 {
+            return bad("compaction_keep_recent must be >= 1");
         }
         if !(1..=500).contains(&self.page_size) {
             return bad("page_size must be in 1..=500");

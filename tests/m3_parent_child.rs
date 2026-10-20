@@ -270,6 +270,7 @@ fn tool_call_response(id: &str, args: Value) -> ModelResponse {
             name: "subagent".into(),
             arguments: args,
         }],
+        usage: None,
     }
 }
 

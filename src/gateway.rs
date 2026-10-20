@@ -1,8 +1,9 @@
 //! `LlmGateway`: internal seam giữa runtime và provider protocol (docs/08, docs/18 §18.5).
 //!
 //! Production dùng [`ClientGateway`] trên crate `llm` (pin `=1.3.8`, evidence G0). Type của
-//! `llm` không bao giờ ra public API. M2: tool definitions/calls/results; stream vẫn được gom
-//! nội bộ (live delta/ordering đến ở M4).
+//! `llm` không bao giờ ra public API. M2: tool definitions/calls/results. M4: stream được lắp
+//! ráp thành một response duy nhất; text delta và `ToolCallReady` chỉ là preview qua
+//! [`StreamSink`] (không persist, không kích hoạt execution).
 //!
 //! Item ở đây là `pub` trong module private; chỉ re-export qua `test_support` khi bật
 //! feature `test-support`, để production host không thể inject/lắp ráp gateway.
@@ -103,13 +104,37 @@ pub struct ModelRequest {
     pub tools: Vec<ModelTool>,
 }
 
+/// Usage do provider báo; `None` ở cấp response nghĩa là provider không trả số liệu
+/// (runtime không bịa số và không coi đó là lỗi).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelResponse {
     pub text: String,
     pub finish_reason: String,
     /// Chỉ có khi toàn response đã `Done` và mọi arguments là JSON hợp lệ.
     pub tool_calls: Vec<ModelToolCall>,
+    pub usage: Option<ModelUsage>,
 }
+
+/// Preview ephemeral trong lúc stream. Không phải trạng thái bền vững: lỗi/hủy giữa chừng
+/// khiến mọi preview bị bỏ, và `ToolCallReady` **không** cho phép execute tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamEvent {
+    TextDelta(String),
+    /// Một call đã đủ arguments hợp lệ nhưng response chưa `Finished` (chưa được xác nhận).
+    ToolCallReady {
+        id: String,
+        name: String,
+    },
+}
+
+/// Nơi nhận preview; gọi đồng bộ theo đúng thứ tự provider phát.
+pub type StreamSink<'a> = &'a (dyn Fn(StreamEvent) + Send + Sync);
 
 /// Lỗi gateway đã sanitize: văn bản thô của provider bị bỏ (có thể echo secret).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +147,8 @@ pub enum GatewayError {
     Timeout,
     Cancelled,
     Protocol,
+    /// Provider từ chối vì prompt vượt context window trước khi sinh output.
+    ContextOverflow,
 }
 
 impl GatewayError {
@@ -135,6 +162,7 @@ impl GatewayError {
             Self::Timeout => "PROVIDER_TIMEOUT",
             Self::Cancelled => "CANCELLED",
             Self::Protocol => "PROVIDER_PROTOCOL_ERROR",
+            Self::ContextOverflow => "CONTEXT_LIMIT",
         }
     }
 
@@ -149,6 +177,7 @@ impl GatewayError {
             Self::Timeout => "the provider request timed out",
             Self::Cancelled => "the request was cancelled",
             Self::Protocol => "the provider returned an unexpected response",
+            Self::ContextOverflow => "the conversation exceeds the model context limit",
         }
     }
 }
@@ -156,11 +185,12 @@ impl GatewayError {
 #[async_trait]
 pub trait LlmGateway: Send + Sync {
     /// Một lượt model hoàn chỉnh. Chỉ trả `Ok` khi toàn response đã `Done`; mọi
-    /// lỗi/hủy/timeout giữa chừng loại bỏ phần text đã nhận.
+    /// lỗi/hủy/timeout giữa chừng loại bỏ phần text và call đã nhận. `sink` chỉ nhận preview.
     async fn complete(
         &self,
         request: &ModelRequest,
         cancel: &CancellationToken,
+        sink: StreamSink<'_>,
     ) -> Result<ModelResponse, GatewayError>;
 }
 
@@ -235,6 +265,7 @@ impl LlmGateway for ClientGateway {
         &self,
         request: &ModelRequest,
         cancel: &CancellationToken,
+        sink: StreamSink<'_>,
     ) -> Result<ModelResponse, GatewayError> {
         let cfg = self
             .providers
@@ -266,7 +297,7 @@ impl LlmGateway for ClientGateway {
                 .chat_stream_with_tools(&messages, (!tools.is_empty()).then_some(&tools[..]))
                 .await
                 .map_err(|e| map_error(&e))?;
-            collect(raw).await
+            collect(raw, sink).await
         };
         tokio::select! {
             () = cancel.cancelled() => Err(GatewayError::Cancelled),
@@ -336,7 +367,7 @@ fn to_chat_messages(messages: &[ModelMessage]) -> Vec<ChatMessage> {
 /// Gom stream thành một response đã `Done`. Stream cụt (không `Done`) là lỗi protocol.
 /// Tool call chỉ được trả khi **toàn** response kết thúc thành công: lỗi/hủy/timeout sau
 /// `ToolUseComplete` vẫn loại bỏ mọi call đã nhận (không có gì để dispatch).
-async fn collect(mut raw: RawStream) -> Result<ModelResponse, GatewayError> {
+async fn collect(mut raw: RawStream, sink: StreamSink<'_>) -> Result<ModelResponse, GatewayError> {
     let mut text = String::new();
     let mut tool_calls = Vec::new();
     loop {
@@ -344,7 +375,12 @@ async fn collect(mut raw: RawStream) -> Result<ModelResponse, GatewayError> {
             None => return Err(GatewayError::Protocol),
             Some(Err(e)) => return Err(map_error(&e)),
             Some(Ok(chunk)) => match chunk {
-                StreamChunk::Text(t) => text.push_str(&t),
+                StreamChunk::Text(t) => {
+                    if !t.is_empty() {
+                        sink(StreamEvent::TextDelta(t.clone()));
+                    }
+                    text.push_str(&t);
+                }
                 StreamChunk::ToolUseStart { .. } | StreamChunk::ToolUseInputDelta { .. } => {}
                 StreamChunk::ToolUseComplete { tool_call, .. } => {
                     let raw_args = tool_call.function.arguments.trim();
@@ -353,6 +389,10 @@ async fn collect(mut raw: RawStream) -> Result<ModelResponse, GatewayError> {
                     } else {
                         serde_json::from_str(raw_args).map_err(|_| GatewayError::Protocol)?
                     };
+                    sink(StreamEvent::ToolCallReady {
+                        id: tool_call.id.clone(),
+                        name: tool_call.function.name.clone(),
+                    });
                     tool_calls.push(ModelToolCall {
                         id: tool_call.id,
                         name: tool_call.function.name,
@@ -364,7 +404,9 @@ async fn collect(mut raw: RawStream) -> Result<ModelResponse, GatewayError> {
                         text,
                         finish_reason: stop_reason,
                         tool_calls,
-                    })
+                        // `llm` 1.3.8 không phát usage trong stream: thiếu usage không phải lỗi.
+                        usage: None,
+                    });
                 }
             },
         }
@@ -375,10 +417,19 @@ async fn collect(mut raw: RawStream) -> Result<ModelResponse, GatewayError> {
 fn map_error(e: &LLMError) -> GatewayError {
     match e {
         LLMError::AuthError(_) => GatewayError::Auth,
+        LLMError::InvalidRequest(m) if looks_like_overflow(m) => GatewayError::ContextOverflow,
         LLMError::InvalidRequest(_) | LLMError::ToolConfigError(_) => GatewayError::InvalidRequest,
         LLMError::ProviderError(_) => GatewayError::Provider,
         LLMError::HttpError(_) | LLMError::RetryExceeded { .. } => GatewayError::Transport,
-        LLMError::ResponseFormatError { message, .. } => match http_status(message) {
+        LLMError::ResponseFormatError {
+            message,
+            raw_response,
+        } => match http_status(message) {
+            Some(400) | Some(413) | Some(422)
+                if looks_like_overflow(message) || looks_like_overflow(raw_response) =>
+            {
+                GatewayError::ContextOverflow
+            }
             Some(401) | Some(403) => GatewayError::Auth,
             Some(400) | Some(404) | Some(413) | Some(422) => GatewayError::InvalidRequest,
             Some(429) | Some(500..=599) => GatewayError::Provider,
@@ -386,6 +437,24 @@ fn map_error(e: &LLMError) -> GatewayError {
         },
         LLMError::JsonError(_) | LLMError::Generic(_) => GatewayError::Protocol,
     }
+}
+
+/// Nhận diện lỗi overflow từ mô tả của provider. Chỉ dùng để phân loại; văn bản không bao
+/// giờ được echo ra ngoài.
+fn looks_like_overflow(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    [
+        "context_length_exceeded",
+        "context length",
+        "context window",
+        "maximum context",
+        "too many tokens",
+        "prompt is too long",
+        "reduce the length",
+        "request too large",
+    ]
+    .iter()
+    .any(|needle| t.contains(needle))
 }
 
 fn http_status(msg: &str) -> Option<u16> {
@@ -397,13 +466,28 @@ fn http_status(msg: &str) -> Option<u16> {
 mod tests {
     use super::*;
 
+    async fn collect_q(raw: RawStream) -> Result<ModelResponse, GatewayError> {
+        collect(raw, &|_| {}).await
+    }
+
+    /// Chạy `collect` và trả kèm preview theo đúng thứ tự nhận được.
+    async fn collect_events(
+        raw: RawStream,
+    ) -> (Result<ModelResponse, GatewayError>, Vec<StreamEvent>) {
+        let seen = Mutex::new(Vec::new());
+        let sink = |e: StreamEvent| seen.lock().unwrap().push(e);
+        let r = collect(raw, &sink).await;
+        let events = seen.into_inner().unwrap();
+        (r, events)
+    }
+
     fn stream(items: Vec<Result<StreamChunk, LLMError>>) -> RawStream {
         Box::pin(futures::stream::iter(items))
     }
 
     #[tokio::test]
     async fn collects_text_until_done() {
-        let r = collect(stream(vec![
+        let r = collect_q(stream(vec![
             Ok(StreamChunk::Text("he".into())),
             Ok(StreamChunk::Text("llo".into())),
             Ok(StreamChunk::Done {
@@ -418,9 +502,9 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_or_failed_stream_discards_text() {
-        let cut = collect(stream(vec![Ok(StreamChunk::Text("x".into()))])).await;
+        let cut = collect_q(stream(vec![Ok(StreamChunk::Text("x".into()))])).await;
         assert_eq!(cut, Err(GatewayError::Protocol));
-        let failed = collect(stream(vec![
+        let failed = collect_q(stream(vec![
             Ok(StreamChunk::Text("x".into())),
             Err(LLMError::HttpError("boom sk-SECRET".into())),
         ]))
@@ -441,7 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_calls_are_returned_only_after_done() {
-        let r = collect(stream(vec![
+        let r = collect_q(stream(vec![
             Ok(StreamChunk::ToolUseStart {
                 index: 0,
                 id: "c1".into(),
@@ -478,7 +562,7 @@ mod tests {
     /// AT-35 (mức gateway): lỗi sau `ToolUseComplete` mà chưa `Done` → không trả call nào.
     #[tokio::test]
     async fn error_after_complete_tool_call_yields_no_calls() {
-        let failed = collect(stream(vec![
+        let failed = collect_q(stream(vec![
             Ok(StreamChunk::ToolUseComplete {
                 index: 0,
                 tool_call: tool_call("c1", "{}"),
@@ -487,7 +571,7 @@ mod tests {
         ]))
         .await;
         assert_eq!(failed, Err(GatewayError::Transport));
-        let cut = collect(stream(vec![Ok(StreamChunk::ToolUseComplete {
+        let cut = collect_q(stream(vec![Ok(StreamChunk::ToolUseComplete {
             index: 0,
             tool_call: tool_call("c1", "{}"),
         })]))
@@ -497,7 +581,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_tool_arguments_are_a_protocol_error() {
-        let r = collect(stream(vec![
+        let r = collect_q(stream(vec![
             Ok(StreamChunk::ToolUseComplete {
                 index: 0,
                 tool_call: tool_call("c1", "{bad"),
@@ -562,5 +646,69 @@ mod tests {
         ] {
             assert!(!e.message().contains("sk-"));
         }
+    }
+
+    /// AT-26 (mức gateway): 20 fragment được phát đúng thứ tự và gom đúng nội dung.
+    #[tokio::test]
+    async fn twenty_text_fragments_stream_in_order_and_assemble() {
+        let mut items: Vec<Result<StreamChunk, LLMError>> = (0..20)
+            .map(|i| Ok(StreamChunk::Text(format!("[{i}]"))))
+            .collect();
+        items.push(Ok(StreamChunk::Done {
+            stop_reason: "end_turn".into(),
+        }));
+        let (r, events) = collect_events(stream(items)).await;
+        let expected: Vec<String> = (0..20).map(|i| format!("[{i}]")).collect();
+        let deltas: Vec<String> = events
+            .iter()
+            .map(|e| match e {
+                StreamEvent::TextDelta(t) => t.clone(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(deltas, expected);
+        assert_eq!(r.unwrap().text, expected.concat());
+    }
+
+    /// AT-35: `ToolCallReady` chỉ là preview; lỗi trước `Done` không trả call nào.
+    #[tokio::test]
+    async fn tool_call_ready_then_error_is_a_preview_only() {
+        let (r, events) = collect_events(stream(vec![
+            Ok(StreamChunk::ToolUseComplete {
+                index: 0,
+                tool_call: tool_call("c1", "{}"),
+            }),
+            Err(LLMError::HttpError("boom".into())),
+        ]))
+        .await;
+        assert_eq!(r, Err(GatewayError::Transport));
+        assert_eq!(
+            events,
+            vec![StreamEvent::ToolCallReady {
+                id: "c1".into(),
+                name: "t".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn context_overflow_is_classified_without_leaking_text() {
+        let overflow = LLMError::ResponseFormatError {
+            message: "API returned error status: 400 Bad Request".into(),
+            raw_response: "{\"error\":{\"code\":\"context_length_exceeded\",\"key\":\"sk-LEAK\"}}"
+                .into(),
+        };
+        assert_eq!(map_error(&overflow), GatewayError::ContextOverflow);
+        assert_eq!(
+            map_error(&LLMError::InvalidRequest("prompt is too long".into())),
+            GatewayError::ContextOverflow
+        );
+        let plain = LLMError::ResponseFormatError {
+            message: "API returned error status: 400 Bad Request".into(),
+            raw_response: "bad".into(),
+        };
+        assert_eq!(map_error(&plain), GatewayError::InvalidRequest);
+        assert_eq!(GatewayError::ContextOverflow.code(), "CONTEXT_LIMIT");
+        assert!(!GatewayError::ContextOverflow.message().contains("sk-"));
     }
 }

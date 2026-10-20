@@ -6,9 +6,11 @@
 //! managed supervisor, single-agent text run, `result`/`history`.
 //! M2 (tools & skills): ToolExecutor, SkillManager, PromptBuilder, tool loop tuần tự.
 //! M3 (parent–child): tool `subagent` foreground, child session riêng, admission atomic.
-//! Compaction, recovery đầy đủ đến ở M4+.
+//! M4 (continuous): steps cap tùy chọn, auto compaction trong active turn, stream assembly.
+//! Recovery đầy đủ đến ở M5+.
 
 mod agent;
+mod compaction;
 mod config;
 mod error;
 mod executor;
