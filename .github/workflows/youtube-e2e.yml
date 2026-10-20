@@ -1,16 +1,6 @@
 name: YouTube E2E (offline)
 
 on:
-  push:
-    branches:
-      - feature/youtube-transcript-e2e
-    paths:
-      - Cargo.toml
-      - Cargo.lock
-      - examples/youtube_flow.rs
-      - examples/youtube_flow/**
-      - tests/youtube_flow.rs
-      - .github/workflows/youtube-e2e.yml
   pull_request:
     paths:
       - Cargo.toml
@@ -20,6 +10,10 @@ on:
       - tests/youtube_flow.rs
       - .github/workflows/youtube-e2e.yml
   workflow_dispatch:
+
+concurrency:
+  group: youtube-e2e-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
