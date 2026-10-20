@@ -4,7 +4,7 @@ Thư viện Rust **nhúng vào server hiện có** để điều phối nhiều 
 tool và skill do host cung cấp. Core không phụ thuộc web framework: host sở hữu Tokio runtime,
 transport, AuthN/AuthZ và đăng ký domain tool qua trait `HostTool`.
 
-- Crate: `orchestrator_agent_rs` v0.1.0 (`publish = false`), edition 2021, Rust ≥ 1.89
+- Crate: `orchestrator-agent` v0.1.0 (import là `orchestrator_agent_rs`), edition 2021, Rust ≥ 1.89
 - Kiến trúc: Root/Subagent dùng chung `AgentRuntime`, crate [`llm`](https://crates.io/crates/llm) `=1.3.8`,
   SQLx/SQLite làm execution store, `ArtifactStore` cục bộ bất biến
 - Thiết kế chi tiết: [docs/README.md](docs/README.md) · Hợp đồng public: [docs/18-embeddable-library.md](docs/18-embeddable-library.md)
@@ -34,7 +34,7 @@ transport, AuthN/AuthZ và đăng ký domain tool qua trait `HostTool`.
 
 ```toml
 [dependencies]
-orchestrator_agent_rs = { path = "../orchestrator_agent_rs" }
+orchestrator-agent = "0.1"
 async-trait = "0.1"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
@@ -484,3 +484,7 @@ Bằng chứng từng milestone: [docs/evidence/](docs/evidence/) · Spec triể
 | [Ví dụ cấu hình](docs/examples/agents.yaml) | Host-side DTO mẫu (core không parse YAML) |
 
 [Review report](docs/research/design-review-report.md) là snapshot lịch sử trước khi chốt v5.0.
+
+## License
+
+Dual-licensed under MIT OR Apache-2.0 (xem `LICENSE-MIT`, `LICENSE-APACHE`).

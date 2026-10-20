@@ -31,14 +31,14 @@ vài khe ngữ nghĩa giữa nhánh "lỗi trong process" với nhánh "crash r�
 
 | Thành phần | Trách nhiệm trong flow | Nguồn |
 |---|---|---|
-| `OrchestratorBuilder::build` | Validate config/registry/skills, snapshot prompt, lấy owner lock, mở SQLite, sweep artifact mồ côi, đánh dấu run cũ `interrupted`, startup recovery, nối runtime, start supervisor | [builder.rs](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/orchestrator/builder.rs#L86-L325) |
-| `Orchestrator` (facade) | `submit`/`result`/`history`/`cancel`/`archive`/`subscribe`/`snapshot`/`resolve_interrupted_invocation`/`shutdown` | [session.rs](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/orchestrator/session.rs), [lifecycle.rs](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/orchestrator/lifecycle.rs) |
-| `Supervisor` | Spawn đúng một worker cho mỗi claim `running` chưa có owner (sau admission, khi worker xong, sweep định kỳ); cancel từng run; shutdown | [supervisor.rs](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/supervisor.rs#L207-L289) |
-| `AgentRuntime` | Runner + transcript writer duy nhất: vòng model ⇄ tool, steps cap, compaction, terminal | [runtime/mod.rs](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/runtime/mod.rs#L124-L275) |
-| `ToolExecutor` | Validate schema/permission, chạy HostTool/skill/artifact_read/subagent với timeout + cancel hợp tác; không ghi transcript | [executor/dispatch.rs](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/executor/dispatch.rs) |
-| `TaskManager` | Admit child turn idempotent theo `invocation_id`, chờ kết quả child, map thành `ToolOutcome` | [subagent/manager.rs](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/subagent/manager.rs#L81-L204) |
-| `SessionStore` | Mọi transaction: admission, invocation, settle, terminal, recovery, snapshot | [store/](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/store) |
-| `Emitter`/`ExecutionFeed` | Publish committed event sau commit (kèm revision) và ephemeral delta | [feed/emitter.rs](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/feed/emitter.rs) |
+| `OrchestratorBuilder::build` | Validate config/registry/skills, snapshot prompt, lấy owner lock, mở SQLite, sweep artifact mồ côi, đánh dấu run cũ `interrupted`, startup recovery, nối runtime, start supervisor | [builder.rs](../../src/orchestrator/builder.rs#L86-L325) |
+| `Orchestrator` (facade) | `submit`/`result`/`history`/`cancel`/`archive`/`subscribe`/`snapshot`/`resolve_interrupted_invocation`/`shutdown` | [session.rs](../../src/orchestrator/session.rs), [lifecycle.rs](../../src/orchestrator/lifecycle.rs) |
+| `Supervisor` | Spawn đúng một worker cho mỗi claim `running` chưa có owner (sau admission, khi worker xong, sweep định kỳ); cancel từng run; shutdown | [supervisor.rs](../../src/supervisor.rs#L207-L289) |
+| `AgentRuntime` | Runner + transcript writer duy nhất: vòng model ⇄ tool, steps cap, compaction, terminal | [runtime/mod.rs](../../src/runtime/mod.rs#L124-L275) |
+| `ToolExecutor` | Validate schema/permission, chạy HostTool/skill/artifact_read/subagent với timeout + cancel hợp tác; không ghi transcript | [executor/dispatch.rs](../../src/executor/dispatch.rs) |
+| `TaskManager` | Admit child turn idempotent theo `invocation_id`, chờ kết quả child, map thành `ToolOutcome` | [subagent/manager.rs](../../src/subagent/manager.rs#L81-L204) |
+| `SessionStore` | Mọi transaction: admission, invocation, settle, terminal, recovery, snapshot | [store/](../../src/store) |
+| `Emitter`/`ExecutionFeed` | Publish committed event sau commit (kèm revision) và ephemeral delta | [feed/emitter.rs](../../src/feed/emitter.rs) |
 
 ### 2.2. Happy path: submit → final
 
@@ -104,16 +104,16 @@ stateDiagram-v2
   idempotent theo `invocation_id`.
 - **Cancel:** `active_run_family` trả parent trước child; có worker thì cancel token, chưa có thì
   ghi `cancelled` trực tiếp rồi cancel lần nữa để bắt worker vừa spawn
-  ([session.rs](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/orchestrator/session.rs#L155-L182)).
+  ([session.rs](../../src/orchestrator/session.rs#L155-L182)).
 - **Startup recovery:** dưới owner lock → `mark_stale_runs_interrupted` → `recover_all` (child
   trước parent) → chỉ tạo attempt mới khi mọi invocation chưa settle là `requested` hoặc
   replay-safe, child không bị chặn và routing identity không đổi
-  ([recovery.rs](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/store/recovery.rs#L284-L440)).
+  ([recovery.rs](../../src/store/recovery.rs#L284-L440)).
 - **Operator reconciliation:** ghi kết quả đã xác minh + audit trong một transaction, rồi
   `recover_after_resolution` đi từ session lên các parent.
 - **Shutdown:** đóng admission (write lock) → drain có hạn → cancel → spawn nốt claim chưa có
   owner để chúng bị `interrupted` đúng cách → join trong `grace` → đóng store → nhả lock; quá hạn
-  thì trả lỗi và **giữ** lock ([supervisor.rs](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/supervisor.rs#L160-L195)).
+  thì trả lỗi và **giữ** lock ([supervisor.rs](../../src/supervisor.rs#L160-L195)).
 
 ## 3. Điểm mạnh
 
@@ -142,7 +142,7 @@ stateDiagram-v2
 
 **Hiện trạng.** Khi không commit được, `execute` trả `false`, worker rời `owned` nhưng run vẫn
 `running`; sweep kế tiếp (mặc định 30 s) spawn lại. Nhánh
-[`commit_tool_calls` lỗi](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/runtime/mod.rs#L244-L252)
+[`commit_tool_calls` lỗi](../../src/runtime/mod.rs#L244-L252)
 được chú thích "sweep gọi lại LLM, an toàn" — an toàn về **correctness** nhưng không về chi phí.
 Nếu đọc vẫn được còn ghi thất bại kéo dài (đĩa đầy, file DB read-only, lock giữ lâu hơn
 `busy_timeout` 5 s), mỗi chu kỳ sweep sẽ gọi provider một lần, không có bộ đếm hay trần trong
@@ -160,7 +160,7 @@ process (`max_resume_attempts` chỉ áp cho recovery sau restart).
 
 ### FLOW-02 · P2 · Không giới hạn số run chạy đồng thời
 
-**Hiện trạng.** [`spawn_unowned`](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/supervisor.rs#L250-L289)
+**Hiện trạng.** [`spawn_unowned`](../../src/supervisor.rs#L250-L289)
 spawn worker cho **mọi** claim `running`. Không có semaphore toàn cục hay theo provider;
 `docs/08` chỉ ghi "global child semaphore thêm khi triển khai concurrent children", nhưng nhiều
 root session song song đã đủ gây burst.
@@ -180,7 +180,7 @@ hành vi). Claim vẫn durable và chờ slot; worker child không được bị
 | Nhánh | Parent | Child sau khi operator resolve |
 |---|---|---|
 | Crash → restart | Parent cũng `interrupted`, recovery bị chặn `RECOVERY_BLOCKED` chờ child | Child resume, rồi parent resume và nhận kết quả child — nhất quán |
-| Lỗi trong process | [`await_child`](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/subagent/manager.rs#L158-L204) thấy child terminal `interrupted` → `CHILD_FAILED`; parent tiếp tục và có thể đã `completed` | [`recover_after_resolution`](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/store/recovery.rs#L152-L181) vẫn resume child vì candidate filter không xét parent invocation đã settle |
+| Lỗi trong process | [`await_child`](../../src/subagent/manager.rs#L158-L204) thấy child terminal `interrupted` → `CHILD_FAILED`; parent tiếp tục và có thể đã `completed` | [`recover_after_resolution`](../../src/store/recovery.rs#L152-L181) vẫn resume child vì candidate filter không xét parent invocation đã settle |
 
 Kết quả: child chạy tiếp tốn token mà không ai tiêu thụ output; nếu model của parent sau đó
 gọi `subagent` với `session_id` đó, có thể nhận `SESSION_BUSY`.
@@ -196,7 +196,7 @@ Phương án (a) ảnh hưởng ADR-002 (Root tự đánh giá kết quả child
 ### FLOW-04 · P2 · `context_limit_tokens` và `tool_timeout` là toàn cục
 
 **Hiện trạng.** `ContextPolicy` và `ToolLimits` lấy từ `RuntimeConfig` dùng chung cho mọi agent
-và mọi tool ([config.rs](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/config.rs#L128-L145):
+và mọi tool ([config.rs](../../src/config.rs#L128-L145):
 100 000 token, 300 s). Root và Child được phép dùng provider/model khác nhau, context window
 thật có thể chênh nhiều lần; tool kiểu tải/transcribe video (xem `examples/video_summary.rs`)
 cần timeout khác tool đọc nhanh.
@@ -210,7 +210,7 @@ Model window lớn: compact sớm, mất ngữ cảnh không cần thiết. Tool
 
 ### FLOW-05 · P3 · Input của compaction không chặn tổng
 
-[`compaction::plan`](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/compaction.rs#L85-L141)
+[`compaction::plan`](../../src/compaction.rs#L85-L141)
 cắt từng item theo `SUMMARY_INPUT_ITEM_BYTES` nhưng không chặn tổng prefix. Ước lượng token là
 `bytes / BYTES_PER_TOKEN`, nên với model window nhỏ hoặc history có rất nhiều item ngắn, chính
 request tóm tắt có thể overflow → run `failed` với `CONTEXT_OVERFLOW`. Đề xuất: chặn tổng input
@@ -225,7 +225,7 @@ trigger + sweep của supervisor).
 
 ### FLOW-07 · P3 · Mỗi committed event đọc thêm DB một lần
 
-[`Emitter::committed_run`](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/feed/emitter.rs#L38-L42)
+[`Emitter::committed_run`](../../src/feed/emitter.rs#L38-L42)
 query `event_info_for_run` sau commit để lấy root/revision; một step có tool sinh nhiều event
 (message, tool.started × N, tool.completed × N). Đề xuất: các hàm store trả về
 `(root_session_id, revision)` từ chính transaction (`RETURNING state_revision`) để emitter khỏi
@@ -235,7 +235,7 @@ query `event_info_for_run` sau commit để lấy root/revision; một step có 
 
 - Tool `Mutating` không kiểm tra cờ `cancelled` sẽ chạy tới `tool_timeout` (300 s) và run kết
   thúc `interrupted/TOOL_OUTCOME_UNKNOWN` chứ không phải `cancelled`
-  ([dispatch.rs](file:///Users/lamphuchai/Desktop/orchestrator_agent_rs/src/executor/dispatch.rs#L91-L175)).
+  ([dispatch.rs](../../src/executor/dispatch.rs#L91-L175)).
   Hành vi này đúng về an toàn nhưng host dễ bất ngờ: cần ghi vào doc của `cancel` và `HostTool`.
 - `cancel` dùng `ensure_open` nên bị từ chối khi đang drain shutdown; với `shutdown_drain > 0`,
   host không thể hủy run đang drain. Cân nhắc cho phép `cancel` trong pha drain.

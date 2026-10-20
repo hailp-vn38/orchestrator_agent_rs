@@ -1,14 +1,22 @@
 [package]
-name = "orchestrator_agent_rs"
+name = "orchestrator-agent"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
-description = "Embeddable multi-agent orchestrator library (v5.0 design)"
-publish = false
+description = "Embeddable Root/Subagent orchestrator for Tokio hosts: durable SQLite history, crash recovery, tools, skills and local artifacts"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hailp-vn38/orchestrator_agent_rs"
+readme = "README.md"
+keywords = ["agent", "llm", "orchestrator", "tokio", "sqlite"]
+categories = ["asynchronous", "development-tools"]
 build = "build.rs"
 
 # Spike G0 là package độc lập (có [workspace] riêng), không thuộc library.
-exclude = ["spikes/", "docs/"]
+exclude = ["spikes/", "docs/", ".agents/", ".github/", ".cargo/", "scripts/", "skills-lock.json", ".env.live*", "AGENTS.md"]
+
+# Giữ tên crate Rust `orchestrator_agent_rs` cho code/test/example hiện có.
+[lib]
+name = "orchestrator_agent_rs"
 
 [features]
 # Seam test nội bộ (fake LlmGateway + fault hooks). Không bật trong build production;
@@ -30,6 +38,6 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-orchestrator_agent_rs = { path = ".", features = ["test-support"] }
+orchestrator_agent_rs = { path = ".", package = "orchestrator-agent", features = ["test-support"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync", "test-util"] }
 tempfile = "3"

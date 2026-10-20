@@ -42,7 +42,7 @@ Giới hạn: contention chỉ 1 process, 32 task; chưa đo storage limits/disk
 
 | Provider | Backend/model | Endpoint | Kết quả |
 |---|---|---|---|
-| OpenAI-compatible | `OpenAI` adapter / `gh/gpt-4o-mini` | `http://192.168.1.157:20128/v1` | **PASS 6/6 smoke checks**, qua gateway LAN; không phải chứng cứ upstream trực tiếp |
+| OpenAI-compatible | `OpenAI` adapter / `gh/gpt-4o-mini` | `http://<lan-gateway-host>:<port>/v1` | **PASS 6/6 smoke checks**, qua gateway LAN; không phải chứng cứ upstream trực tiếp |
 | Provider 2 | `Anthropic` / `claude-sonnet-4-5` | `https://api.anthropic.com` (thực tế) | **FAIL** `llm_auth` (401 invalid x-api-key) mọi bước; tool-result-continuation NOT_RUN |
 
 Nguyên nhân provider 2: biến môi trường `ANTHROPIC_*` trỏ tới gateway bên thứ ba (`agentrouter.org`), nhưng backend Anthropic của `llm 1.3.8` **hard-code** `https://api.anthropic.com/v1/messages` và bỏ qua `base_url`. Key proxy bị Anthropic từ chối. Đây chưa phải bằng chứng về capability của model.
