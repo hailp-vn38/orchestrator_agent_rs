@@ -10,7 +10,9 @@ use std::time::Duration;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
+mod observe;
 mod recovery;
+pub(crate) use observe::EventInfo;
 pub(crate) use recovery::{RecoveryPolicy, Resolution, CODE_NO_EFFECT, CODE_SHUTTING_DOWN};
 
 use crate::error::{ErrorCode, OrchestratorError};
@@ -478,6 +480,21 @@ impl SessionStore {
         session_id: &str,
     ) -> Result<(), OrchestratorError> {
         self.authorize(caller, session_id).await.map(|_| ())
+    }
+
+    /// Như [`Self::check_scope`] nhưng session phải là Root của một family (observation).
+    pub(crate) async fn check_root_scope(
+        &self,
+        caller: &CallerContext,
+        session_id: &str,
+    ) -> Result<(), OrchestratorError> {
+        if self.authorize(caller, session_id).await?.is_child {
+            return Err(OrchestratorError::new(
+                ErrorCode::InvalidInput,
+                "observation is addressed by the root session of a family",
+            ));
+        }
+        Ok(())
     }
 
     /// Kiểm tra owner/workspace; dùng cho mọi read công khai.
@@ -1079,26 +1096,7 @@ impl SessionStore {
 
         let mut items = Vec::with_capacity(rows.len().min(limit as usize));
         for row in &rows {
-            let role: String = row.try_get("role").map_err(db("read role"))?;
-            let json: String = row.try_get("content_json").map_err(db("read content"))?;
-            let sequence: i64 = row.try_get("sequence").map_err(db("read sequence"))?;
-            items.push(MessageView {
-                id: row.try_get("id").map_err(db("read id"))?,
-                sequence: sequence as u64,
-                role: MessageRole::parse(&role).ok_or_else(|| {
-                    OrchestratorError::new(ErrorCode::Internal, "unknown message role")
-                })?,
-                text: text_of(&json),
-                run_id: row.try_get("run_id").map_err(db("read run id"))?,
-                tool_call_id: row.try_get("tool_call_id").map_err(db("read call id"))?,
-                tool_calls: calls_of(&json)
-                    .into_iter()
-                    .map(|c| MessageToolCall {
-                        call_id: c.id,
-                        name: c.name,
-                    })
-                    .collect(),
-            });
+            items.push(message_from_row(row)?);
         }
         let next_cursor = if items.len() > limit as usize {
             items.truncate(limit as usize);
@@ -1392,6 +1390,29 @@ async fn admit_child_inner(
         session_id: child_session,
         turn_id,
         created: true,
+    })
+}
+
+/// Cột cần có: `id, sequence, role, content_json, run_id, tool_call_id`.
+fn message_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<MessageView, OrchestratorError> {
+    let role: String = row.try_get("role").map_err(db("read role"))?;
+    let json: String = row.try_get("content_json").map_err(db("read content"))?;
+    let sequence: i64 = row.try_get("sequence").map_err(db("read sequence"))?;
+    Ok(MessageView {
+        id: row.try_get("id").map_err(db("read id"))?,
+        sequence: sequence as u64,
+        role: MessageRole::parse(&role)
+            .ok_or_else(|| OrchestratorError::new(ErrorCode::Internal, "unknown message role"))?,
+        text: text_of(&json),
+        run_id: row.try_get("run_id").map_err(db("read run id"))?,
+        tool_call_id: row.try_get("tool_call_id").map_err(db("read call id"))?,
+        tool_calls: calls_of(&json)
+            .into_iter()
+            .map(|c| MessageToolCall {
+                call_id: c.id,
+                name: c.name,
+            })
+            .collect(),
     })
 }
 

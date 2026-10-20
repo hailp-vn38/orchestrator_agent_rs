@@ -9,12 +9,15 @@
 //! M4 (continuous): steps cap tùy chọn, auto compaction trong active turn, stream assembly.
 //! M5 (recovery & lifecycle): startup recovery bounded, operator reconciliation, cancel
 //! (parent → active child), shutdown drain/quiesce/join.
+//! M6 (observation): `subscribe` (bounded broadcast, best-effort) + `snapshot` (family, một read
+//! transaction); committed event chỉ publish sau commit và chỉ invalidate canonical view.
 
 mod agent;
 mod compaction;
 mod config;
 mod error;
 mod executor;
+mod feed;
 // Item `pub` trong module private; chỉ lộ ra qua `test_support` khi bật feature.
 mod gateway;
 mod orchestrator;
@@ -36,13 +39,14 @@ pub use config::{
     LlmBackend, LlmConfig, LlmProviderConfig, OrchestratorConfig, ProviderAuth, RuntimeConfig,
 };
 pub use error::{ConfigReason, ErrorCode, OrchestratorError};
+pub use feed::{ExecutionEvent, FeedItem, Subscription};
 pub use orchestrator::{Orchestrator, OrchestratorBuilder};
 pub use secret::SecretString;
 pub use tool::{
     HostTool, ToolContext, ToolDescriptor, ToolEffect, ToolError, ToolOutcome, ToolScope,
 };
 pub use types::{
-    AcceptedTurn, AgentResult, CallerContext, MessageRole, MessageToolCall, MessageView,
-    OperatorContext, Page, PageRequest, ResultError, RunStatus, SessionPolicy,
-    VerifiedToolResolution,
+    AcceptedTurn, AgentResult, CallerContext, FamilySnapshot, InvocationSnapshot, InvocationStatus,
+    MessageRole, MessageToolCall, MessageView, OperatorContext, Page, PageRequest, ResultError,
+    RunSnapshot, RunStatus, SessionPolicy, SessionSnapshot, VerifiedToolResolution,
 };

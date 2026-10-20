@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::error::{ConfigReason, OrchestratorError};
+use crate::feed::ProgressSink;
 
 /// Tên tool dành riêng cho built-in; host không được đăng ký trùng.
 pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &["subagent", "skill"];
@@ -32,6 +33,8 @@ pub struct ToolScope {
     pub owner_id: String,
     pub workspace_id: String,
     pub session_id: String,
+    /// Root của session family (chính `session_id` nếu là Root); engine resolve từ ancestry.
+    pub root_session_id: String,
     pub run_id: String,
     pub agent_id: String,
     /// Internal `tool_invocations.id`, khác provider `tool_call_id`.
@@ -51,11 +54,20 @@ const MAX_PROGRESS_BYTES: usize = 1024;
 pub struct ToolContext {
     scope: ToolScope,
     cancelled: Arc<AtomicBool>,
+    progress: Option<ProgressSink>,
 }
 
 impl ToolContext {
-    pub(crate) fn new(scope: ToolScope, cancelled: Arc<AtomicBool>) -> Self {
-        Self { scope, cancelled }
+    pub(crate) fn new(
+        scope: ToolScope,
+        cancelled: Arc<AtomicBool>,
+        progress: Option<ProgressSink>,
+    ) -> Self {
+        Self {
+            scope,
+            cancelled,
+            progress,
+        }
     }
 
     pub fn scope(&self) -> &ToolScope {
@@ -68,7 +80,8 @@ impl ToolContext {
     }
 
     /// Progress ephemeral, best-effort, không chặn và không ghi SQLite. Bị cắt ở
-    /// `MAX_PROGRESS_BYTES`; hiện chỉ đi vào tracing, event feed gắn ở M6.
+    /// `MAX_PROGRESS_BYTES`, bị throttle theo `RuntimeConfig::progress_min_interval` và đi vào
+    /// event feed (`tool.progress`, secret đã cấu hình bị che) cùng tracing.
     pub fn progress(&self, update: &str) {
         let mut end = update.len().min(MAX_PROGRESS_BYTES);
         while !update.is_char_boundary(end) {
@@ -78,9 +91,12 @@ impl ToolContext {
             session_id = %self.scope.session_id,
             run_id = %self.scope.run_id,
             invocation_id = %self.scope.invocation_id,
-            progress = &update[..end],
+            progress_bytes = end,
             "tool progress"
         );
+        if let Some(sink) = &self.progress {
+            sink.send(&update[..end]);
+        }
     }
 }
 

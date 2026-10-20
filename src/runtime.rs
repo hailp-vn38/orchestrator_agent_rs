@@ -19,7 +19,10 @@
 //! `cancel` của host (`cancelled`/`CANCELLED`, terminal).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use serde_json::json;
 
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn, Instrument};
@@ -27,12 +30,14 @@ use tracing::{info, warn, Instrument};
 use crate::agent::AgentDefinition;
 use crate::compaction::{estimate_tokens, plan, SUMMARY_SYSTEM};
 use crate::executor::{Dispatch, Effective, Prepared, ToolExecutor, CODE_OUTCOME_UNKNOWN};
+use crate::feed::{chunks, Emitter};
 use crate::gateway::{
     GatewayError, LlmGateway, ModelMessage, ModelRequest, ModelResponse, ModelRole, StreamEvent,
 };
 use crate::prompt::{context_messages, PromptBuilder};
 use crate::store::{
-    NewCheckpoint, PendingInvocation, RunRecord, SessionStore, StoredToolCall, CODE_SHUTTING_DOWN,
+    new_id, NewCheckpoint, PendingInvocation, RunRecord, SessionStore, StoredToolCall,
+    CODE_SHUTTING_DOWN,
 };
 use crate::tool::ToolScope;
 use crate::types::RunStatus;
@@ -72,6 +77,8 @@ pub(crate) struct AgentRuntime {
     context: ContextPolicy,
     /// Token shutdown của engine: phân biệt hủy do shutdown với `cancel` của host.
     shutdown: CancellationToken,
+    /// Publish observation event **sau** commit (docs/16); không bao giờ chặn run.
+    emitter: Emitter,
 }
 
 /// Kết luận của một bước điều phối: tiếp tục vòng lặp hay kết thúc `execute`.
@@ -82,6 +89,8 @@ enum Flow {
 }
 
 impl AgentRuntime {
+    // Composition root duy nhất: các collaborator được nối một lần lúc build.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         store: SessionStore,
         gateway: Arc<dyn LlmGateway>,
@@ -90,6 +99,7 @@ impl AgentRuntime {
         agents: HashMap<String, AgentDefinition>,
         context: ContextPolicy,
         shutdown: CancellationToken,
+        emitter: Emitter,
     ) -> Self {
         Self {
             store,
@@ -99,6 +109,7 @@ impl AgentRuntime {
             agents,
             context,
             shutdown,
+            emitter,
         }
     }
 
@@ -120,6 +131,9 @@ impl AgentRuntime {
             Err(_) => return false,
         };
         tracing::Span::current().record("session_id", tracing::field::display(&run.session_id));
+        self.emitter
+            .committed_run(run_id, "run.started", json!({ "agent_id": run.agent_id }))
+            .await;
         let Some(agent) = self.agents.get(&run.agent_id) else {
             return self.fail(run_id, GatewayError::NotConfigured).await;
         };
@@ -160,7 +174,7 @@ impl AgentRuntime {
                 (_, Err(_)) => return false,
                 _ => false,
             };
-            let response = match self.model_step(&run, &eff, capped, cancel).await {
+            let (response, step_id) = match self.model_step(&run, &eff, capped, cancel).await {
                 Ok(r) => r,
                 Err(done) => return done,
             };
@@ -173,8 +187,25 @@ impl AgentRuntime {
                     response.text.as_str()
                 };
                 return match self.store.complete_run(run_id, text).await {
-                    Ok(_) => {
+                    Ok(message_id) => {
                         info!(capped, "run completed");
+                        if let Some(message_id) = message_id {
+                            self.emitter
+                                .committed_run(
+                                    run_id,
+                                    "message.committed",
+                                    json!({
+                                        "message_id": message_id,
+                                        "role": "assistant",
+                                        "step_id": step_id,
+                                        "final": true,
+                                    }),
+                                )
+                                .await;
+                            self.emitter
+                                .run_terminal(run_id, RunStatus::Completed, None)
+                                .await;
+                        }
                         true
                     }
                     Err(_) => {
@@ -218,6 +249,31 @@ impl AgentRuntime {
                 Ok(None) => return true, // run đã terminal ở nơi khác
                 Err(_) => return false,  // chưa có invocation nào → sweep gọi lại LLM, an toàn
             };
+            self.emitter
+                .committed_run(
+                    run_id,
+                    "message.committed",
+                    json!({
+                        "role": "assistant",
+                        "step_id": step_id,
+                        "final": false,
+                        "tool_call_count": pending.len(),
+                    }),
+                )
+                .await;
+            for inv in &pending {
+                self.emitter
+                    .committed_run(
+                        run_id,
+                        "tool.started",
+                        json!({
+                            "tool_call_id": inv.tool_call_id,
+                            "invocation_id": inv.id,
+                            "tool_name": inv.tool_name,
+                        }),
+                    )
+                    .await;
+            }
         }
     }
 
@@ -243,7 +299,7 @@ impl AgentRuntime {
         eff: &Effective,
         capped: bool,
         cancel: &CancellationToken,
-    ) -> Result<ModelResponse, bool> {
+    ) -> Result<(ModelResponse, String), bool> {
         let run_id = run.run_id.as_str();
         let mut request = self.step_request(run, eff, capped).await.ok_or(false)?;
         if estimate_tokens(&request) >= self.context.threshold() {
@@ -255,12 +311,11 @@ impl AgentRuntime {
         }
         let mut retried = false;
         loop {
-            // Preview (text delta/ToolCallReady) chưa có consumer ở M4; M6 nối event feed.
-            let sink = |_: StreamEvent| {};
-            match self.gateway.complete(&request, cancel, &sink).await {
+            let step_id = new_id();
+            match self.stream_step(run, &request, cancel, &step_id).await {
                 Ok(response) => {
                     self.record_usage(run_id, &response).await;
-                    return Ok(response);
+                    return Ok((response, step_id));
                 }
                 Err(GatewayError::ContextOverflow) if !retried => {
                     retried = true;
@@ -277,6 +332,71 @@ impl AgentRuntime {
                 Err(e) => return Err(self.fail(run_id, e).await),
             }
         }
+    }
+
+    /// Một lần gọi model kèm preview ephemeral: `step.started`, `text.delta` theo thứ tự (secret đã
+    /// cấu hình bị che kể cả khi bị cắt qua nhiều fragment), rồi `step.ended`. Preview **không**
+    /// phải text đã xác nhận: step lỗi giữa chừng kết thúc với `completed=false`. `ToolCallReady`
+    /// không phát event và không cho phép execute tool.
+    async fn stream_step(
+        &self,
+        run: &RunRecord,
+        request: &ModelRequest,
+        cancel: &CancellationToken,
+        step_id: &str,
+    ) -> Result<ModelResponse, GatewayError> {
+        let feed = self.emitter.feed();
+        let root = run.parent_session_id.as_deref().unwrap_or(&run.session_id);
+        let (session, run_id) = (run.session_id.as_str(), run.run_id.as_str());
+        feed.ephemeral(
+            root,
+            session,
+            Some(run_id),
+            "step.started",
+            json!({ "step_id": step_id }),
+        );
+        let filter = Mutex::new(feed.delta_filter());
+        let next_index = AtomicU64::new(0);
+        let emit_text = |text: &str| {
+            for part in chunks(text, feed.delta_max_bytes()) {
+                feed.ephemeral(
+                    root,
+                    session,
+                    Some(run_id),
+                    "text.delta",
+                    json!({
+                        "step_id": step_id,
+                        "delta_index": next_index.fetch_add(1, Ordering::Relaxed),
+                        "delta": part,
+                    }),
+                );
+            }
+        };
+        let sink = |event: StreamEvent| {
+            if let StreamEvent::TextDelta(fragment) = event {
+                let safe = filter
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(&fragment);
+                emit_text(&safe);
+            }
+        };
+        let result = self.gateway.complete(request, cancel, &sink).await;
+        let tail = filter.lock().unwrap_or_else(|p| p.into_inner()).flush();
+        emit_text(&tail);
+        let ended = match &result {
+            Ok(response) => json!({
+                "step_id": step_id,
+                "completed": true,
+                "usage": response.usage.map(|u| json!({
+                    "input_tokens": u.input_tokens,
+                    "output_tokens": u.output_tokens,
+                })),
+            }),
+            Err(e) => json!({ "step_id": step_id, "completed": false, "error_code": e.code() }),
+        };
+        feed.ephemeral(root, session, Some(run_id), "step.ended", ended);
+        result
     }
 
     /// Request của step; khi `capped` bỏ mọi tool và thêm hướng dẫn text-only.
@@ -324,6 +444,13 @@ impl AgentRuntime {
         let Some(plan) = plan(&context, self.context.keep_recent) else {
             return Ok(false);
         };
+        self.emitter.feed().ephemeral(
+            run.parent_session_id.as_deref().unwrap_or(&run.session_id),
+            &run.session_id,
+            Some(&run.run_id),
+            "compaction.started",
+            json!({}),
+        );
         let request = ModelRequest {
             provider_id: run.provider_id.clone(),
             model_id: run.model_id.clone(),
@@ -346,10 +473,17 @@ impl AgentRuntime {
             objective: plan.objective,
             model_ref: format!("{}/{}", run.provider_id, run.model_id),
         };
-        self.store
+        let written = self
+            .store
             .append_compaction(&run.run_id, &checkpoint)
             .await
-            .map_err(|_| GatewayError::Protocol)
+            .map_err(|_| GatewayError::Protocol)?;
+        if written {
+            self.emitter
+                .committed_run(&run.run_id, "compaction.completed", json!({}))
+                .await;
+        }
+        Ok(written)
     }
 
     /// Dispatch tuần tự các invocation `requested`; settle đủ trước khi trả `Continue`.
@@ -429,7 +563,26 @@ impl AgentRuntime {
             .settle_invocation(run_id, &inv.id, &settled)
             .await
         {
-            Ok(true) => None,
+            Ok(true) => {
+                // Chỉ sau khi tool-result + terminal state đã commit.
+                self.emitter
+                    .committed_run(
+                        run_id,
+                        if settled.failed {
+                            "tool.failed"
+                        } else {
+                            "tool.completed"
+                        },
+                        json!({
+                            "tool_call_id": inv.tool_call_id,
+                            "invocation_id": inv.id,
+                            "tool_name": inv.tool_name,
+                            "error_code": settled.error_code,
+                        }),
+                    )
+                    .await;
+                None
+            }
             Ok(false) => Some(true),
             Err(_) => {
                 // Tool có thể đã chạy xong nhưng không xác nhận được: invocation vẫn `running`,
@@ -451,6 +604,10 @@ impl AgentRuntime {
             owner_id: run.owner_id.clone(),
             workspace_id: run.workspace_id.clone(),
             session_id: run.session_id.clone(),
+            root_session_id: run
+                .parent_session_id
+                .clone()
+                .unwrap_or_else(|| run.session_id.clone()),
             run_id: run_id.to_owned(),
             agent_id: run.agent_id.clone(),
             invocation_id: inv.id.clone(),
@@ -480,11 +637,14 @@ impl AgentRuntime {
             .finish_run_without_final(run_id, status, code, message)
             .await
         {
-            Ok(_) => {
+            Ok(committed) => {
                 info!(
                     status = status.as_str(),
                     code, "run finished without final message"
                 );
+                if committed {
+                    self.emitter.run_terminal(run_id, status, Some(code)).await;
+                }
                 true
             }
             Err(_) => {

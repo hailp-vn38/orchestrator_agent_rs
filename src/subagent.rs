@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentDefinition, AgentMode};
+use crate::feed::Emitter;
 use crate::gateway::ModelTool;
 use crate::store::{ChildAdmission, ChildAdmitError, ChildTarget, RunRoute, SessionStore};
 use crate::supervisor::AdmissionSignal;
@@ -78,6 +79,7 @@ pub(crate) struct TaskManager {
     modes: HashMap<String, AgentMode>,
     routes: HashMap<String, RunRoute>,
     signal: AdmissionSignal,
+    emitter: Emitter,
 }
 
 impl TaskManager {
@@ -86,6 +88,7 @@ impl TaskManager {
         agents: &HashMap<String, AgentDefinition>,
         routes: HashMap<String, RunRoute>,
         signal: AdmissionSignal,
+        emitter: Emitter,
     ) -> Self {
         let delegable = agents
             .values()
@@ -99,6 +102,7 @@ impl TaskManager {
             modes,
             routes,
             signal,
+            emitter,
         }
     }
 
@@ -188,6 +192,19 @@ impl TaskManager {
         if admission.created {
             // Child run đã commit; supervisor (trigger hoặc sweep) sẽ spawn đúng một worker.
             self.signal.admitted();
+            // Link child đã commit (revision parent tăng): UI refresh family để thấy child mới.
+            self.emitter
+                .committed_session(
+                    &scope.session_id,
+                    Some(&scope.run_id),
+                    "session.changed",
+                    serde_json::json!({
+                        "reason": "child_created",
+                        "child_session_id": admission.session_id,
+                        "tool_call_id": scope.tool_call_id,
+                    }),
+                )
+                .await;
         }
         self.await_child(scope, &admission, cancel).await
     }
@@ -373,6 +390,7 @@ mod tests {
             owner_id: "o".into(),
             workspace_id: "w".into(),
             session_id: "parent".into(),
+            root_session_id: "parent".into(),
             run_id: "run".into(),
             agent_id: "root".into(),
             invocation_id: "inv".into(),

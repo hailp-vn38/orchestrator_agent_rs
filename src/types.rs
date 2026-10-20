@@ -263,3 +263,122 @@ pub struct Page<T> {
     pub items: Vec<T>,
     pub next_cursor: Option<String>,
 }
+
+/// Trạng thái của một tool invocation trong snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvocationStatus {
+    Requested,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    /// Outcome không xác định: cần reconcile, không bao giờ tự replay (nếu không replay-safe).
+    Interrupted,
+}
+
+impl InvocationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "requested" => Self::Requested,
+            "running" => Self::Running,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            "interrupted" => Self::Interrupted,
+            _ => return None,
+        })
+    }
+}
+
+/// Attempt (run) trong snapshot; số liệu là snapshot tổng, không phải timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSnapshot {
+    pub run_id: String,
+    pub turn_id: String,
+    /// `resume_attempt` của run.
+    pub attempt: u32,
+    pub status: RunStatus,
+    pub steps: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub error: Option<ResultError>,
+}
+
+/// Tool invocation trong snapshot (không kèm arguments/kết quả: không rò dữ liệu nhạy cảm).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvocationSnapshot {
+    /// Internal invocation ID (dùng cho `resolve_interrupted_invocation`).
+    pub invocation_id: String,
+    pub run_id: String,
+    /// Provider call ID.
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub status: InvocationStatus,
+    /// Child session do invocation `subagent` tạo.
+    pub child_session_id: Option<String>,
+    pub error_code: Option<String>,
+}
+
+/// Trạng thái canonical của một session trong family, đọc cùng một read transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    pub session_id: String,
+    /// `None` với Root.
+    pub parent_session_id: Option<String>,
+    pub agent_id: String,
+    pub archived: bool,
+    /// Revision đã commit của session này; không phải cursor replay.
+    pub state_revision: i64,
+    /// Attempt mới nhất của session (đang `Running` nếu session đang active).
+    pub latest_run: Option<RunSnapshot>,
+    /// Message gần nhất (≤ `page_size`) theo `sequence` tăng dần; lịch sử dài đọc bằng `history`.
+    pub recent_messages: Vec<MessageView>,
+    /// Invocation gần nhất (≤ `page_size`) theo thứ tự tạo.
+    pub invocations: Vec<InvocationSnapshot>,
+}
+
+/// Snapshot nhất quán của Root và các Child đã xác nhận trong SQLite (docs/16 §16.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FamilySnapshot {
+    pub root: SessionSnapshot,
+    /// Child theo thứ tự tạo (bị chặn ở một trần cố định; xem `children_truncated`).
+    pub children: Vec<SessionSnapshot>,
+    pub children_truncated: bool,
+}
+
+impl FamilySnapshot {
+    /// Còn run `Running` trong family: host phải refresh snapshot định kỳ (kể cả khi stream
+    /// còn sống) để bắt terminal commit bị mất publication. Hết active thì dừng refresh.
+    pub fn has_active_work(&self) -> bool {
+        self.sessions()
+            .any(|s| matches!(&s.latest_run, Some(r) if r.status == RunStatus::Running))
+    }
+
+    /// Root rồi tới các Child.
+    pub fn sessions(&self) -> impl Iterator<Item = &SessionSnapshot> {
+        std::iter::once(&self.root).chain(self.children.iter())
+    }
+
+    pub fn session(&self, session_id: &str) -> Option<&SessionSnapshot> {
+        self.sessions().find(|s| s.session_id == session_id)
+    }
+
+    /// `true` nếu snapshot này phản ánh ít nhất `revision` của `session_id`. Session chưa có
+    /// trong snapshot (child mới) thì chưa đủ mới.
+    pub fn covers(&self, session_id: &str, revision: i64) -> bool {
+        self.session(session_id)
+            .is_some_and(|s| s.state_revision >= revision)
+    }
+}

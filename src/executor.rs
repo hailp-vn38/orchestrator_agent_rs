@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::AgentDefinition;
+use crate::feed::{ExecutionFeed, ProgressSink};
 use crate::gateway::ModelTool;
 use crate::skill::{render, SkillManager};
 use crate::subagent::{self, Delegation, SubagentInput, TaskManager, SUBAGENT_TOOL};
@@ -77,6 +78,8 @@ pub(crate) struct ToolLimits {
     pub timeout: Duration,
     pub model_cap_bytes: usize,
     pub hard_cap_bytes: usize,
+    /// Khoảng tối thiểu giữa hai `tool.progress` của một invocation.
+    pub progress_interval: Duration,
 }
 
 /// Kết quả đã chốt của một invocation, sẵn sàng để runtime commit.
@@ -137,6 +140,7 @@ pub(crate) struct ToolExecutor {
     skills: Arc<SkillManager>,
     tasks: TaskManager,
     limits: ToolLimits,
+    feed: ExecutionFeed,
 }
 
 impl ToolExecutor {
@@ -145,6 +149,7 @@ impl ToolExecutor {
         skills: Arc<SkillManager>,
         tasks: TaskManager,
         limits: ToolLimits,
+        feed: ExecutionFeed,
     ) -> Self {
         let descriptors = tools
             .iter()
@@ -156,6 +161,7 @@ impl ToolExecutor {
             skills,
             tasks,
             limits,
+            feed,
         }
     }
 
@@ -292,7 +298,8 @@ impl ToolExecutor {
         cancel: &CancellationToken,
     ) -> Dispatch {
         let cancelled = Arc::new(AtomicBool::new(cancel.is_cancelled()));
-        let context = ToolContext::new(scope, Arc::clone(&cancelled));
+        let progress = ProgressSink::new(&self.feed, &scope, self.limits.progress_interval);
+        let context = ToolContext::new(scope, Arc::clone(&cancelled), Some(progress));
         let guarded = AssertUnwindSafe(tool.execute(context, args)).catch_unwind();
         let watcher = async {
             cancel.cancelled().await;

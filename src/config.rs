@@ -95,6 +95,19 @@ pub struct RuntimeConfig {
     pub compaction_threshold_percent: u8,
     /// Số exchange settled gần nhất luôn giữ nguyên văn (không đưa vào summary).
     pub compaction_keep_recent: usize,
+    /// Sức chứa của broadcast `ExecutionFeed` (số event). Subscriber chậm hơn mức này nhận
+    /// `ResyncRequired`; publisher không bao giờ bị chặn.
+    pub event_capacity: usize,
+    /// Trần byte của một `text.delta`; fragment lớn hơn được cắt thành nhiều delta liên tiếp
+    /// (không mất text, giữ thứ tự).
+    pub event_delta_max_bytes: usize,
+    /// Khoảng tối thiểu giữa hai `tool.progress` của cùng một invocation; update tới sớm hơn bị
+    /// bỏ (ephemeral, best-effort).
+    pub progress_min_interval: Duration,
+    /// Chu kỳ host refresh snapshot khi family còn active, kể cả khi stream còn sống (bắt
+    /// terminal commit bị mất publication). Engine không tự refresh: đây là giá trị host đọc
+    /// qua `Orchestrator::snapshot_refresh_interval`.
+    pub snapshot_refresh: Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -113,6 +126,10 @@ impl Default for RuntimeConfig {
             context_limit_tokens: 100_000,
             compaction_threshold_percent: 80,
             compaction_keep_recent: 2,
+            event_capacity: 4096,
+            event_delta_max_bytes: 4 * 1024,
+            progress_min_interval: Duration::from_millis(200),
+            snapshot_refresh: Duration::from_secs(30),
         }
     }
 }
@@ -156,6 +173,15 @@ impl RuntimeConfig {
         }
         if !(1..=500).contains(&self.page_size) {
             return bad("page_size must be in 1..=500");
+        }
+        if !(2..=65_536).contains(&self.event_capacity) {
+            return bad("event_capacity must be in 2..=65536");
+        }
+        if !(64..=64 * 1024).contains(&self.event_delta_max_bytes) {
+            return bad("event_delta_max_bytes must be in 64..=65536");
+        }
+        if self.snapshot_refresh.is_zero() {
+            return bad("snapshot_refresh must be > 0");
         }
         Ok(())
     }

@@ -1,6 +1,7 @@
 //! Orchestrator handle + builder: single-agent text, tool/skill loop, parent–child trên SQLite store.
 //! Chỉ những gì đã hoạt động mới được expose. M5 thêm startup recovery, `cancel`,
-//! `resolve_interrupted_invocation` và shutdown nhiều pha.
+//! `resolve_interrupted_invocation` và shutdown nhiều pha. M6 thêm observation:
+//! `subscribe` (feed bounded, best-effort) và `snapshot` (canonical, một read transaction).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
@@ -9,9 +10,10 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentDefinition, AgentMode, AgentRegistry};
-use crate::config::{OrchestratorConfig, RuntimeConfig};
+use crate::config::{OrchestratorConfig, ProviderAuth, RuntimeConfig};
 use crate::error::{ConfigReason, ErrorCode, OrchestratorError};
 use crate::executor::{replay_safe_names, Settled, ToolExecutor, ToolLimits};
+use crate::feed::{Emitter, ExecutionFeed, Subscription};
 use crate::gateway::{ClientGateway, LlmGateway};
 use crate::owner_lock::OwnerLock;
 use crate::prompt::PromptBuilder;
@@ -22,8 +24,8 @@ use crate::subagent::TaskManager;
 use crate::supervisor::{AdmissionSignal, Supervisor};
 use crate::tool::{validate_descriptor, HostTool, ToolDescriptor};
 use crate::types::{
-    AcceptedTurn, AgentResult, CallerContext, MessageView, OperatorContext, Page, PageRequest,
-    RunStatus, SessionPolicy, VerifiedToolResolution,
+    AcceptedTurn, AgentResult, CallerContext, FamilySnapshot, MessageView, OperatorContext, Page,
+    PageRequest, RunStatus, SessionPolicy, VerifiedToolResolution,
 };
 
 const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 64 * 1024;
@@ -47,6 +49,8 @@ pub struct Orchestrator {
     /// Tool replay-safe (xem `replay_safe_names`) cho policy recovery sau operator resolve.
     replay_safe: BTreeSet<String>,
     limits: ToolLimits,
+    feed: ExecutionFeed,
+    emitter: Emitter,
 }
 
 pub struct OrchestratorBuilder {
@@ -54,6 +58,8 @@ pub struct OrchestratorBuilder {
     tools: Vec<Arc<dyn HostTool>>,
     gateway: Option<Arc<dyn LlmGateway>>,
     drop_admission_triggers: Arc<AtomicBool>,
+    #[cfg(feature = "test-support")]
+    feed_fault: Option<Arc<crate::feed::FeedFault>>,
 }
 
 impl Orchestrator {
@@ -63,6 +69,8 @@ impl Orchestrator {
             tools: Vec::new(),
             gateway: None,
             drop_admission_triggers: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "test-support")]
+            feed_fault: None,
         }
     }
 
@@ -174,6 +182,44 @@ impl Orchestrator {
             .await
     }
 
+    /// Mở stream sự kiện của một session family (docs/16). Chỉ nhận **Root**; owner/workspace
+    /// được kiểm tra tại đây, và event của family khác không bao giờ được giao (child mới tạo
+    /// vẫn nằm trong family vì `root_session_id` do engine resolve từ ancestry).
+    ///
+    /// Event chỉ là gợi ý live: committed event (`state_revision` `Some`) chỉ *invalidate* view,
+    /// không dùng payload làm patch. Hợp đồng cho host adapter/client: (1) subscribe **trước**
+    /// khi gọi [`Self::snapshot`]; (2) refresh snapshot (debounce) tới khi mọi session đạt ≥
+    /// revision đã thấy; (3) khi nhận `ResyncRequired`/stream kết thúc: bỏ preview chưa xác
+    /// nhận, subscribe lại rồi snapshot lại; (4) khi `FamilySnapshot::has_active_work`, refresh
+    /// theo [`Self::snapshot_refresh_interval`] **kể cả khi stream còn sống**.
+    pub async fn subscribe(
+        &self,
+        caller: &CallerContext,
+        root_session_id: &str,
+    ) -> Result<Subscription, OrchestratorError> {
+        self.ensure_open()?;
+        self.store.check_root_scope(caller, root_session_id).await?;
+        Ok(self.feed.subscribe(root_session_id))
+    }
+
+    /// Snapshot canonical của Root và Child đã xác nhận trong SQLite, đọc trong một read
+    /// transaction (revision từng session nhất quán với nội dung). Authorization mỗi lần gọi.
+    pub async fn snapshot(
+        &self,
+        caller: &CallerContext,
+        root_session_id: &str,
+    ) -> Result<FamilySnapshot, OrchestratorError> {
+        self.ensure_open()?;
+        self.store
+            .family_snapshot(caller, root_session_id, self.runtime.page_size)
+            .await
+    }
+
+    /// Chu kỳ host nên refresh snapshot khi family còn active (`RuntimeConfig::snapshot_refresh`).
+    pub fn snapshot_refresh_interval(&self) -> std::time::Duration {
+        self.runtime.snapshot_refresh
+    }
+
     /// Chặn admission mới; history vẫn đọc được. Run đang chạy không bị hủy. Idempotent.
     pub async fn archive_session(
         &self,
@@ -181,7 +227,16 @@ impl Orchestrator {
         session_id: &str,
     ) -> Result<(), OrchestratorError> {
         self.ensure_open()?;
-        self.store.archive_session(caller, session_id).await
+        self.store.archive_session(caller, session_id).await?;
+        self.emitter
+            .committed_session(
+                session_id,
+                None,
+                "session.changed",
+                serde_json::json!({ "reason": "archived" }),
+            )
+            .await;
+        Ok(())
     }
 
     /// Hủy hợp tác run đang active của session (và child đang
@@ -208,6 +263,9 @@ impl Orchestrator {
                     )
                     .await?;
                 self.supervisor.cancel_run(&run_id);
+                self.emitter
+                    .run_terminal(&run_id, RunStatus::Cancelled, Some("CANCELLED"))
+                    .await;
             }
         }
         Ok(())
@@ -285,6 +343,17 @@ impl Orchestrator {
             operator_id = %operator.operator_id.trim(),
             "interrupted invocation resolved by an operator"
         );
+        self.emitter
+            .committed_session(
+                session_id,
+                None,
+                "session.changed",
+                serde_json::json!({
+                    "reason": "invocation_resolved",
+                    "invocation_id": invocation_id,
+                }),
+            )
+            .await;
         let route = |agent_id: &str| route_of(self.registry.get(agent_id)?, &self.fingerprints);
         let replay_safe = |tool: &str| self.replay_safe.contains(tool);
         let policy = RecoveryPolicy {
@@ -311,7 +380,11 @@ impl Orchestrator {
     pub async fn shutdown(&self) -> Result<(), OrchestratorError> {
         self.supervisor
             .shutdown(self.runtime.shutdown_drain, self.runtime.shutdown_grace)
-            .await
+            .await?;
+        // Mọi worker đã dừng và đã publish xong: kết thúc các subscription (event đã xếp hàng
+        // vẫn được giao trước).
+        self.feed.close();
+        Ok(())
     }
 
     fn ensure_open(&self) -> Result<(), OrchestratorError> {
@@ -358,6 +431,13 @@ impl OrchestratorBuilder {
     #[cfg(feature = "test-support")]
     pub fn with_dropped_admission_triggers(mut self, flag: Arc<AtomicBool>) -> Self {
         self.drop_admission_triggers = flag;
+        self
+    }
+
+    /// Test support nội bộ: fault hook làm sai lệch việc publish sau commit.
+    #[cfg(feature = "test-support")]
+    pub fn with_feed_fault(mut self, fault: Arc<crate::feed::FeedFault>) -> Self {
+        self.feed_fault = Some(fault);
         self
     }
 
@@ -477,7 +557,31 @@ impl OrchestratorBuilder {
             timeout: self.config.runtime.tool_timeout,
             model_cap_bytes: self.config.runtime.tool_output_cap_bytes,
             hard_cap_bytes: self.config.runtime.tool_result_hard_cap_bytes,
+            progress_interval: self.config.runtime.progress_min_interval,
         };
+
+        // API key đã cấu hình bị che trong mọi text ephemeral của feed (không bao giờ phát đi).
+        let secrets: Vec<String> = self
+            .config
+            .llm
+            .providers
+            .iter()
+            .filter_map(|p| match &p.auth {
+                ProviderAuth::ApiKey(key) => Some(key.expose().to_owned()),
+                ProviderAuth::None => None,
+            })
+            .collect();
+        #[allow(unused_mut)]
+        let mut feed = ExecutionFeed::new(
+            self.config.runtime.event_capacity,
+            self.config.runtime.event_delta_max_bytes,
+            secrets,
+        );
+        #[cfg(feature = "test-support")]
+        if let Some(fault) = self.feed_fault {
+            feed = feed.with_fault(fault);
+        }
+        let emitter = Emitter::new(feed.clone(), store.clone());
 
         // Startup recovery bounded (docs/15 §15.7): attempt mới giữ turn_id khi an toàn; outcome
         // không xác định hoặc routing identity đổi thì chặn. Chạy trước khi supervisor spawn.
@@ -497,8 +601,15 @@ impl OrchestratorBuilder {
             );
         }
 
-        let tasks = TaskManager::new(store.clone(), &agents, routes, signal.clone());
-        let executor = ToolExecutor::new(tools.clone(), Arc::new(skills), tasks, limits);
+        let tasks = TaskManager::new(
+            store.clone(),
+            &agents,
+            routes,
+            signal.clone(),
+            emitter.clone(),
+        );
+        let executor =
+            ToolExecutor::new(tools.clone(), Arc::new(skills), tasks, limits, feed.clone());
 
         let gateway: Arc<dyn LlmGateway> = match self.gateway {
             Some(g) => g,
@@ -517,6 +628,7 @@ impl OrchestratorBuilder {
                 keep_recent: self.config.runtime.compaction_keep_recent,
             },
             shutdown.clone(),
+            emitter.clone(),
         );
         let supervisor = Supervisor::start(
             store.clone(),
@@ -537,6 +649,8 @@ impl OrchestratorBuilder {
             runtime: self.config.runtime,
             replay_safe,
             limits,
+            feed,
+            emitter,
         })
     }
 }

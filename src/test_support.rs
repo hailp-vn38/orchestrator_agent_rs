@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use std::time::Duration;
 
+pub use crate::feed::FeedFault;
 pub use crate::gateway::{
     GatewayError, LlmGateway, ModelMessage, ModelRequest, ModelResponse, ModelRole, ModelTool,
     ModelToolCall, ModelUsage, StreamEvent, StreamSink,
