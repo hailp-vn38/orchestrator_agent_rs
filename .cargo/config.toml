@@ -1,0 +1,16 @@
+[term]
+color = "never"
+progress.when = "never"   # không in progress bar vào log/agent output
+
+[profile.dev]
+debug = "line-tables-only"  # backtrace đủ dùng, link nhanh hơn, ít disk
+
+[profile.dev.package."*"]
+debug = false               # dependency không cần debuginfo
+opt-level = 0
+
+[profile.test]
+debug = "line-tables-only"
+
+[build]
+incremental = true
