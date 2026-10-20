@@ -71,13 +71,19 @@ fn provider(id: &str, backend: LlmBackend, endpoint: Option<&str>) -> LlmProvide
 struct Fixture {
     _dir: tempfile::TempDir,
     prompt: std::path::PathBuf,
+    store: std::path::PathBuf,
 }
 
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let prompt = dir.path().join("root.md");
     std::fs::write(&prompt, "You are root.").unwrap();
-    Fixture { _dir: dir, prompt }
+    let store = dir.path().join("store");
+    Fixture {
+        _dir: dir,
+        prompt,
+        store,
+    }
 }
 
 fn agent(f: &Fixture, id: &str, provider: &str) -> AgentDefinition {
@@ -85,12 +91,13 @@ fn agent(f: &Fixture, id: &str, provider: &str) -> AgentDefinition {
 }
 
 fn config(f: &Fixture) -> OrchestratorConfig {
-    OrchestratorConfig {
-        llm: LlmConfig {
+    OrchestratorConfig::new(
+        LlmConfig {
             providers: vec![provider("openai-main", LlmBackend::OpenAi, None)],
         },
-        agents: vec![agent(f, "root", "openai-main").with_mode(AgentMode::Primary)],
-    }
+        vec![agent(f, "root", "openai-main").with_mode(AgentMode::Primary)],
+        &f.store,
+    )
 }
 
 async fn build(

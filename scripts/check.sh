@@ -29,6 +29,8 @@ run() { # run <name> <cmd...>
 
 run fmt     cargo fmt --check
 run clippy  cargo clippy --all-targets --quiet -- -D warnings
+# Lib production không bật feature test-support (dev-dependency tự bật khi build tests).
+run clippy-lib cargo clippy --lib --quiet -- -D warnings
 run test    cargo test --lib --tests --quiet
 if [ "$mode" = full ]; then
   run examples cargo build --examples --quiet

@@ -15,7 +15,6 @@ impl SecretString {
     }
 
     /// Chỉ nội bộ library (gateway) được đọc giá trị thật.
-    #[allow(dead_code)] // gateway dùng từ M1
     pub(crate) fn expose(&self) -> &str {
         &self.0
     }

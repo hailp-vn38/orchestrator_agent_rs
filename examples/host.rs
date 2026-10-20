@@ -134,10 +134,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ];
 
-    let config = OrchestratorConfig {
+    // Execution store do library sở hữu: dùng thư mục riêng, tách khỏi DB nghiệp vụ của host.
+    let store_dir =
+        std::env::temp_dir().join(format!("orchestrator-host-example-{}", std::process::id()));
+    let config = OrchestratorConfig::new(
         llm,
-        agents: dtos.iter().map(|d| map_dto(d, &root)).collect(),
-    };
+        dtos.iter().map(|d| map_dto(d, &root)).collect(),
+        &store_dir,
+    );
 
     let orchestrator = Orchestrator::builder(config)
         .register_tool(Arc::new(EchoTool("read_file")))
@@ -150,5 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "base instructions v{}",
         orchestrator.base_instructions_version()
     );
+    orchestrator.shutdown().await?;
+    std::fs::remove_dir_all(&store_dir)?;
     Ok(())
 }

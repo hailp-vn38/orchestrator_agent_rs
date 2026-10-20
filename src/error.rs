@@ -10,6 +10,7 @@ pub enum ErrorCode {
     PermissionDenied,
     NotFound,
     SessionBusy,
+    SessionArchived,
     RecoveryBlocked,
     ProviderConfigChanged,
     StoreAlreadyOwned,
@@ -25,6 +26,7 @@ impl ErrorCode {
             Self::PermissionDenied => "PERMISSION_DENIED",
             Self::NotFound => "NOT_FOUND",
             Self::SessionBusy => "SESSION_BUSY",
+            Self::SessionArchived => "SESSION_ARCHIVED",
             Self::RecoveryBlocked => "RECOVERY_BLOCKED",
             Self::ProviderConfigChanged => "PROVIDER_CONFIG_CHANGED",
             Self::StoreAlreadyOwned => "STORE_ALREADY_OWNED",
@@ -66,6 +68,8 @@ pub enum ConfigReason {
     InvalidToolDescriptor,
     InvalidToolSchema,
     BaseInstructionsInvalid,
+    InvalidStoreDir,
+    InvalidRuntimeConfig,
 }
 
 impl ConfigReason {
@@ -92,6 +96,8 @@ impl ConfigReason {
             Self::InvalidToolDescriptor => "INVALID_TOOL_DESCRIPTOR",
             Self::InvalidToolSchema => "INVALID_TOOL_SCHEMA",
             Self::BaseInstructionsInvalid => "BASE_INSTRUCTIONS_INVALID",
+            Self::InvalidStoreDir => "INVALID_STORE_DIR",
+            Self::InvalidRuntimeConfig => "INVALID_RUNTIME_CONFIG",
         }
     }
 }
@@ -106,6 +112,21 @@ pub struct OrchestratorError {
 }
 
 impl OrchestratorError {
+    /// Lỗi runtime không thuộc validate cấu hình. `message` phải đã sanitize.
+    pub(crate) fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            reason: None,
+            message: message.into(),
+        }
+    }
+
+    /// Lỗi lưu trữ: chi tiết chỉ ghi tracing, không trả về host.
+    pub(crate) fn storage(context: &'static str, err: &dyn std::fmt::Display) -> Self {
+        tracing::warn!(context, error = %err, "execution store error");
+        Self::new(ErrorCode::Unavailable, "execution store operation failed")
+    }
+
     pub(crate) fn config(reason: ConfigReason, message: impl Into<String>) -> Self {
         Self {
             code: ErrorCode::InvalidInput,

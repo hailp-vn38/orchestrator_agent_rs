@@ -1,6 +1,7 @@
 //! Typed public config (docs/18 §18.5.2). Host truyền config đã resolve secret;
 //! library validate cục bộ, không gọi remote khi build.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -13,6 +14,78 @@ use crate::secret::SecretString;
 pub struct OrchestratorConfig {
     pub llm: LlmConfig,
     pub agents: Vec<AgentDefinition>,
+    /// Thư mục execution store do library sở hữu (SQLite + owner lock). Mặc định nên là
+    /// DB riêng, không dùng database nghiệp vụ của host (EMB-06).
+    pub store_dir: PathBuf,
+    pub runtime: RuntimeConfig,
+}
+
+impl OrchestratorConfig {
+    pub fn new(
+        llm: LlmConfig,
+        agents: Vec<AgentDefinition>,
+        store_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            llm,
+            agents,
+            store_dir: store_dir.into(),
+            runtime: RuntimeConfig::default(),
+        }
+    }
+
+    pub(crate) fn validate_local(&self) -> Result<(), OrchestratorError> {
+        if self.store_dir.as_os_str().is_empty() {
+            return Err(OrchestratorError::config(
+                ConfigReason::InvalidStoreDir,
+                "store_dir must not be empty",
+            ));
+        }
+        self.runtime.validate()
+    }
+}
+
+/// Giới hạn vận hành của managed execution (đơn vị trong tên field).
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    /// Chu kỳ sweep của supervisor: reconcile durable claim chưa có owner trong process.
+    pub supervisor_sweep: Duration,
+    /// Trần số item mỗi trang history; `limit` của host được clamp vào `1..=page_size`.
+    pub page_size: u32,
+    /// Thời gian chờ các local task dừng khi `shutdown()`.
+    pub shutdown_grace: Duration,
+}
+
+impl Default for RuntimeConfig {
+    /// Giá trị theo profile G0 (estimated, chưa phải số đo).
+    fn default() -> Self {
+        Self {
+            supervisor_sweep: Duration::from_secs(30),
+            page_size: 50,
+            shutdown_grace: Duration::from_secs(30),
+        }
+    }
+}
+
+impl RuntimeConfig {
+    pub(crate) fn validate(&self) -> Result<(), OrchestratorError> {
+        let bad = |m: &str| {
+            Err(OrchestratorError::config(
+                ConfigReason::InvalidRuntimeConfig,
+                m,
+            ))
+        };
+        if self.supervisor_sweep.is_zero() {
+            return bad("supervisor_sweep must be > 0");
+        }
+        if self.shutdown_grace.is_zero() {
+            return bad("shutdown_grace must be > 0");
+        }
+        if !(1..=500).contains(&self.page_size) {
+            return bad("page_size must be in 1..=500");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -43,7 +116,7 @@ pub enum LlmBackend {
 }
 
 impl LlmBackend {
-    fn kind(self) -> &'static str {
+    pub(crate) fn kind(self) -> &'static str {
         match self {
             Self::OpenAi => "openai",
             Self::Anthropic => "anthropic",
@@ -126,6 +199,11 @@ impl LlmProviderConfig {
             }
         }
         Ok(())
+    }
+
+    /// Endpoint đã chuẩn hóa (credential-free http(s) URL), `None` nếu không đặt.
+    pub(crate) fn normalized_endpoint(&self) -> Option<String> {
+        self.endpoint.as_deref().and_then(normalize_endpoint)
     }
 
     /// SHA-256 có version của các trường non-secret làm đổi routing (EMB-16):
