@@ -52,7 +52,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .next()
         .ok_or("usage: cargo run --example youtube_flow -- <youtube-url> [output.md]")?;
     let destination = PathBuf::from(
-        args.next().unwrap_or_else(|| "youtube-summary.md".to_string()),
+        args.next()
+            .unwrap_or_else(|| "youtube-summary.md".to_string()),
     );
     if args.next().is_some() {
         return Err("expected one YouTube URL and at most one output path".into());
@@ -64,8 +65,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let binary = setting("YTDLP_BIN").unwrap_or_else(|| "yt-dlp".to_string());
 
     let temp = tempfile::tempdir()?;
-    let prompt = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/youtube_flow/prompt.md");
+    let prompt = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/youtube_flow/prompt.md");
 
     let mut config = OrchestratorConfig::new(
         LlmConfig {
@@ -77,12 +77,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 request_timeout: Duration::from_secs(120),
             }],
         },
-        vec![
-            AgentDefinition::new("root", "live", model)
-                .with_mode(AgentMode::Primary)
-                .with_prompt_path(prompt)
-                .with_allowed_tools(["fetch_youtube_transcript", "publish_youtube_markdown"]),
-        ],
+        vec![AgentDefinition::new("root", "live", model)
+            .with_mode(AgentMode::Primary)
+            .with_prompt_path(prompt)
+            .with_allowed_tools(["fetch_youtube_transcript", "publish_youtube_markdown"])],
         temp.path().join("store"),
     );
     // Do not truncate the returned subtitles silently before the LLM reads them.
@@ -122,7 +120,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     if result.status != RunStatus::Completed {
         orchestrator.shutdown().await?;
-        return Err(format!("run did not complete: {:?} {:?}", result.status, result.error).into());
+        return Err(format!(
+            "run did not complete: {:?} {:?}",
+            result.status, result.error
+        )
+        .into());
     }
 
     // Completed run alone does not prove the business output exists.
