@@ -10,7 +10,8 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 pub use crate::gateway::{
-    GatewayError, LlmGateway, ModelMessage, ModelRequest, ModelResponse, ModelRole,
+    GatewayError, LlmGateway, ModelMessage, ModelRequest, ModelResponse, ModelRole, ModelTool,
+    ModelToolCall,
 };
 
 /// Fault hook: khi `true`, trigger ngay sau admission bị bỏ (claim đã commit nhưng chưa
@@ -18,7 +19,7 @@ pub use crate::gateway::{
 pub type DropAdmissionTriggers = Arc<AtomicBool>;
 
 struct State {
-    script: VecDeque<Result<String, GatewayError>>,
+    script: VecDeque<Result<ModelResponse, GatewayError>>,
     requests: Vec<ModelRequest>,
 }
 
@@ -41,7 +42,35 @@ impl ScriptedGateway {
     }
 
     pub fn push_text(&self, text: impl Into<String>) {
-        self.state().script.push_back(Ok(text.into()));
+        self.push_response(ModelResponse {
+            text: text.into(),
+            finish_reason: "end_turn".into(),
+            tool_calls: Vec::new(),
+        });
+    }
+
+    /// Response chứa tool call: `(provider call id, tên tool, arguments)`.
+    pub fn push_tool_calls(
+        &self,
+        text: impl Into<String>,
+        calls: Vec<(&str, &str, serde_json::Value)>,
+    ) {
+        self.push_response(ModelResponse {
+            text: text.into(),
+            finish_reason: "tool_use".into(),
+            tool_calls: calls
+                .into_iter()
+                .map(|(id, name, arguments)| ModelToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments,
+                })
+                .collect(),
+        });
+    }
+
+    pub fn push_response(&self, response: ModelResponse) {
+        self.state().script.push_back(Ok(response));
     }
 
     pub fn push_error(&self, error: GatewayError) {
@@ -90,9 +119,8 @@ impl LlmGateway for ScriptedGateway {
             return Err(GatewayError::Cancelled);
         }
         let next = self.state().script.pop_front();
-        let text = match next {
-            Some(Err(e)) => return Err(e),
-            Some(Ok(t)) => t,
+        match next {
+            Some(result) => result,
             None => {
                 let last_user = request
                     .messages
@@ -101,12 +129,12 @@ impl LlmGateway for ScriptedGateway {
                     .find(|m| m.role == ModelRole::User)
                     .map(|m| m.text.as_str())
                     .unwrap_or_default();
-                format!("echo: {last_user}")
+                Ok(ModelResponse {
+                    text: format!("echo: {last_user}"),
+                    finish_reason: "end_turn".into(),
+                    tool_calls: Vec::new(),
+                })
             }
-        };
-        Ok(ModelResponse {
-            text,
-            finish_reason: "end_turn".into(),
-        })
+        }
     }
 }

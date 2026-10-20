@@ -18,6 +18,12 @@ pub struct OrchestratorConfig {
     /// DB riêng, không dùng database nghiệp vụ của host (EMB-06).
     pub store_dir: PathBuf,
     pub runtime: RuntimeConfig,
+    /// Thư mục `skills/` của project (`skills/<id>/SKILL.md`). `None` = không có skill.
+    /// Scan một lần lúc build; thay đổi cần restart (không hot reload).
+    pub skills_dir: Option<PathBuf>,
+    /// File project instructions (vd. `AGENTS.md`), snapshot lúc build. Là untrusted
+    /// context: không thay thế base hay quyền thực thi.
+    pub project_instructions: Option<PathBuf>,
 }
 
 impl OrchestratorConfig {
@@ -31,7 +37,19 @@ impl OrchestratorConfig {
             agents,
             store_dir: store_dir.into(),
             runtime: RuntimeConfig::default(),
+            skills_dir: None,
+            project_instructions: None,
         }
+    }
+
+    pub fn with_skills_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.skills_dir = Some(dir.into());
+        self
+    }
+
+    pub fn with_project_instructions(mut self, path: impl Into<PathBuf>) -> Self {
+        self.project_instructions = Some(path.into());
+        self
     }
 
     pub(crate) fn validate_local(&self) -> Result<(), OrchestratorError> {
@@ -54,6 +72,16 @@ pub struct RuntimeConfig {
     pub page_size: u32,
     /// Thời gian chờ các local task dừng khi `shutdown()`.
     pub shutdown_grace: Duration,
+    /// Timeout của *một* thao tác tool (không phải của cả run). Quá hạn: tool ReadOnly trả
+    /// lỗi kỹ thuật `TOOL_TIMEOUT`; tool Mutating có outcome unknown → run `interrupted`.
+    pub tool_timeout: Duration,
+    /// Trần byte model-visible của một tool result; vượt thì cắt kèm marker rõ ràng.
+    pub tool_output_cap_bytes: usize,
+    /// Trần byte được persist trong `result_json`; vượt thì outcome bị từ chối bằng
+    /// `TOOL_OUTPUT_TOO_LARGE` (không persist phần dư).
+    pub tool_result_hard_cap_bytes: usize,
+    /// Trần byte của một `SKILL.md`; vượt thì `skill(id)` trả lỗi rõ, không cắt âm thầm.
+    pub skill_max_bytes: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -63,6 +91,10 @@ impl Default for RuntimeConfig {
             supervisor_sweep: Duration::from_secs(30),
             page_size: 50,
             shutdown_grace: Duration::from_secs(30),
+            tool_timeout: Duration::from_secs(300),
+            tool_output_cap_bytes: 64 * 1024,
+            tool_result_hard_cap_bytes: 8 * 1024 * 1024,
+            skill_max_bytes: 64 * 1024,
         }
     }
 }
@@ -80,6 +112,17 @@ impl RuntimeConfig {
         }
         if self.shutdown_grace.is_zero() {
             return bad("shutdown_grace must be > 0");
+        }
+        if self.tool_timeout.is_zero() {
+            return bad("tool_timeout must be > 0");
+        }
+        if self.tool_output_cap_bytes == 0
+            || self.tool_output_cap_bytes > self.tool_result_hard_cap_bytes
+        {
+            return bad("tool_output_cap_bytes must be in 1..=tool_result_hard_cap_bytes");
+        }
+        if self.skill_max_bytes == 0 {
+            return bad("skill_max_bytes must be > 0");
         }
         if !(1..=500).contains(&self.page_size) {
             return bad("page_size must be in 1..=500");

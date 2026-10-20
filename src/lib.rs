@@ -4,17 +4,21 @@
 //! registration contract, embedded mandatory base và registry validation.
 //! M1 (single agent): SQLite execution store + owner lock, durable admission (`submit`),
 //! managed supervisor, single-agent text run, `result`/`history`.
-//! Tool loop, skill, child, compaction, recovery đầy đủ đến ở M2+.
+//! M2 (tools & skills): ToolExecutor, SkillManager, PromptBuilder, tool loop tuần tự.
+//! Child, compaction, recovery đầy đủ đến ở M3+.
 
 mod agent;
 mod config;
 mod error;
+mod executor;
 // Item `pub` trong module private; chỉ lộ ra qua `test_support` khi bật feature.
 mod gateway;
 mod orchestrator;
 mod owner_lock;
+mod prompt;
 mod runtime;
 mod secret;
+mod skill;
 mod store;
 mod supervisor;
 #[cfg(feature = "test-support")]
@@ -33,6 +37,6 @@ pub use tool::{
     HostTool, ToolContext, ToolDescriptor, ToolEffect, ToolError, ToolOutcome, ToolScope,
 };
 pub use types::{
-    AcceptedTurn, AgentResult, CallerContext, MessageRole, MessageView, Page, PageRequest,
-    ResultError, RunStatus,
+    AcceptedTurn, AgentResult, CallerContext, MessageRole, MessageToolCall, MessageView, Page,
+    PageRequest, ResultError, RunStatus, SessionPolicy,
 };

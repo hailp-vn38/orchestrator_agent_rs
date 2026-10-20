@@ -1,7 +1,8 @@
 //! `LlmGateway`: internal seam giữa runtime và provider protocol (docs/08, docs/18 §18.5).
 //!
 //! Production dùng [`ClientGateway`] trên crate `llm` (pin `=1.3.8`, evidence G0). Type của
-//! `llm` không bao giờ ra public API. M1 chỉ cần text-only; tool/stream ordering đến ở M2/M4.
+//! `llm` không bao giờ ra public API. M2: tool definitions/calls/results; stream vẫn được gom
+//! nội bộ (live delta/ordering đến ở M4).
 //!
 //! Item ở đây là `pub` trong module private; chỉ re-export qua `test_support` khi bật
 //! feature `test-support`, để production host không thể inject/lắp ráp gateway.
@@ -13,9 +14,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use llm::builder::{LLMBackend as LlmCrateBackend, LLMBuilder};
-use llm::chat::{ChatMessage, StreamChunk};
+use llm::chat::{ChatMessage, FunctionTool, StreamChunk, Tool};
 use llm::error::LLMError;
-use llm::LLMProvider;
+use llm::{FunctionCall, LLMProvider, ToolCall};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -28,27 +29,86 @@ const MAX_OUTPUT_TOKENS: u32 = 4096;
 pub enum ModelRole {
     User,
     Assistant,
+    /// Kết quả của một tool call trước đó (`tool_call_id` + `tool_name` được điền).
+    Tool,
+}
+
+/// Tool call do model đề xuất; `id` là provider call ID (chỉ duy nhất trong một response).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelMessage {
     pub role: ModelRole,
     pub text: String,
+    /// Chỉ dùng với `Assistant`: các tool call của message đó.
+    pub tool_calls: Vec<ModelToolCall>,
+    /// Chỉ dùng với `Tool`: provider call ID mà result này ghép với.
+    pub tool_call_id: Option<String>,
+    /// Chỉ dùng với `Tool`: tên tool đã được gọi.
+    pub tool_name: Option<String>,
 }
 
-/// Request đã resolve theo agent: `system` = mandatory base + prompt của agent.
+impl ModelMessage {
+    pub fn text(role: ModelRole, text: impl Into<String>) -> Self {
+        Self {
+            role,
+            text: text.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+
+    pub fn assistant_with_calls(text: impl Into<String>, calls: Vec<ModelToolCall>) -> Self {
+        Self {
+            tool_calls: calls,
+            ..Self::text(ModelRole::Assistant, text)
+        }
+    }
+
+    pub fn tool_result(
+        call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            tool_call_id: Some(call_id.into()),
+            tool_name: Some(tool_name.into()),
+            ..Self::text(ModelRole::Tool, text)
+        }
+    }
+}
+
+/// Tool được cung cấp cho model ở request này (đã lọc theo effective permissions).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelTool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+/// Request đã resolve theo agent: `system` = mandatory base + prompt của agent (+ project
+/// instructions + skill catalog được phép).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequest {
     pub provider_id: String,
     pub model_id: String,
     pub system: String,
     pub messages: Vec<ModelMessage>,
+    pub tools: Vec<ModelTool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelResponse {
     pub text: String,
     pub finish_reason: String,
+    /// Chỉ có khi toàn response đã `Done` và mọi arguments là JSON hợp lệ.
+    pub tool_calls: Vec<ModelToolCall>,
 }
 
 /// Lỗi gateway đã sanitize: văn bản thô của provider bị bỏ (có thể echo secret).
@@ -184,12 +244,18 @@ impl LlmGateway for ClientGateway {
             return Err(GatewayError::NotConfigured);
         }
         let client = self.client(cfg, request)?;
-        let messages: Vec<ChatMessage> = request
-            .messages
+        let messages = to_chat_messages(&request.messages);
+        let tools: Vec<Tool> = request
+            .tools
             .iter()
-            .map(|m| match m.role {
-                ModelRole::User => ChatMessage::user().content(m.text.clone()).build(),
-                ModelRole::Assistant => ChatMessage::assistant().content(m.text.clone()).build(),
+            .map(|t| Tool {
+                tool_type: "function".to_string(),
+                function: FunctionTool {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    parameters: t.input_schema.clone(),
+                },
+                cache_control: None,
             })
             .collect();
 
@@ -197,7 +263,7 @@ impl LlmGateway for ClientGateway {
         // request LLM, không phải của cả run.
         let work = async {
             let raw: RawStream = client
-                .chat_stream_with_tools(&messages, None)
+                .chat_stream_with_tools(&messages, (!tools.is_empty()).then_some(&tools[..]))
                 .await
                 .map_err(|e| map_error(&e))?;
             collect(raw).await
@@ -211,23 +277,93 @@ impl LlmGateway for ClientGateway {
     }
 }
 
-/// Gom stream thành một response đã `Done`. Stream cụt (không `Done`) là lỗi protocol;
-/// tool-use khi không cung cấp tool cũng là lỗi protocol ở M1.
+/// Chuyển transcript nội bộ sang message của `llm`. Các tool result liên tiếp (kết quả của
+/// cùng một assistant response) gộp thành **một** message để mọi provider chấp nhận.
+/// Nội dung result đi trong `function.arguments` (quy ước của crate `llm`).
+fn to_chat_messages(messages: &[ModelMessage]) -> Vec<ChatMessage> {
+    let mut out = Vec::with_capacity(messages.len());
+    let mut i = 0;
+    while i < messages.len() {
+        let m = &messages[i];
+        match m.role {
+            ModelRole::User => out.push(ChatMessage::user().content(m.text.clone()).build()),
+            ModelRole::Assistant if m.tool_calls.is_empty() => {
+                out.push(ChatMessage::assistant().content(m.text.clone()).build());
+            }
+            ModelRole::Assistant => {
+                let calls = m
+                    .tool_calls
+                    .iter()
+                    .map(|c| ToolCall {
+                        id: c.id.clone(),
+                        call_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: c.name.clone(),
+                            arguments: c.arguments.to_string(),
+                        },
+                    })
+                    .collect();
+                out.push(
+                    ChatMessage::assistant()
+                        .content(m.text.clone())
+                        .tool_use(calls)
+                        .build(),
+                );
+            }
+            ModelRole::Tool => {
+                let mut results = Vec::new();
+                while i < messages.len() && messages[i].role == ModelRole::Tool {
+                    let r = &messages[i];
+                    results.push(ToolCall {
+                        id: r.tool_call_id.clone().unwrap_or_default(),
+                        call_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: r.tool_name.clone().unwrap_or_default(),
+                            arguments: r.text.clone(),
+                        },
+                    });
+                    i += 1;
+                }
+                out.push(ChatMessage::user().tool_result(results).build());
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Gom stream thành một response đã `Done`. Stream cụt (không `Done`) là lỗi protocol.
+/// Tool call chỉ được trả khi **toàn** response kết thúc thành công: lỗi/hủy/timeout sau
+/// `ToolUseComplete` vẫn loại bỏ mọi call đã nhận (không có gì để dispatch).
 async fn collect(mut raw: RawStream) -> Result<ModelResponse, GatewayError> {
     let mut text = String::new();
+    let mut tool_calls = Vec::new();
     loop {
         match raw.next().await {
             None => return Err(GatewayError::Protocol),
             Some(Err(e)) => return Err(map_error(&e)),
             Some(Ok(chunk)) => match chunk {
                 StreamChunk::Text(t) => text.push_str(&t),
-                StreamChunk::ToolUseStart { .. }
-                | StreamChunk::ToolUseInputDelta { .. }
-                | StreamChunk::ToolUseComplete { .. } => return Err(GatewayError::Protocol),
+                StreamChunk::ToolUseStart { .. } | StreamChunk::ToolUseInputDelta { .. } => {}
+                StreamChunk::ToolUseComplete { tool_call, .. } => {
+                    let raw_args = tool_call.function.arguments.trim();
+                    let arguments = if raw_args.is_empty() {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::from_str(raw_args).map_err(|_| GatewayError::Protocol)?
+                    };
+                    tool_calls.push(ModelToolCall {
+                        id: tool_call.id,
+                        name: tool_call.function.name,
+                        arguments,
+                    });
+                }
                 StreamChunk::Done { stop_reason } => {
                     return Ok(ModelResponse {
                         text,
                         finish_reason: stop_reason,
+                        tool_calls,
                     })
                 }
             },
@@ -290,6 +426,114 @@ mod tests {
         ]))
         .await;
         assert_eq!(failed, Err(GatewayError::Transport));
+    }
+
+    fn tool_call(id: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "t".into(),
+                arguments: args.into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_calls_are_returned_only_after_done() {
+        let r = collect(stream(vec![
+            Ok(StreamChunk::ToolUseStart {
+                index: 0,
+                id: "c1".into(),
+                name: "t".into(),
+            }),
+            Ok(StreamChunk::ToolUseInputDelta {
+                index: 0,
+                partial_json: "{\"a\":".into(),
+            }),
+            Ok(StreamChunk::ToolUseInputDelta {
+                index: 0,
+                partial_json: "1}".into(),
+            }),
+            Ok(StreamChunk::ToolUseComplete {
+                index: 0,
+                tool_call: tool_call("c1", "{\"a\":1}"),
+            }),
+            Ok(StreamChunk::ToolUseComplete {
+                index: 1,
+                tool_call: tool_call("c2", ""),
+            }),
+            Ok(StreamChunk::Done {
+                stop_reason: "tool_use".into(),
+            }),
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(r.tool_calls.len(), 2);
+        assert_eq!(r.tool_calls[0].id, "c1");
+        assert_eq!(r.tool_calls[0].arguments, serde_json::json!({"a": 1}));
+        assert_eq!(r.tool_calls[1].arguments, serde_json::json!({}));
+    }
+
+    /// AT-35 (mức gateway): lỗi sau `ToolUseComplete` mà chưa `Done` → không trả call nào.
+    #[tokio::test]
+    async fn error_after_complete_tool_call_yields_no_calls() {
+        let failed = collect(stream(vec![
+            Ok(StreamChunk::ToolUseComplete {
+                index: 0,
+                tool_call: tool_call("c1", "{}"),
+            }),
+            Err(LLMError::HttpError("boom".into())),
+        ]))
+        .await;
+        assert_eq!(failed, Err(GatewayError::Transport));
+        let cut = collect(stream(vec![Ok(StreamChunk::ToolUseComplete {
+            index: 0,
+            tool_call: tool_call("c1", "{}"),
+        })]))
+        .await;
+        assert_eq!(cut, Err(GatewayError::Protocol));
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_arguments_are_a_protocol_error() {
+        let r = collect(stream(vec![
+            Ok(StreamChunk::ToolUseComplete {
+                index: 0,
+                tool_call: tool_call("c1", "{bad"),
+            }),
+            Ok(StreamChunk::Done {
+                stop_reason: "tool_use".into(),
+            }),
+        ]))
+        .await;
+        assert_eq!(r, Err(GatewayError::Protocol));
+    }
+
+    #[test]
+    fn consecutive_tool_results_are_grouped_into_one_message() {
+        let call = |id: &str| ModelToolCall {
+            id: id.into(),
+            name: "t".into(),
+            arguments: serde_json::json!({}),
+        };
+        let msgs = vec![
+            ModelMessage::text(ModelRole::User, "go"),
+            ModelMessage::assistant_with_calls("", vec![call("a"), call("b")]),
+            ModelMessage::tool_result("a", "t", "ra"),
+            ModelMessage::tool_result("b", "t", "rb"),
+            ModelMessage::text(ModelRole::Assistant, "done"),
+        ];
+        let out = to_chat_messages(&msgs);
+        assert_eq!(out.len(), 4);
+        match &out[2].message_type {
+            llm::chat::MessageType::ToolResult(rs) => {
+                let ids: Vec<&str> = rs.iter().map(|r| r.id.as_str()).collect();
+                assert_eq!(ids, ["a", "b"]);
+                assert_eq!(rs[1].function.arguments, "rb");
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
     }
 
     #[test]

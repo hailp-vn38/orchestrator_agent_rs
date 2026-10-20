@@ -11,9 +11,10 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 use crate::error::{ErrorCode, OrchestratorError};
+use crate::executor::Settled;
 use crate::types::{
-    AcceptedTurn, AgentResult, CallerContext, MessageRole, MessageView, Page, PageRequest,
-    ResultError, RunStatus,
+    AcceptedTurn, AgentResult, CallerContext, MessageRole, MessageToolCall, MessageView, Page,
+    PageRequest, ResultError, RunStatus, SessionPolicy,
 };
 
 /// Tên file DB trong `store_dir`.
@@ -39,12 +40,43 @@ pub(crate) struct RunRecord {
     pub provider_id: String,
     pub model_id: String,
     pub status: RunStatus,
+    pub owner_id: String,
+    pub workspace_id: String,
+    pub policy: SessionPolicy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConversationRole {
-    User,
-    Assistant,
+/// Tool call đã persist trong assistant message (`id` = provider call ID).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+/// Transcript dùng để dựng model context (user/assistant/tool theo thứ tự `sequence`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TranscriptEntry {
+    User(String),
+    Assistant {
+        text: String,
+        calls: Vec<StoredToolCall>,
+    },
+    Tool {
+        call_id: String,
+        tool_name: String,
+        text: String,
+    },
+}
+
+/// Invocation đã persist nhưng chưa settle. `started=false`: `requested` (chưa từng chạy);
+/// `started=true`: `running` (outcome chưa biết nếu process chết giữa chừng).
+#[derive(Debug, Clone)]
+pub(crate) struct PendingInvocation {
+    pub id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
+    pub started: bool,
 }
 
 #[derive(Clone)]
@@ -62,6 +94,40 @@ pub(crate) fn new_id() -> String {
 
 fn text_json(text: &str) -> String {
     serde_json::json!({ "text": text }).to_string()
+}
+
+fn parse_policy(permissions_json: Option<&str>) -> SessionPolicy {
+    let list = |v: &serde_json::Value, key: &str| {
+        v.get(key).and_then(|a| a.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+    };
+    permissions_json
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+        .map(|v| SessionPolicy {
+            allowed_tools: list(&v, "allowed_tools"),
+            allowed_skills: list(&v, "allowed_skills"),
+        })
+        .unwrap_or_default()
+}
+
+/// Tool calls trong `content_json` của assistant message (rỗng nếu là câu trả lời cuối).
+fn calls_of(content_json: &str) -> Vec<StoredToolCall> {
+    serde_json::from_str::<serde_json::Value>(content_json)
+        .ok()
+        .and_then(|v| v.get("tool_calls").and_then(|c| c.as_array()).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| {
+            Some(StoredToolCall {
+                id: c.get("id")?.as_str()?.to_owned(),
+                name: c.get("name")?.as_str()?.to_owned(),
+                arguments: c.get("arguments").cloned().unwrap_or(serde_json::json!({})),
+            })
+        })
+        .collect()
 }
 
 fn text_of(content_json: &str) -> String {
@@ -100,19 +166,39 @@ impl SessionStore {
         self.pool.close().await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn create_root_session(
         &self,
         caller: &CallerContext,
         agent_id: &str,
     ) -> Result<String, OrchestratorError> {
+        self.create_root_session_with(caller, agent_id, &SessionPolicy::default())
+            .await
+    }
+
+    pub(crate) async fn create_root_session_with(
+        &self,
+        caller: &CallerContext,
+        agent_id: &str,
+        policy: &SessionPolicy,
+    ) -> Result<String, OrchestratorError> {
         let id = new_id();
+        let permissions = (policy != &SessionPolicy::default()).then(|| {
+            serde_json::json!({
+                "allowed_tools": policy.allowed_tools,
+                "allowed_skills": policy.allowed_skills,
+            })
+            .to_string()
+        });
         sqlx::query(
-            "INSERT INTO sessions(id, agent_id, owner_id, workspace_id) VALUES(?1, ?2, ?3, ?4)",
+            "INSERT INTO sessions(id, agent_id, owner_id, workspace_id, permissions_json) \
+             VALUES(?1, ?2, ?3, ?4, ?5)",
         )
         .bind(&id)
         .bind(agent_id)
         .bind(&caller.owner_id)
         .bind(&caller.workspace_id)
+        .bind(permissions)
         .execute(&self.pool)
         .await
         .map_err(db("create session"))?;
@@ -290,7 +376,9 @@ impl SessionStore {
         run_id: &str,
     ) -> Result<Option<RunRecord>, OrchestratorError> {
         let row = sqlx::query(
-            "SELECT session_id, agent_id, provider_id, model_id, status FROM agent_runs WHERE id = ?1",
+            "SELECT r.session_id, r.agent_id, r.provider_id, r.model_id, r.status, \
+             s.owner_id, s.workspace_id, s.permissions_json \
+             FROM agent_runs r JOIN sessions s ON s.id = r.session_id WHERE r.id = ?1",
         )
         .bind(run_id)
         .fetch_optional(&self.pool)
@@ -298,6 +386,8 @@ impl SessionStore {
         .map_err(db("load run"))?;
         let Some(row) = row else { return Ok(None) };
         let status: String = row.try_get("status").map_err(db("read run status"))?;
+        let permissions: Option<String> =
+            row.try_get("permissions_json").map_err(db("read policy"))?;
         Ok(Some(RunRecord {
             session_id: row.try_get("session_id").map_err(db("read run"))?,
             agent_id: row.try_get("agent_id").map_err(db("read run"))?,
@@ -305,17 +395,22 @@ impl SessionStore {
             model_id: row.try_get("model_id").map_err(db("read run"))?,
             status: RunStatus::parse(&status)
                 .ok_or_else(|| OrchestratorError::new(ErrorCode::Internal, "unknown run status"))?,
+            owner_id: row.try_get("owner_id").map_err(db("read run"))?,
+            workspace_id: row.try_get("workspace_id").map_err(db("read run"))?,
+            policy: parse_policy(permissions.as_deref()),
         }))
     }
 
-    /// Transcript user/assistant của session theo thứ tự (M1: toàn bộ; compaction ở M4).
+    /// Transcript user/assistant/tool của session theo thứ tự (toàn bộ; compaction ở M4).
     pub(crate) async fn conversation(
         &self,
         session_id: &str,
-    ) -> Result<Vec<(ConversationRole, String)>, OrchestratorError> {
+    ) -> Result<Vec<TranscriptEntry>, OrchestratorError> {
         let rows = sqlx::query(
-            "SELECT role, content_json FROM messages \
-             WHERE session_id = ?1 AND role IN ('user', 'assistant') ORDER BY sequence",
+            "SELECT m.role, m.content_json, m.tool_call_id, ti.tool_name \
+             FROM messages m LEFT JOIN tool_invocations ti ON ti.id = m.tool_invocation_id \
+             WHERE m.session_id = ?1 AND m.role IN ('user', 'assistant', 'tool') \
+             ORDER BY m.sequence",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
@@ -325,12 +420,24 @@ impl SessionStore {
             .map(|r| {
                 let role: String = r.try_get("role").map_err(db("read role"))?;
                 let json: String = r.try_get("content_json").map_err(db("read content"))?;
-                let role = if role == "user" {
-                    ConversationRole::User
-                } else {
-                    ConversationRole::Assistant
-                };
-                Ok((role, text_of(&json)))
+                Ok(match role.as_str() {
+                    "user" => TranscriptEntry::User(text_of(&json)),
+                    "tool" => {
+                        let call_id: Option<String> =
+                            r.try_get("tool_call_id").map_err(db("read call id"))?;
+                        let tool_name: Option<String> =
+                            r.try_get("tool_name").map_err(db("read tool name"))?;
+                        TranscriptEntry::Tool {
+                            call_id: call_id.unwrap_or_default(),
+                            tool_name: tool_name.unwrap_or_default(),
+                            text: text_of(&json),
+                        }
+                    }
+                    _ => TranscriptEntry::Assistant {
+                        text: text_of(&json),
+                        calls: calls_of(&json),
+                    },
+                })
             })
             .collect()
     }
@@ -391,8 +498,219 @@ impl SessionStore {
         Ok(Some(message_id))
     }
 
+    /// Một transaction: assistant message (text + tất cả tool calls) và **mọi** invocation
+    /// `requested`. Chỉ sau commit này mới được dispatch bất kỳ tool nào. `Ok(None)`: run
+    /// không còn `running`. Trả invocation theo đúng thứ tự provider.
+    pub(crate) async fn commit_tool_calls(
+        &self,
+        run_id: &str,
+        text: &str,
+        calls: &[StoredToolCall],
+    ) -> Result<Option<Vec<PendingInvocation>>, OrchestratorError> {
+        let mut tx = self.pool.begin().await.map_err(db("begin tool calls"))?;
+        let Some((session_id, seq)) = claim_sequence(&mut tx, run_id).await? else {
+            let _ = tx.rollback().await;
+            return Ok(None);
+        };
+        let message_id = new_id();
+        let content = serde_json::json!({
+            "text": text,
+            "tool_calls": calls
+                .iter()
+                .map(|c| serde_json::json!({
+                    "id": c.id, "name": c.name, "arguments": c.arguments,
+                }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO messages(id, session_id, sequence, role, content_json, run_id) \
+             VALUES(?1, ?2, ?3, 'assistant', ?4, ?5)",
+        )
+        .bind(&message_id)
+        .bind(&session_id)
+        .bind(seq)
+        .bind(content)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db("insert assistant tool-call message"))?;
+        let mut pending = Vec::with_capacity(calls.len());
+        for call in calls {
+            let id = new_id();
+            sqlx::query(
+                "INSERT INTO tool_invocations(id, session_id, run_id, tool_call_id, \
+                 assistant_message_id, tool_name, arguments_json, status) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'requested')",
+            )
+            .bind(&id)
+            .bind(&session_id)
+            .bind(run_id)
+            .bind(&call.id)
+            .bind(&message_id)
+            .bind(&call.name)
+            .bind(call.arguments.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db("insert tool invocation"))?;
+            pending.push(PendingInvocation {
+                id,
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                started: false,
+            });
+        }
+        let changed = sqlx::query(
+            "UPDATE agent_runs SET steps = steps + 1 WHERE id = ?1 AND status = 'running'",
+        )
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db("count step"))?
+        .rows_affected();
+        if changed != 1 {
+            let _ = tx.rollback().await;
+            return Ok(None);
+        }
+        tx.commit().await.map_err(db("commit tool calls"))?;
+        Ok(Some(pending))
+    }
+
+    /// `requested` → `running`, commit **trước** khi gọi tool: nếu process chết sau điểm này
+    /// thì outcome là unknown và không bao giờ được replay mù. `Ok(false)`: không còn hợp lệ.
+    pub(crate) async fn begin_invocation(
+        &self,
+        run_id: &str,
+        invocation_id: &str,
+    ) -> Result<bool, OrchestratorError> {
+        let mut tx = self.pool.begin().await.map_err(db("begin invocation"))?;
+        let started = sqlx::query(
+            "UPDATE tool_invocations SET status = 'running', started_at = unixepoch() \
+             WHERE id = ?1 AND run_id = ?2 AND status = 'requested' \
+             AND EXISTS (SELECT 1 FROM agent_runs WHERE id = ?2 AND status = 'running') \
+             RETURNING session_id",
+        )
+        .bind(invocation_id)
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db("start invocation"))?;
+        let Some(row) = started else {
+            let _ = tx.rollback().await;
+            return Ok(false);
+        };
+        let session_id: String = row.try_get("session_id").map_err(db("read session"))?;
+        sqlx::query(
+            "UPDATE sessions SET state_revision = state_revision + 1, updated_at = unixepoch() \
+             WHERE id = ?1",
+        )
+        .bind(&session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db("bump revision"))?;
+        tx.commit().await.map_err(db("commit invocation start"))?;
+        Ok(true)
+    }
+
+    /// Ghi tool-result message **và** đưa invocation tới `completed`/`failed` trong cùng một
+    /// transaction (docs/05 §5.4). Nếu commit lỗi thì không có gì được xác nhận.
+    /// `Ok(false)`: invocation/run không còn hợp lệ (không ghi đè).
+    pub(crate) async fn settle_invocation(
+        &self,
+        run_id: &str,
+        invocation_id: &str,
+        settled: &Settled,
+    ) -> Result<bool, OrchestratorError> {
+        let mut tx = self.pool.begin().await.map_err(db("begin settle"))?;
+        let status = if settled.failed {
+            "failed"
+        } else {
+            "completed"
+        };
+        let updated = sqlx::query(
+            "UPDATE tool_invocations SET status = ?3, result_json = ?4, error_code = ?5, \
+             finished_at = unixepoch() \
+             WHERE id = ?1 AND run_id = ?2 AND status IN ('requested', 'running') \
+             AND EXISTS (SELECT 1 FROM agent_runs WHERE id = ?2 AND status = 'running') \
+             RETURNING session_id, tool_call_id",
+        )
+        .bind(invocation_id)
+        .bind(run_id)
+        .bind(status)
+        .bind(&settled.result_json)
+        .bind(&settled.error_code)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db("settle invocation"))?;
+        let Some(row) = updated else {
+            let _ = tx.rollback().await;
+            return Ok(false);
+        };
+        let session_id: String = row.try_get("session_id").map_err(db("read session"))?;
+        let call_id: String = row.try_get("tool_call_id").map_err(db("read call id"))?;
+        let seq: i64 = sqlx::query_scalar(
+            "UPDATE sessions SET next_sequence = next_sequence + 1, \
+             state_revision = state_revision + 1, updated_at = unixepoch() \
+             WHERE id = ?1 RETURNING next_sequence - 1",
+        )
+        .bind(&session_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db("claim result sequence"))?;
+        sqlx::query(
+            "INSERT INTO messages(id, session_id, sequence, role, content_json, \
+             tool_call_id, tool_invocation_id, run_id) \
+             VALUES(?1, ?2, ?3, 'tool', ?4, ?5, ?6, ?7)",
+        )
+        .bind(new_id())
+        .bind(&session_id)
+        .bind(seq)
+        .bind(
+            serde_json::json!({ "text": settled.model_text, "is_error": settled.failed })
+                .to_string(),
+        )
+        .bind(&call_id)
+        .bind(invocation_id)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db("insert tool result"))?;
+        tx.commit().await.map_err(db("commit tool result"))?;
+        Ok(true)
+    }
+
+    /// Invocation chưa settle của run, theo đúng thứ tự provider.
+    pub(crate) async fn pending_invocations(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<PendingInvocation>, OrchestratorError> {
+        let rows = sqlx::query(
+            "SELECT id, tool_call_id, tool_name, arguments_json, status FROM tool_invocations \
+             WHERE run_id = ?1 AND status IN ('requested', 'running') ORDER BY rowid",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db("load pending invocations"))?;
+        rows.iter()
+            .map(|r| {
+                let args: String = r.try_get("arguments_json").map_err(db("read arguments"))?;
+                let status: String = r.try_get("status").map_err(db("read status"))?;
+                Ok(PendingInvocation {
+                    id: r.try_get("id").map_err(db("read id"))?,
+                    tool_call_id: r.try_get("tool_call_id").map_err(db("read call id"))?,
+                    tool_name: r.try_get("tool_name").map_err(db("read tool name"))?,
+                    arguments: serde_json::from_str(&args).unwrap_or(serde_json::json!({})),
+                    started: status == "running",
+                })
+            })
+            .collect()
+    }
+
     /// Terminal không-completed (failed/timed_out/interrupted/cancelled). `Ok(false)`:
-    /// run không còn `running`.
+    /// run không còn `running`. Invocation chưa settle của run được đưa về terminal cùng
+    /// transaction (không để `requested`/`running` treo) mà **không** giả outcome.
     pub(crate) async fn finish_run_without_final(
         &self,
         run_id: &str,
@@ -426,13 +744,27 @@ impl SessionStore {
         .execute(&mut *tx)
         .await
         .map_err(db("finish run"))?;
+        sqlx::query(
+            "UPDATE tool_invocations SET status = ?1, error_code = ?2, finished_at = unixepoch() \
+             WHERE run_id = ?3 AND status IN ('requested', 'running')",
+        )
+        .bind(if status == RunStatus::Cancelled {
+            "cancelled"
+        } else {
+            "interrupted"
+        })
+        .bind(error_code)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db("interrupt invocations"))?;
         tx.commit().await.map_err(db("commit terminal"))?;
         Ok(true)
     }
 
     /// Lúc build (đã giữ owner lock): run còn `running` từ process trước không có owner
-    /// nào nữa. M1 đánh dấu `interrupted` để session không kẹt; auto-resume/reconcile
-    /// thuộc M5, không replay.
+    /// nào nữa. Đánh dấu `interrupted` (cả invocation dang dở) để session không kẹt;
+    /// auto-resume/reconcile thuộc M5, **không replay** tool.
     pub(crate) async fn interrupt_stale_runs(&self) -> Result<u64, OrchestratorError> {
         let mut tx = self.pool.begin().await.map_err(db("begin stale scan"))?;
         sqlx::query(
@@ -451,6 +783,13 @@ impl SessionStore {
         .await
         .map_err(db("interrupt stale runs"))?
         .rows_affected();
+        sqlx::query(
+            "UPDATE tool_invocations SET status = 'interrupted', error_code = 'INTERRUPTED', \
+             finished_at = unixepoch() WHERE status IN ('requested', 'running')",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(db("interrupt stale invocations"))?;
         tx.commit().await.map_err(db("commit stale scan"))?;
         Ok(n)
     }
@@ -469,7 +808,7 @@ impl SessionStore {
         };
         let limit = page.limit.clamp(1, max_page);
         let rows = sqlx::query(
-            "SELECT id, sequence, role, content_json, run_id FROM messages \
+            "SELECT id, sequence, role, content_json, run_id, tool_call_id FROM messages \
              WHERE session_id = ?1 AND sequence > ?2 AND role IN ('user', 'assistant', 'tool') \
              ORDER BY sequence LIMIT ?3",
         )
@@ -493,6 +832,14 @@ impl SessionStore {
                 })?,
                 text: text_of(&json),
                 run_id: row.try_get("run_id").map_err(db("read run id"))?,
+                tool_call_id: row.try_get("tool_call_id").map_err(db("read call id"))?,
+                tool_calls: calls_of(&json)
+                    .into_iter()
+                    .map(|c| MessageToolCall {
+                        call_id: c.id,
+                        name: c.name,
+                    })
+                    .collect(),
             });
         }
         let next_cursor = if items.len() > limit as usize {
@@ -568,6 +915,28 @@ impl SessionStore {
             }),
         })
     }
+}
+
+/// Cấp sequence kế tiếp cho session của một run còn `running`. `None`: run đã terminal.
+async fn claim_sequence(
+    tx: &mut sqlx::SqliteConnection,
+    run_id: &str,
+) -> Result<Option<(String, i64)>, OrchestratorError> {
+    let row = sqlx::query(
+        "UPDATE sessions SET next_sequence = next_sequence + 1, \
+         state_revision = state_revision + 1, updated_at = unixepoch() \
+         WHERE id = (SELECT session_id FROM agent_runs WHERE id = ?1 AND status = 'running') \
+         RETURNING id, next_sequence - 1 AS seq",
+    )
+    .bind(run_id)
+    .fetch_optional(tx)
+    .await
+    .map_err(db("claim sequence"))?;
+    let Some(row) = row else { return Ok(None) };
+    Ok(Some((
+        row.try_get("id").map_err(db("read session"))?,
+        row.try_get("seq").map_err(db("read sequence"))?,
+    )))
 }
 
 struct SessionScope {

@@ -115,6 +115,46 @@ pub struct MessageView {
     pub text: String,
     /// Attempt tạo ra message (assistant/tool); `None` với input của user.
     pub run_id: Option<String>,
+    /// Provider call ID của tool-result message; `None` với role khác.
+    pub tool_call_id: Option<String>,
+    /// Tool calls mà assistant message này yêu cầu (rỗng nếu là câu trả lời cuối).
+    pub tool_calls: Vec<MessageToolCall>,
+}
+
+/// Tool call đã persist trong một assistant message (không kèm arguments).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageToolCall {
+    /// Provider call ID, chỉ duy nhất trong assistant message chứa nó.
+    pub call_id: String,
+    pub name: String,
+}
+
+/// Thu hẹp quyền của **một** session so với `AgentDefinition`. `None` = kế thừa agent;
+/// `Some(list)` = chỉ giữ phần giao với quyền của agent. Policy không bao giờ mở rộng quyền.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionPolicy {
+    pub allowed_tools: Option<Vec<String>>,
+    pub allowed_skills: Option<Vec<String>>,
+}
+
+impl SessionPolicy {
+    pub fn with_allowed_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_tools = Some(tools.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn with_allowed_skills<I, S>(mut self, skills: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_skills = Some(skills.into_iter().map(Into::into).collect());
+        self
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

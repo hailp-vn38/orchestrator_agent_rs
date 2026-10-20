@@ -1,5 +1,5 @@
-//! Orchestrator handle + builder. M1: single-agent text execution trên SQLite store.
-//! Chỉ những gì đã hoạt động mới được expose; tool loop/skill/child đến ở M2+.
+//! Orchestrator handle + builder. M2: single-agent text + tool/skill loop trên SQLite store.
+//! Chỉ những gì đã hoạt động mới được expose; child/compaction/recovery đầy đủ đến ở M3+.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
@@ -8,13 +8,20 @@ use std::sync::Arc;
 use crate::agent::{AgentDefinition, AgentMode, AgentRegistry};
 use crate::config::{OrchestratorConfig, RuntimeConfig};
 use crate::error::{ConfigReason, ErrorCode, OrchestratorError};
+use crate::executor::{ToolExecutor, ToolLimits};
 use crate::gateway::{ClientGateway, LlmGateway};
 use crate::owner_lock::OwnerLock;
-use crate::runtime::{build_system, AgentRuntime};
+use crate::prompt::PromptBuilder;
+use crate::runtime::AgentRuntime;
+use crate::skill::SkillManager;
 use crate::store::{RunRoute, SessionStore, DB_FILE};
 use crate::supervisor::Supervisor;
 use crate::tool::{validate_descriptor, HostTool, ToolDescriptor};
-use crate::types::{AcceptedTurn, AgentResult, CallerContext, MessageView, Page, PageRequest};
+use crate::types::{
+    AcceptedTurn, AgentResult, CallerContext, MessageView, Page, PageRequest, SessionPolicy,
+};
+
+const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 64 * 1024;
 
 /// Mandatory base, embed lúc compile; host không cung cấp file.
 const BASE_INSTRUCTIONS: &str = include_str!("base_instructions.md");
@@ -79,6 +86,18 @@ impl Orchestrator {
         caller: &CallerContext,
         agent_id: &str,
     ) -> Result<String, OrchestratorError> {
+        self.create_session_with_policy(caller, agent_id, SessionPolicy::default())
+            .await
+    }
+
+    /// Như [`Self::create_session`] nhưng thu hẹp quyền tool/skill của session. Policy chỉ
+    /// giao với quyền của agent, không bao giờ mở rộng được.
+    pub async fn create_session_with_policy(
+        &self,
+        caller: &CallerContext,
+        agent_id: &str,
+        policy: SessionPolicy,
+    ) -> Result<String, OrchestratorError> {
         self.ensure_open()?;
         let agent = self
             .registry
@@ -90,7 +109,9 @@ impl Orchestrator {
                 "agent cannot be used as a root session",
             ));
         }
-        self.store.create_root_session(caller, &agent.id).await
+        self.store
+            .create_root_session_with(caller, &agent.id, &policy)
+            .await
     }
 
     /// Trả sau khi input + run claim đã commit; không đợi LLM. `SESSION_BUSY` nếu session
@@ -224,8 +245,40 @@ impl OrchestratorBuilder {
         let names: HashSet<String> = tools.keys().cloned().collect();
         let registry = AgentRegistry::build(self.config.agents, &self.config.llm, &names).await?;
 
+        let skills = match &self.config.skills_dir {
+            Some(dir) => SkillManager::discover(dir, self.config.runtime.skill_max_bytes).await?,
+            None => SkillManager::empty(self.config.runtime.skill_max_bytes),
+        };
+        if self.config.skills_dir.is_some() {
+            for def in registry.list() {
+                if let Some(missing) = def.allowed_skills.iter().find(|s| !skills.contains(s)) {
+                    return Err(OrchestratorError::config(
+                        ConfigReason::UnknownSkill,
+                        format!("agent '{}': unknown skill '{}'", def.id, missing),
+                    ));
+                }
+            }
+        }
+
+        let project = match &self.config.project_instructions {
+            Some(path) => {
+                let bad = || {
+                    OrchestratorError::config(
+                        ConfigReason::ProjectInstructionsInvalid,
+                        "project instructions must be a readable UTF-8 file within 64KiB",
+                    )
+                };
+                let text = tokio::fs::read_to_string(path).await.map_err(|_| bad())?;
+                if text.len() > PROJECT_INSTRUCTIONS_MAX_BYTES {
+                    return Err(bad());
+                }
+                Some(text)
+            }
+            None => None,
+        };
+
         // Snapshot prompt lúc build (registry bất biến, không hot reload).
-        let mut systems = HashMap::new();
+        let mut prompts: Vec<(String, String)> = Vec::new();
         for def in registry.list() {
             let prompt = tokio::fs::read_to_string(&def.prompt_path)
                 .await
@@ -238,8 +291,24 @@ impl OrchestratorBuilder {
                         ),
                     )
                 })?;
-            systems.insert(def.id.clone(), build_system(BASE_INSTRUCTIONS, &prompt));
+            prompts.push((def.id.clone(), prompt));
         }
+        let prompt_builder = PromptBuilder::new(
+            BASE_INSTRUCTIONS,
+            project.as_deref(),
+            prompts.iter().map(|(id, p)| (id.as_str(), p.as_str())),
+        );
+        let agents: HashMap<String, AgentDefinition> =
+            registry.list().map(|d| (d.id.clone(), d.clone())).collect();
+        let executor = ToolExecutor::new(
+            tools.clone(),
+            Arc::new(skills),
+            ToolLimits {
+                timeout: self.config.runtime.tool_timeout,
+                model_cap_bytes: self.config.runtime.tool_output_cap_bytes,
+                hard_cap_bytes: self.config.runtime.tool_result_hard_cap_bytes,
+            },
+        );
 
         let fingerprints: BTreeMap<String, String> = self
             .config
@@ -269,7 +338,7 @@ impl OrchestratorBuilder {
             Some(g) => g,
             None => Arc::new(ClientGateway::new(&self.config.llm.providers)),
         };
-        let runtime = AgentRuntime::new(store.clone(), gateway, systems);
+        let runtime = AgentRuntime::new(store.clone(), gateway, prompt_builder, executor, agents);
         let supervisor = Supervisor::start(
             store.clone(),
             runtime,

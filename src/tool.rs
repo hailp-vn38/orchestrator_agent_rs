@@ -1,5 +1,5 @@
-//! HostTool: external extension seam (docs/18 §18.6). M0 chỉ cung cấp contract đăng ký
-//! và validate; dispatch/permissions/artifacts/checkpoint thuộc M2/M7.
+//! HostTool: external extension seam (docs/18 §18.6). M0 cung cấp contract đăng ký và
+//! validate; M2 thêm dispatch có scope/permissions (`executor`). Artifacts/checkpoint thuộc M7.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -24,16 +24,27 @@ pub struct ToolDescriptor {
     pub effect: ToolEffect,
 }
 
+/// Identity + effective permission snapshot do runtime mint (không lấy từ LLM). Host chỉ
+/// đọc; `non_exhaustive` để host không tự dựng scope giả.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ToolScope {
     pub owner_id: String,
     pub workspace_id: String,
     pub session_id: String,
     pub run_id: String,
+    pub agent_id: String,
     /// Internal `tool_invocations.id`, khác provider `tool_call_id`.
     pub invocation_id: String,
     pub tool_call_id: String,
+    /// Effective tools của session (agent ∩ session policy), đã sắp xếp.
+    pub allowed_tools: Vec<String>,
+    /// Effective skills của session (agent ∩ session policy), đã sắp xếp.
+    pub allowed_skills: Vec<String>,
 }
+
+/// Trần byte của một progress update (cắt tại ranh giới ký tự).
+const MAX_PROGRESS_BYTES: usize = 1024;
 
 /// Capability có phạm vi do runtime mint; host không tự dựng được ngoài test của crate.
 #[derive(Debug, Clone)]
@@ -43,7 +54,6 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
-    #[allow(dead_code)] // ToolExecutor dùng từ M2
     pub(crate) fn new(scope: ToolScope, cancelled: Arc<AtomicBool>) -> Self {
         Self { scope, cancelled }
     }
@@ -55,6 +65,22 @@ impl ToolContext {
     /// Hủy hợp tác; tool tự quyết định dừng.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Progress ephemeral, best-effort, không chặn và không ghi SQLite. Bị cắt ở
+    /// `MAX_PROGRESS_BYTES`; hiện chỉ đi vào tracing, event feed gắn ở M6.
+    pub fn progress(&self, update: &str) {
+        let mut end = update.len().min(MAX_PROGRESS_BYTES);
+        while !update.is_char_boundary(end) {
+            end -= 1;
+        }
+        tracing::debug!(
+            session_id = %self.scope.session_id,
+            run_id = %self.scope.run_id,
+            invocation_id = %self.scope.invocation_id,
+            progress = &update[..end],
+            "tool progress"
+        );
     }
 }
 

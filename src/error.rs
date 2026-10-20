@@ -70,6 +70,11 @@ pub enum ConfigReason {
     BaseInstructionsInvalid,
     InvalidStoreDir,
     InvalidRuntimeConfig,
+    InvalidSkillsDir,
+    InvalidSkill,
+    DuplicateSkill,
+    UnknownSkill,
+    ProjectInstructionsInvalid,
 }
 
 impl ConfigReason {
@@ -98,6 +103,11 @@ impl ConfigReason {
             Self::BaseInstructionsInvalid => "BASE_INSTRUCTIONS_INVALID",
             Self::InvalidStoreDir => "INVALID_STORE_DIR",
             Self::InvalidRuntimeConfig => "INVALID_RUNTIME_CONFIG",
+            Self::InvalidSkillsDir => "INVALID_SKILLS_DIR",
+            Self::InvalidSkill => "INVALID_SKILL",
+            Self::DuplicateSkill => "DUPLICATE_SKILL",
+            Self::UnknownSkill => "UNKNOWN_SKILL",
+            Self::ProjectInstructionsInvalid => "PROJECT_INSTRUCTIONS_INVALID",
         }
     }
 }
