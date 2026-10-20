@@ -26,7 +26,7 @@ use crate::skill::SkillManager;
 use crate::store::{RecoveryPolicy, Resolution, RunRoute, SessionStore, CODE_NO_EFFECT, DB_FILE};
 use crate::subagent::TaskManager;
 use crate::supervisor::{AdmissionSignal, Supervisor};
-use crate::tool::{validate_descriptor, HostTool, ToolDescriptor};
+use crate::tool::{validate_descriptor, HostTool, ToolDescriptor, ToolServices};
 use crate::types::{
     AcceptedTurn, AgentResult, ArtifactRef, CallerContext, FamilySnapshot, MessageView,
     OperatorContext, Page, PageRequest, RunStatus, SessionPolicy, VerifiedToolResolution,
@@ -741,9 +741,11 @@ impl OrchestratorBuilder {
             tasks,
             limits,
             feed.clone(),
-            artifacts.clone(),
-            store.clone(),
-            emitter.clone(),
+            ToolServices {
+                artifacts: artifacts.clone(),
+                store: store.clone(),
+                emitter: emitter.clone(),
+            },
         );
 
         let gateway: Arc<dyn LlmGateway> = match self.gateway {

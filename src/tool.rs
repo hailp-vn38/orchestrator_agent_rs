@@ -59,15 +59,21 @@ pub struct ToolScope {
 /// Trần byte của một progress update (cắt tại ranh giới ký tự).
 const MAX_PROGRESS_BYTES: usize = 1024;
 
+/// Các dịch vụ nội bộ mà runtime cấp cho `ToolContext` (luôn đi cùng nhau).
+#[derive(Clone)]
+pub(crate) struct ToolServices {
+    pub artifacts: ArtifactStore,
+    pub store: SessionStore,
+    pub emitter: Emitter,
+}
+
 /// Capability có phạm vi do runtime mint; host không tự dựng được ngoài test của crate.
 #[derive(Clone)]
 pub struct ToolContext {
     scope: ToolScope,
     cancelled: Arc<AtomicBool>,
     progress: Option<ProgressSink>,
-    artifacts: Option<ArtifactStore>,
-    store: Option<SessionStore>,
-    emitter: Option<Emitter>,
+    services: Option<ToolServices>,
 }
 
 impl fmt::Debug for ToolContext {
@@ -84,17 +90,13 @@ impl ToolContext {
         scope: ToolScope,
         cancelled: Arc<AtomicBool>,
         progress: Option<ProgressSink>,
-        artifacts: Option<ArtifactStore>,
-        store: Option<SessionStore>,
-        emitter: Option<Emitter>,
+        services: Option<ToolServices>,
     ) -> Self {
         Self {
             scope,
             cancelled,
             progress,
-            artifacts,
-            store,
-            emitter,
+            services,
         }
     }
 
@@ -158,7 +160,10 @@ pub struct ToolArtifacts<'a> {
 impl ToolArtifacts<'_> {
     /// Ghi bất biến một artifact mới qua `ArtifactStore` và trả về [`ArtifactRef`] đã xác minh.
     pub async fn put(&self, input: ArtifactInput) -> Result<ArtifactRef, ToolError> {
-        let Some(store) = &self.ctx.artifacts else {
+        let Some(ToolServices {
+            artifacts: store, ..
+        }) = &self.ctx.services
+        else {
             return Err(ToolError {
                 code: CODE_ARTIFACT_UNAVAILABLE.into(),
                 message: "artifact store is not available in this context".into(),
@@ -166,7 +171,7 @@ impl ToolArtifacts<'_> {
         };
         let write_scope = ArtifactWriteScope::from_tool_scope(&self.ctx.scope);
         let reference = store.put(&write_scope, input).await?;
-        if let Some(emitter) = &self.ctx.emitter {
+        if let Some(ToolServices { emitter, .. }) = &self.ctx.services {
             emitter
                 .committed_session(
                     &self.ctx.scope.session_id,
@@ -187,7 +192,10 @@ impl ToolArtifacts<'_> {
     /// thuộc cùng owner/workspace, cùng session family **và** nằm trong explicit invocation
     /// input/checkpoint scope. Cùng workspace đơn thuần không tự cấp quyền đọc (AT-40).
     pub async fn open(&self, artifact_id: &str) -> Result<ArtifactReader, ToolError> {
-        let Some(store) = &self.ctx.artifacts else {
+        let Some(ToolServices {
+            artifacts: store, ..
+        }) = &self.ctx.services
+        else {
             return Err(ToolError {
                 code: CODE_ARTIFACT_UNAVAILABLE.into(),
                 message: "artifact store is not available in this context".into(),
@@ -208,7 +216,10 @@ impl ToolCheckpoint<'_> {
     /// và xác minh tính toàn vẹn của artifact đó. Trả `Ok(None)` nếu invocation chưa commit
     /// pointer nào (không tự kế thừa từ invocation trước trong cùng child session).
     pub async fn current(&self) -> Result<Option<String>, ToolError> {
-        let (Some(store), Some(artifacts)) = (&self.ctx.store, &self.ctx.artifacts) else {
+        let Some(ToolServices {
+            store, artifacts, ..
+        }) = &self.ctx.services
+        else {
             return Err(ToolError {
                 code: CODE_ARTIFACT_UNAVAILABLE.into(),
                 message: "checkpoint store is not available in this context".into(),
@@ -226,7 +237,10 @@ impl ToolCheckpoint<'_> {
         manifest_id: &str,
         expected_previous_id: Option<&str>,
     ) -> Result<(), ToolError> {
-        let (Some(store), Some(artifacts)) = (&self.ctx.store, &self.ctx.artifacts) else {
+        let Some(ToolServices {
+            store, artifacts, ..
+        }) = &self.ctx.services
+        else {
             return Err(ToolError {
                 code: CODE_ARTIFACT_UNAVAILABLE.into(),
                 message: "checkpoint store is not available in this context".into(),
@@ -240,7 +254,7 @@ impl ToolCheckpoint<'_> {
                 expected_previous_id,
             )
             .await?;
-        if let Some(emitter) = &self.ctx.emitter {
+        if let Some(ToolServices { emitter, .. }) = &self.ctx.services {
             emitter
                 .committed_session(
                     &self.ctx.scope.session_id,

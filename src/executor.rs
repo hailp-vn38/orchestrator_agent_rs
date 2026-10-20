@@ -15,15 +15,13 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::AgentDefinition;
-use crate::artifact::ArtifactStore;
-use crate::feed::{Emitter, ExecutionFeed, ProgressSink};
+use crate::feed::{ExecutionFeed, ProgressSink};
 use crate::gateway::ModelTool;
 use crate::skill::{render, SkillManager};
-use crate::store::SessionStore;
 use crate::subagent::{self, Delegation, SubagentInput, TaskManager, SUBAGENT_TOOL};
 use crate::tool::{
     HostTool, ToolContext, ToolDescriptor, ToolEffect, ToolError, ToolOutcome, ToolScope,
-    RESERVED_TOOL_NAMES,
+    ToolServices, RESERVED_TOOL_NAMES,
 };
 use crate::types::SessionPolicy;
 
@@ -150,22 +148,17 @@ pub(crate) struct ToolExecutor {
     tasks: TaskManager,
     limits: ToolLimits,
     feed: ExecutionFeed,
-    artifacts: ArtifactStore,
-    store: SessionStore,
-    emitter: Emitter,
+    services: ToolServices,
 }
 
 impl ToolExecutor {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         tools: BTreeMap<String, Arc<dyn HostTool>>,
         skills: Arc<SkillManager>,
         tasks: TaskManager,
         limits: ToolLimits,
         feed: ExecutionFeed,
-        artifacts: ArtifactStore,
-        store: SessionStore,
-        emitter: Emitter,
+        services: ToolServices,
     ) -> Self {
         let descriptors = tools
             .iter()
@@ -178,9 +171,7 @@ impl ToolExecutor {
             tasks,
             limits,
             feed,
-            artifacts,
-            store,
-            emitter,
+            services,
         }
     }
 
@@ -341,6 +332,7 @@ impl ToolExecutor {
                         n.clamp(1, self.limits.model_cap_bytes)
                     });
                 let result = match self
+                    .services
                     .artifacts
                     .read_model_excerpt(&scope, &artifact_id, offset_bytes, cap)
                     .await
@@ -389,9 +381,7 @@ impl ToolExecutor {
             scope.clone(),
             Arc::clone(&cancelled),
             Some(progress),
-            Some(self.artifacts.clone()),
-            Some(self.store.clone()),
-            Some(self.emitter.clone()),
+            Some(self.services.clone()),
         );
         let guarded = AssertUnwindSafe(tool.execute(context, args)).catch_unwind();
         let watcher = async {
@@ -439,7 +429,8 @@ impl ToolExecutor {
                     message: "metadata.artifact_ids entries must be non-empty strings".into(),
                 });
             };
-            self.artifacts
+            self.services
+                .artifacts
                 .verify_in_family(
                     &scope.owner_id,
                     &scope.workspace_id,
