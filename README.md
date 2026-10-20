@@ -374,7 +374,7 @@ src/
   gateway/       adapter crate `llm`
   agent.rs config.rs tool.rs skill.rs prompt.rs types.rs error.rs ...
 migrations/      SQL migration (0001–0004)
-examples/        host, live_flow, video_summary
+examples/        host, live_flow, load_skills, video_summary
 tests/           m0–m7 (fake + live) và read_api
 docs/            thiết kế, ADR, evidence, spec
 spikes/g0/       spike độc lập (không thuộc library)
@@ -402,6 +402,21 @@ Root trả lời → Root hỏi tiếp cùng child session. Cấu hình provider
 (`--env-file`, `LIVE_ENV_FILE`, mặc định `.env.live`); biến `G0_OPENAI_*` của shell không ghi đè.
 Log JSONL ở `target/live-flow/<UUID>/events.jsonl` (API key được che). Exit 0 khi cả hai lượt completed,
 tool đã chạy và child session được tái sử dụng; mỗi lượt chờ tối đa 240 giây.
+
+### `load_skills` — agent nạp skill qua tool `skill(id)`
+
+[Example load_skills](examples/load_skills.rs): `OrchestratorConfig::with_skills_dir` trỏ tới
+[docs/examples/skills](docs/examples/skills) (scan một lần lúc `build()`); agent `reviewer` có tool `skill` và
+`with_allowed_skills(["rust-review"])`. Agent được yêu cầu nạp skill `rust-review` rồi liệt kê các bước workflow.
+
+```sh
+cp .env.live.example .env.live   # nếu chưa có; điền G0_OPENAI_*
+cargo run --example load_skills
+cargo run --example load_skills -- --env-file .env.live
+```
+
+Exit 0 khi turn completed và invocation `skill` ở trạng thái `Completed`; kết quả in ra stdout.
+Store tạm nằm trong thư mục temp và được xóa sau khi chạy.
 
 ### `video_summary` — video → transcript → tóm tắt → Markdown
 
