@@ -35,7 +35,10 @@ fn canonical_video_url(input: &str) -> Result<String, ToolError> {
     {
         rest.split(['&', '?', '#', '/']).next().unwrap_or_default()
     } else {
-        return Err(error("INVALID_URL", "expected a YouTube watch or youtu.be video URL"));
+        return Err(error(
+            "INVALID_URL",
+            "expected a YouTube watch or youtu.be video URL",
+        ));
     };
 
     if video_id.len() != 11
@@ -43,7 +46,10 @@ fn canonical_video_url(input: &str) -> Result<String, ToolError> {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     {
-        return Err(error("INVALID_URL", "YouTube video ID must be 11 URL-safe characters"));
+        return Err(error(
+            "INVALID_URL",
+            "YouTube video ID must be 11 URL-safe characters",
+        ));
     }
 
     Ok(format!("https://www.youtube.com/watch?v={video_id}"))
@@ -178,7 +184,10 @@ impl HostTool for FetchYoutubeTranscript {
             .map_err(|_| error("INVALID_CAPTIONS", "subtitle file is not UTF-8"))?;
         let transcript = parse_vtt(source);
         if transcript.is_empty() {
-            return Err(error("NO_TRANSCRIPT", "the subtitle file has no spoken text"));
+            return Err(error(
+                "NO_TRANSCRIPT",
+                "the subtitle file has no spoken text",
+            ));
         }
         if transcript.len() > MAX_TRANSCRIPT_BYTES {
             return Err(error("TRANSCRIPT_TOO_LARGE", "transcript exceeds 128 KiB"));
@@ -221,7 +230,12 @@ async fn pick_caption(dir: &Path) -> Result<(String, PathBuf), ToolError> {
     {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.ends_with(".vtt") || !entry.file_type().await.map(|ft| ft.is_file()).unwrap_or(false)
+        if !name.ends_with(".vtt")
+            || !entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_file())
+                .unwrap_or(false)
         {
             continue;
         }
