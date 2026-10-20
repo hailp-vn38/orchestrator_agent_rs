@@ -1,6 +1,6 @@
 # 17 — Agent Results & Artifacts
 
-**Status:** Proposed design  
+**Status:** Accepted design (v5.0)  
 **Scope:** Rust/Tokio modular monolith, SQLx/SQLite, local artifact storage, OpenCode-style Root/Subagent sessions.  
 **Related:** [02 Agents](02-agents.md), [05 Tools](05-tools.md), [06 Delegation](06-delegation.md), [07 Sessions](07-sessions-context.md), [09 Persistence](09-persistence.md), [11 Flows](11-flows.md), [15 Long-running](15-long-running-sessions.md), [16 Streaming](16-streaming-events.md).
 
@@ -24,27 +24,7 @@
 
 ## 17.3. Architecture
 
-```mermaid
-flowchart TD
-  UI[Web / CLI] --> API[Axum endpoints]
-  API --> RT[Shared AgentRuntime]
-  RT --> PB[PromptBuilder]
-  RT --> TX[ToolExecutor]
-  TX --> SUB[TaskManager / child AgentRuntime]
-  SUB --> RT
-  TX --> ART[ArtifactStore]
-  RT --> SS[SessionStore / SQLite]
-  ART --> META[(SQLite artifact metadata)]
-  ART --> FS[(Private local filesystem)]
-  RT --> FE[ExecutionFeed]
-  TX --> FE
-  FE --> SSE[Axum SSE]
-  SSE --> UI
-  API --> ART
-  API --> SS
-```
-
-`ArtifactStore` is a deep module, not a pass-through facade. It hides staging, atomic publication, hashing, metadata commit and authorized reads. Cross-store invocation recovery belongs to `AgentRuntime` using `SessionStore`; `ArtifactStore` exposes verified refs but does not mutate run/tool state. No storage adapter trait is needed with only a local implementation. `AgentResult` assembly belongs in the read endpoint/application orchestration, not a second stateful result manager.
+`ArtifactStore` là concrete deep module nội bộ của embeddable library, không phụ thuộc Axum; host dùng public `Orchestrator` để list/download và `HostTool` dùng `ToolContext.artifacts().put/open`. SessionStore owns run/transcript/checkpoint pointer; ArtifactStore owns immutable publication/metadata/integrity/authorized reads. No second ResultManager or remote storage adapter trait.
 
 ### Minimal interfaces (illustrative Rust, not compile-checked)
 
@@ -57,22 +37,16 @@ pub struct ArtifactRef {
     pub role: ArtifactRole, // Primary | Intermediate; listing/display only
 }
 
-pub struct AgentResult {
-    pub session_id: String,
-    pub turn_id: String,
-    pub run_id: String, // latest attempt for this turn
-    pub status: RunStatus, // derived from latest attempt, not prior interrupted attempt
-    pub output: Option<String>,
-    pub artifacts: Vec<ArtifactRef>,
-}
+// The single canonical public AgentResult lives in docs/18 §18.7:
+// latest attempt + confirmed output + bounded artifact_preview + cursor.
 
 impl ArtifactStore {
     pub async fn put(&self, context: &ArtifactContext, input: ArtifactInput)
         -> Result<ArtifactRef, ArtifactError>;
     pub async fn get(&self, context: &ArtifactContext, id: &str)
         -> Result<ArtifactReader, ArtifactError>;
-    pub async fn list_for_turn(&self, context: &ArtifactContext, turn_id: &str)
-        -> Result<Vec<ArtifactRef>, ArtifactError>;
+    pub async fn list_for_turn(&self, context: &ArtifactContext, turn_id: &str, page: PageRequest)
+        -> Result<Page<ArtifactRef>, ArtifactError>;
 }
 ```
 
@@ -91,23 +65,22 @@ CREATE TABLE artifacts (
   workspace_id TEXT NOT NULL,
   session_id TEXT NOT NULL REFERENCES sessions(id),
   turn_id TEXT NOT NULL,
-  producer_tool_call_id TEXT,
+  producer_invocation_id TEXT REFERENCES tool_invocations(id),
   role TEXT NOT NULL CHECK(role IN ('primary','intermediate')),
   name TEXT NOT NULL,
   mime_type TEXT NOT NULL,
   size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
   sha256 TEXT NOT NULL,
   storage_key TEXT NOT NULL UNIQUE,
-  state TEXT NOT NULL CHECK(state = 'ready'),
   created_at INTEGER NOT NULL
 );
 CREATE INDEX idx_artifacts_turn ON artifacts(workspace_id, turn_id, created_at);
 CREATE INDEX idx_artifacts_session ON artifacts(session_id, created_at);
 ```
 
-Schema is illustrative: use the repository's established ID/clock conventions during migration. A `turn_id` is stable across run recovery; `run_id` may change. Validate `session_id` and turn ownership in application logic/transactions. A tool-call foreign key is optional because calls are scoped by session and historical references must survive recovery. `producer_tool_call_id` must be interpreted together with `session_id`. Avoid duplicating `agent_runs.status` or creating an artifact status state machine for every provider operation.
+Schema is illustrative: use the repository's established ID/clock conventions during migration. A `turn_id` is stable across run recovery; `run_id` may change. Validate `session_id` and turn ownership in application logic/transactions. Producer attribution is optional for non-tool outputs; when present, `producer_invocation_id` is a nullable FK to the immutable internal `tool_invocations.id`, not a provider call ID (which can repeat in a session). Store validates producer session/turn ownership transactionally. Avoid duplicating `agent_runs.status` or creating an artifact status state machine for every provider operation.
 
-Physical layout: private configured root directory, server-generated opaque storage keys, staging and committed subdirectories. Never interpolate user filenames into paths. Use create-new staging files, streaming hash/size checks, `fsync` file, atomic rename within same filesystem, directory sync where supported, then metadata publication. Readers only resolve `ready` rows and only server-generated keys. File and DB are not one atomic transaction: if bytes are committed but metadata is absent, an orphan sweep removes them after a safe grace period. If DB references missing/corrupt bytes, return integrity error and flag repair; never claim success. For stronger durability, persist an explicit staging intent internally when warranted by crash tests, without exposing it as an agent-facing status.
+Physical layout: private configured root directory, server-generated opaque storage keys, staging and committed subdirectories. Never interpolate user filenames into paths. Use create-new staging files, streaming hash/size checks, `fsync` file, atomic rename within same filesystem, directory sync where supported, then metadata publication. Readers only resolve committed metadata rows and only server-generated keys. File and DB are not one atomic transaction: if bytes are committed but metadata is absent, an orphan sweep removes them after a safe grace period. If DB references missing/corrupt bytes, return integrity error and flag repair; never claim success. For stronger durability, persist an explicit staging intent internally when warranted by crash tests, without exposing it as an agent-facing status.
 
 Do not overwrite committed bytes. Regeneration creates a new ID. Validate MIME against content where practical, enforce max size, quotas, disk-space reserve, content safety rules and owner/workspace authorization. Hash supports integrity and possible future deduplication; do not deduplicate across tenants by default. External URLs are not filesystem paths or authorization tokens.
 
@@ -130,10 +103,10 @@ MVP retains committed artifacts without automatic TTL, deletion or reference-awa
 ```mermaid
 sequenceDiagram
   participant C as Client
-  participant A as Axum
+  participant A as Orchestrator
   participant S as SessionStore
   participant F as ArtifactStore
-  C->>A: GET /sessions/{session_id}/turns/{turn_id}/result
+  C->>A: result(caller, session_id, turn_id)
   A->>S: authorize + resolve run attempts / final message
   A->>F: list_for_turn(authenticated context, turn_id)
   F-->>A: authorized committed ArtifactRefs
@@ -141,7 +114,7 @@ sequenceDiagram
   A-->>C: AgentResult projection
 ```
 
-Resolve all `agent_runs` for `(session_id, turn_id)` by monotonic `resume_attempt` (and unique run identity as tie-breaker). The **latest attempt** supplies `run_id` and `status`; an older `interrupted` attempt must not override a newer `running` or `completed` attempt. Return `output` only from the final assistant message committed for the resolved terminal attempt, otherwise `None`. If running, return `status=running` and already published authorized artifacts; do not invent a final answer. `turn_id` remains stable across restarts. A final run can contain partial business outcomes. Paginate artifact lists if large; the minimal struct is a conceptual envelope, not a promise to inline thousands of refs. A projection must never expose child artifacts across owner/workspace boundaries; root-family visibility is policy-checked.
+Resolve all `agent_runs` for `(session_id, turn_id)` by monotonic `resume_attempt` (and unique run identity as tie-breaker). `agent_runs.final_message_id` belongs to a confirmed final assistant message with `messages.run_id` matching **that same run**; both are committed with terminal status. Do not query the last assistant text in the whole session. The **latest attempt** supplies `run_id` and `status`; an older `interrupted` attempt must not override a newer `running` or `completed` attempt. Return `output` only from the final assistant message committed for the resolved terminal attempt, otherwise `None`. If running, return `status=running` and already published authorized artifacts; do not invent a final answer. `turn_id` remains stable across restarts. A final run can contain partial business outcomes. Paginate artifact lists if large; the minimal struct is a conceptual envelope, not a promise to inline thousands of refs. A projection must never expose child artifacts across owner/workspace boundaries; root-family visibility is policy-checked.
 
 ## 17.7. Flow A — YouTube playlist → transcript → ASR → analysis
 
@@ -179,9 +152,9 @@ sequenceDiagram
 
 **MVP checkpoint choice: immutable, versioned `playlist-manifest.json` artifacts only.** No per-item SQLite checkpoint table. Each version contains item identity (playlist/source ID, video ID, processing version), source revision, transcript language/ASR model when applicable, item status (`pending`, `completed`, `failed/retryable`, `blocked`) and verified output artifact IDs. Count an item completed only when its refs exist and pass integrity checks. Root can report 18/20 complete while the run status is `completed`.
 
-**Durable pointer protocol:** After `ArtifactStore.put(manifest_vN)` returns a verified committed ref, the tool requests `SessionStore.commit_checkpoint(session_id, tool_call_id, manifest_id, expected_previous_id)` as a short SQLite compare-and-swap transaction on the **existing `tool_invocations` record** (a `checkpoint_artifact_id` nullable column). The transaction checks invocation ownership, status and expected previous pointer, then bumps the session revision. No new checkpoint table. The tool must not report item completion as durable before this commit. The initial manifest follows the same protocol. `AgentRuntime` coordinates this operation through the trusted tool context; tool code cannot directly write transcript rows.
+**Durable pointer protocol:** After `ArtifactStore.put(manifest_vN)` returns a verified committed ref, the tool requests `SessionStore.commit_checkpoint(invocation_id, manifest_id, expected_previous_id)` as a short SQLite compare-and-swap transaction on the **existing `tool_invocations` record** identified by internal `invocation_id` (a `checkpoint_artifact_id` nullable column). The transaction checks invocation ownership, status and expected previous pointer, then bumps the session revision. No new checkpoint table. The tool must not report item completion as durable before this commit. The initial manifest follows the same protocol. `AgentRuntime` coordinates this operation through the trusted tool context; tool code cannot directly write transcript rows.
 
-On restart, recover from the **last committed pointer**, not the newest file or SSE event. A newer manifest whose bytes committed but pointer update did not is an unreferenced candidate, not authoritative; retain it for later inspection (no MVP GC). Verify pointed-to bytes and all completed item refs before skipping work. Missing/corrupt refs require reconciliation or item reprocessing only when safe. Concurrent checkpoint writers on one invocation are rejected by compare-and-swap. When a follow-up uses a new `tool_call_id` in the same child session, explicitly pass the last verified manifest ID into the new invocation and commit it as its initial pointer; do not assume the prior invocation's pointer automatically transfers. Provider-side uncertain mutations still block blind retry. Audio retention must respect source terms and configured limits.
+On restart, recover from the **last committed pointer**, not the newest file or SSE event. A newer manifest whose bytes committed but pointer update did not is an unreferenced candidate, not authoritative; retain it for later inspection (no MVP GC). Verify pointed-to bytes and all completed item refs before skipping work. Missing/corrupt refs require reconciliation or item reprocessing only when safe. Concurrent checkpoint writers on one invocation are rejected by compare-and-swap. When a follow-up uses a new internal `invocation_id` in the same child session, explicitly pass the last verified manifest ID into the new invocation and commit it as its initial pointer; do not assume the prior invocation's pointer automatically transfers. Provider-side uncertain mutations still block blind retry. Audio retention must respect source terms and configured limits.
 
 ## 17.8. Flow B — PDF/DOCX → Markdown → summary → Knowledge Base
 
@@ -277,7 +250,9 @@ Keep existing `ExecutionFeed` taxonomy and `state_revision` invalidation strateg
 8. Media provider accepts job then process restarts: query durable provider job ID, no duplicate generation.
 9. >100 model/tool steps, compaction, HTTP/SSE disconnect and restart: final result and artifacts remain reconstructable from canonical stores.
 
-## 17.14. Incremental implementation plan
+## 17.14. Incremental implementation notes
+
+Canonical roadmap/tests are in [12](12-mvp-test-plan.md) (M7, AT-40/42/47). These are module-specific notes, not a parallel roadmap.
 
 **Phase A — ArtifactStore core:** local storage, SQLite metadata, `put/get/list_for_turn`, authorized reads, immutable publication and interface/fault-injection tests.
 
@@ -285,6 +260,10 @@ Keep existing `ExecutionFeed` taxonomy and `state_revision` invalidation strateg
 
 ## 17.15. Compatibility notes and open questions
 
-- `docs/05-tools.md` and `docs/09-persistence.md` currently say a general artifact store is post-MVP. This proposal intentionally changes that scope **when accepted**; update those documents and the decisions ledger in the same future commit, not silently now.
+- `docs/05-tools.md` and `docs/09-persistence.md` are aligned in v5.0: local ArtifactStore + fifth metadata table are MVP. No tasks/checkpoint table.
 - `AgentResult` is not a replacement for the existing `SubagentOutput`. Do not introduce mandatory `TaskContract`, `ResultValidator`, `Reviewer Agent` or `tasks` scheduler.
 - Set concrete maximum file sizes and quotas during deployment configuration; do not introduce GC/TTL or a separate checkpoint table in MVP. Reconsider only with measured workload evidence.
+
+### Scoped artifact inputs (v5.0)
+
+HostTool có thể đọc committed audio/document/manifest artifact của tool trước bằng `ToolContext.artifacts().open(id)` **chỉ khi** input ref thuộc explicit invocation scope/allowed ancestry. Cùng workspace không tự cấp quyền đọc. Reader có byte cap, streaming backpressure và integrity errors, không lộ private path. Cross-invocation continuation phải carry verified manifest ID tường minh và CAS thành initial pointer của invocation mới. Xem canonical HostTool interface ở [18](18-embeddable-library.md).

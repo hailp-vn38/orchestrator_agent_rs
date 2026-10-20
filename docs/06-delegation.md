@@ -41,8 +41,9 @@ sequenceDiagram
     Root->>Tool: execute subagent(agent, prompt)
     Tool->>TM: delegate(parent, invocation, runtime_ref)
     TM->>TM: mode / permission / ownership / depth / budgets
-    TM->>Store: create/resume child + link invocation.child_session_id
-    TM->>Child: submit(childSession, prompt) + wait(turn_id)
+    TM->>Store: admit_child_turn(parent_invocation_id, child, prompt) atomically
+    Store-->>TM: existing/new child_session_id + child_turn_id
+    TM->>Child: schedule/wait(child_turn_id) idempotently
     Child->>Store: persist child transcript + child run
     Child-->>TM: final assistant text
     TM-->>Tool: SubagentOutput(session_id, completed, output)
@@ -52,7 +53,7 @@ sequenceDiagram
 ```
 
 - **AgentRuntime** persist parent tool result; TaskManager không tự ghi result trùng vào `tasks` table.
-- Transaction ghi child link ngắn; không giữ SQLite transaction trong lúc await child LLM.
+- `SessionStore.admit_child_turn` là một transaction ngắn: verify ownership, append child input, claim child run và persist `child_session_id/child_turn_id` trên parent invocation. `tool_invocations.id` là idempotency key; repeated call cho same invocation trả existing turn, không submit trùng. Không await child LLM trong transaction.
 - Vì Child cũng chạy `AgentRuntime`, recursive async invocation có thể cần boxed future tại nhánh delegation. TaskManager không sở hữu `Arc<AgentRuntime>` để tránh strong-reference cycle.
 
 ### Nội dung model nhìn thấy
@@ -73,7 +74,7 @@ Ví dụ gọi tiếp:
 { "agent": "reviewer", "session_id": "ses_child", "description": "Verify evidence", "prompt": "Provide file references for each issue." }
 ```
 
-TaskManager phải xác nhận child tồn tại, `child.parent_session_id == caller.session_id`, đúng owner/workspace, phù hợp agent policy và không có active run khác trên child session. Nếu busy, MVP trả ToolError; không queue/steer. Mỗi lần gọi `subagent` sinh **một `tool_invocations` record mới** ở parent, nhưng có thể liên kết cùng `child_session_id`.
+TaskManager phải xác nhận child tồn tại, `child.parent_session_id == caller.session_id`, đúng owner/workspace, phù hợp agent policy và không có active run khác trên child session. Nếu busy, MVP trả ToolError; không queue/steer. Mỗi lần gọi `subagent` sinh **một parent invocation mới**, có thể liên kết cùng `child_session_id` nhưng phải liên kết **child_turn_id mới**. Two identical prompt texts trong hai invocations không phải cùng logical turn.
 
 ## 6.5. Root đánh giá kết quả
 
@@ -106,7 +107,7 @@ Background (`background=true`), output `running`, durable synthetic notification
 
 ## 6.9. Subagent chạy hàng giờ
 
-`TaskManager.delegate` foreground chờ child session execution hoàn thành, không dùng `child_timeout_s` cho toàn chuỗi. Child có thể thực hiện nhiều model/tool steps và auto compaction trước khi trả final text. Client HTTP disconnect **không** tự cancel parent; explicit cancel propagate parent → child. Sau restart, child phải recover/reconcile an toàn trước khi parent nhận final. Nếu `steps` được cấu hình trên child, report tại cap chỉ là execution outcome; Root vẫn tự đánh giá và có thể follow-up cùng `session_id`. Xem [15](15-long-running-sessions.md).
+`TaskManager.delegate` foreground chờ child session execution hoàn thành, không dùng `child_timeout_s` cho toàn chuỗi. Child có thể thực hiện nhiều model/tool steps và auto compaction trước khi trả final text. Client HTTP disconnect **không** tự cancel parent; explicit cancel propagate parent → child. Sau restart, parent chỉ wait/result của persisted `child_turn_id` của invocation; child recovery giữ turn và có thể có new run attempts. Child phải recover/reconcile an toàn trước khi parent nhận final. Nếu `steps` được cấu hình trên child, report tại cap chỉ là execution outcome; Root vẫn tự đánh giá và có thể follow-up cùng `session_id`. Xem [15](15-long-running-sessions.md).
 
 ## 6.10. Live child observation
 

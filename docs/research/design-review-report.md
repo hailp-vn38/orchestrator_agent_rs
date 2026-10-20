@@ -1,5 +1,7 @@
 # Báo cáo tổng hợp vấn đề thiết kế Orchestrator Agent RS
 
+> **Historical review snapshot (2026-10-20):** findings bên dưới phản ánh baseline đối chiếu `25f13d4`, **trước v5.0**. Cột “còn mở” là trạng thái khi review, không phải trạng thái hiện hành; xem phần 8 cuối báo cáo.
+
 **Ngày:** 2026-10-20 · **Mốc đối chiếu:** `25f13d4` · **Phạm vi:** toàn bộ **29 file** hiện có trong `docs/`: README, 19 tài liệu `00–18`, 7 file mẫu và 2 báo cáo nghiên cứu (gồm báo cáo này).
 
 Báo cáo kết hợp các phát hiện trước với lượt rà soát mở rộng toàn bộ tài liệu: tính nhất quán của thuật ngữ, public interfaces, prompt/skill/permission, delegation, transaction/recovery, long-running, streaming, artifacts, embedding, tests và bootstrap examples. Baseline v4.1 đã Accepted về thiết kế; tài liệu 17 và 18 còn **Proposed**. Đây là đánh giá hợp đồng thiết kế, chưa phải kết luận có lỗi runtime hay lỗ hổng bảo mật đã khai thác được. Repo chưa có implementation Rust để kiểm chứng các tình huống dưới đây. [Nguồn: trạng thái baseline](../README.md), [đề xuất 17](../17-agent-results-artifacts.md), [đề xuất 18](../18-embeddable-library.md).
@@ -69,7 +71,7 @@ Findings được giữ riêng theo hai trục **Standards** và **Spec**. P2 bi
 
 ### STD-01 · P2 · Thiếu ADR superseding trong checklist acceptance
 
-**Bằng chứng:** Mục 18.15 liệt kê các tài liệu cần cập nhật nhưng không có `docs/13-adrs.md`. Trong khi đó, quy tắc ADR yêu cầu ghi quyết định superseding khi thay đổi lịch sử Accepted. EMB-01/02/05 điều chỉnh entry point gọi trực tiếp AgentRuntime trong ADR-009 và vị trí transport Axum/SSE của baseline/ADR-014. [Nguồn: checklist 18.15](../18-embeddable-library.md#1815-changes-required-in-existing-documents), [quy tắc ADR](../13-adrs.md), [ADR-009](../13-adrs.md#adr-009--deep-modules-one-transcript-writer), [ADR-014](../13-adrs.md#adr-014--streaming-ephemeral-events--durable-session-snapshots).
+**Bằng chứng:** Mục 18.15 liệt kê các tài liệu cần cập nhật nhưng không có `docs/13-adrs.md`. Trong khi đó, quy tắc ADR yêu cầu ghi quyết định superseding khi thay đổi lịch sử Accepted. EMB-01/02/05 điều chỉnh entry point gọi trực tiếp AgentRuntime trong ADR-009 và vị trí transport Axum/SSE của baseline/ADR-014. [Nguồn: checklist 18.15](../18-embeddable-library.md#1815-đồng-bộ-khi-accept-v50), [quy tắc ADR](../13-adrs.md), [ADR-009](../13-adrs.md#adr-009--deep-modules-one-transcript-writer), [ADR-014](../13-adrs.md#adr-014--streaming-ephemeral-events--durable-session-snapshots).
 
 **Khi phát sinh:** Đề xuất 18 được accepted và người triển khai chỉ làm theo checklist hiện tại.
 
@@ -167,7 +169,7 @@ README hướng dẫn copy prompts mẫu; bộ mẫu chỉ có Root/Explorer/Rev
 
 ### GAP-07 · Thiếu trigger resync khi mất notification nhưng connection vẫn sống
 
-Protocol hiện refresh khi nhận committed invalidation, Lagged hoặc reconnect. Nếu worker dừng/panic sau terminal DB commit nhưng trước publish, trong khi process và SSE heartbeat vẫn sống, event chưa publish sẽ không tạo Lagged. Client có thể giữ snapshot running dù canonical state đã terminal. Đây là failure window đã được tài liệu 18 yêu cầu fault test, nhưng trigger sửa trạng thái UI cho tình huống còn kết nối chưa rõ. [Nguồn: reconnect protocol](../16-streaming-events.md#168-sse-endpoints-disconnect--reconnect), [artifact crash matrix](../17-agent-results-artifacts.md#1710-crash-recovery-idempotency-and-compaction), [fault injection 18](../18-embeddable-library.md#1812-test-strategy-qua-các-seams).
+Protocol hiện refresh khi nhận committed invalidation, Lagged hoặc reconnect. Nếu worker dừng/panic sau terminal DB commit nhưng trước publish, trong khi process và SSE heartbeat vẫn sống, event chưa publish sẽ không tạo Lagged. Client có thể giữ snapshot running dù canonical state đã terminal. Đây là failure window đã được tài liệu 18 yêu cầu fault test, nhưng trigger sửa trạng thái UI cho tình huống còn kết nối chưa rõ. [Nguồn: reconnect protocol](../16-streaming-events.md#168-host-sse-endpoints-disconnect--reconnect), [artifact crash matrix](../17-agent-results-artifacts.md#1710-crash-recovery-idempotency-and-compaction), [fault injection 18](../18-embeddable-library.md#1812-test-strategy-qua-các-seams).
 
 **Đóng khi:** Chọn periodic revision/snapshot reconciliation hoặc supervisor phát force-resync cho cửa sổ này; test suppress terminal publish khi connection còn sống, UI cuối cùng đọc đúng terminal state. Không cần thêm event log/historical replay chỉ để xử lý trường hợp này.
 
@@ -193,19 +195,19 @@ README docs hiện chỉ liệt kê 00–16 và root README mô tả 17 mục th
 
 ### ALIGN-01 · Bốn bảng/post-MVP artifacts so với ArtifactStore
 
-Baseline 05/09 đặt general artifact store sau MVP và giữ raw result trong DB dưới hard cap. Tài liệu 17 đề xuất chuyển đầu ra lớn sang private filesystem + bảng `artifacts`, thêm `checkpoint_artifact_id` trên invocation. Tài liệu 18 dựa vào đề xuất này ở E6. [Nguồn: output baseline](../05-tools.md#55-text-output-lớn), [baseline retention](../09-persistence.md#96-tool-outputs-và-retention), [schema 17](../17-agent-results-artifacts.md#174-persistence-and-filesystem), [compatibility 17](../17-agent-results-artifacts.md#1715-compatibility-notes-and-open-questions), [increments 18](../18-embeddable-library.md#1813-incremental-implementation-plan).
+Baseline 05/09 đặt general artifact store sau MVP và giữ raw result trong DB dưới hard cap. Tài liệu 17 đề xuất chuyển đầu ra lớn sang private filesystem + bảng `artifacts`, thêm `checkpoint_artifact_id` trên invocation. Tài liệu 18 dựa vào đề xuất này ở E6. [Nguồn: output baseline](../05-tools.md#55-text-output-lớn), [baseline retention](../09-persistence.md#96-tool-outputs-artifacts-và-retention), [schema 17](../17-agent-results-artifacts.md#174-persistence-and-filesystem), [compatibility 17](../17-agent-results-artifacts.md#1715-compatibility-notes-and-open-questions), [increments 18](../18-embeddable-library.md#1813-implementation-milestones).
 
 **Cách xử lý:** Chốt acceptance và phạm vi ArtifactStore; cập nhật decisions, persistence, tool output policy, migrations, tests và ADR liên quan trong cùng đợt. Hiện chưa được coi schema năm bảng là baseline Accepted hoặc bảng `tasks` được bổ sung.
 
 ### ALIGN-02 · Entry point Axum so với library-first
 
-Baseline bắt đầu từ Axum/API gọi AgentRuntime, có `main.rs/api.rs` và SSE adapter trong kiến trúc server. Tài liệu 18 đặt Orchestrator làm public library handle, host sở hữu AuthN/transport và Tokio runtime; engine giữ authorization, supervisor và stores. [Nguồn: baseline architecture](../01-architecture.md), [EMB decisions](../18-embeddable-library.md#182-quyết-định-kiến-trúc-proposed), [changes required](../18-embeddable-library.md#1815-changes-required-in-existing-documents).
+Baseline bắt đầu từ Axum/API gọi AgentRuntime, có `main.rs/api.rs` và SSE adapter trong kiến trúc server. Tài liệu 18 đặt Orchestrator làm public library handle, host sở hữu AuthN/transport và Tokio runtime; engine giữ authorization, supervisor và stores. [Nguồn: baseline architecture](../01-architecture.md), [EMB decisions](../18-embeddable-library.md#182-quyết-định-kiến-trúc-accepted-design), [changes required](../18-embeddable-library.md#1815-đồng-bộ-khi-accept-v50).
 
 **Cách xử lý:** Khi accept, đồng bộ entry point/public types/source tree và đưa Axum thành optional host example. Giữ nguyên shared runtime, isolated histories và SSE snapshot/invalidation semantics. Cập nhật ADR theo STD-01.
 
 ### ALIGN-03 · AgentResult và roadmap chưa có baseline hợp nhất
 
-Tài liệu 17 minh họa `AgentResult.artifacts: Vec<ArtifactRef>` nhưng đã yêu cầu pagination khi lớn. Tài liệu 18 cụ thể hóa thành bounded `artifact_preview` + cursor, thêm public history/list/download; đây là refinement cần đồng bộ chứ chưa phải mâu thuẫn hành vi bắt buộc. Roadmap M0–M7, Artifact Phase A/B và embedding E0–E6 cũng chưa được ánh xạ thành một kế hoạch triển khai chung. [Nguồn: projection 17](../17-agent-results-artifacts.md#176-agentresult-projection-and-read-flow), [projection 18](../18-embeddable-library.md#187-agentresult-artifacts-và-storage-ownership), [roadmap baseline](../12-mvp-test-plan.md#121-milestones-tracer-bullets), [artifact phases](../17-agent-results-artifacts.md#1714-incremental-implementation-plan), [embedding increments](../18-embeddable-library.md#1813-incremental-implementation-plan).
+Tài liệu 17 minh họa `AgentResult.artifacts: Vec<ArtifactRef>` nhưng đã yêu cầu pagination khi lớn. Tài liệu 18 cụ thể hóa thành bounded `artifact_preview` + cursor, thêm public history/list/download; đây là refinement cần đồng bộ chứ chưa phải mâu thuẫn hành vi bắt buộc. Roadmap M0–M7, Artifact Phase A/B và embedding E0–E6 cũng chưa được ánh xạ thành một kế hoạch triển khai chung. [Nguồn: projection 17](../17-agent-results-artifacts.md#176-agentresult-projection-and-read-flow), [projection 18](../18-embeddable-library.md#187-agentresult-artifacts-và-storage-ownership), [roadmap baseline](../12-mvp-test-plan.md#121-milestones-canonical-tracer-bullets), [artifact phases](../17-agent-results-artifacts.md#1714-incremental-implementation-notes), [embedding increments](../18-embeddable-library.md#1813-implementation-milestones).
 
 **Cách xử lý:** Chọn public result envelope và ánh xạ các increments/gates khi acceptance; không coi các bảng kế hoạch hoặc pseudocode là implementation đã hoàn tất.
 
@@ -227,3 +229,9 @@ Tài liệu 18 cũng đã mô tả supervisor reconciliation trong cùng process
 **Chưa có chứng cứ runtime:** Không chạy cargo tests, provider smoke, crash fault injection, concurrency/authorization tests hoặc deployment acceptance trong các lượt đọc/review này. AT/ST/EMB-AT và artifact verification plan là yêu cầu kiểm chứng, không phải danh sách đã pass. Nghiên cứu dựa trên nguồn sơ cấp trong repo; các khẳng định upstream OpenCode/crate/provider hiện tại chưa được xác minh độc lập.
 
 **Kiểm tra tài liệu:** Rà soát đường dẫn Markdown nội bộ và heading anchors trong toàn bộ `docs/`; không phát hiện tham chiếu nội bộ không tồn tại sau khi hoàn thiện báo cáo. Kiểm tra này không xác minh URL bên ngoài, Rust pseudocode, migration runtime hoặc độ đúng của provider API.
+
+## 8. Resolution sau Codebase Design × Ponytail Review — baseline v5.0
+
+**Resolved in design documents (not runtime verified):** STD-01 (ADR-015–017), STD-02 (session-scoped skill catalog), SPEC-01 (scoped HostTool artifact open), SPEC-02 (quiesce/join trước owner lock release), SPEC-03 (atomic idempotent invocation→child turn). GAP-01/02/03/05/06/07/08 và DOC-01/02 đã được đặc tả/đồng bộ trong docs 00–18 và examples; **GAP-04 còn pending compile/provider/operational spike**.
+
+ALIGN-01/02/03 đã accept ở mức thiết kế: five-table ArtifactStore MVP, library-first host transport, one AgentResult definition và canonical roadmap/test catalog tại [12](../12-mvp-test-plan.md). Ponytail loại duplicate AgentResult/test tables, redundant artifact ready-state, one-field AgentInput wrapper; không thêm tasks, CheckpointManager, storage/provider interface traits. Tất cả test cases AT-38–50 vẫn **chưa chạy**, cần code và fault-injection evidence.

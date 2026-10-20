@@ -19,20 +19,13 @@ LLM đề xuất tool call; **ToolExecutor** kiểm tra input, policy, dispatch 
 ```rust
 #[derive(Debug, Clone)]
 pub struct ToolCall {
-    pub id: String, // stable provider tool-call ID
+    pub id: String, // provider tool-call ID, scoped to an assistant message
     pub name: String,
     pub args: serde_json::Value,
 }
 
-pub struct ToolContext {
-    pub session_id: String,
-    pub run_id: String,
-    pub agent_id: String,
-    // private live event publisher
-}
-impl ToolContext {
-    pub fn progress(&self, update: ToolProgress) { /* best-effort; nonblocking */ }
-}
+// Canonical scoped public ToolContext is specified in docs/18 §18.6.2.
+// ToolExecutor uses runtime-created trusted ToolContext, not a second shape.
 
 pub struct ToolOutcome {
     pub call_id: String,
@@ -65,16 +58,16 @@ flowchart TD
     B --> D
 ```
 
-- Lưu assistant message có tool calls và `tool_invocations.status=requested` **trước khi thực hiện side effect**. ToolExecutor không mở transcript transaction riêng.
+- Lưu assistant message có tool calls và `tool_invocations.status=requested` **trước khi thực hiện side effect**. Internal `tool_invocations.id` là stable invocation key; provider `tool_call_id` được giữ nguyên cho model history và unique trong từng assistant message (không yêu cầu unique toàn session). Tool-result message gắn `messages.tool_invocation_id` để replay/reconciliation không suy đoán pairing bằng provider ID toàn session. ToolExecutor không mở transcript transaction riêng.
 - Sau khi tool trả: runtime ghi tool result/error và cập nhật invocation `completed/failed` **trong cùng transaction**. Luôn bảo toàn `tool_call_id`.
 - **Events:** `tool.started` chỉ emit sau invocation requested/running được persist. `ToolContext::progress(..)` emit ephemeral `tool.progress` không ghi SQLite. Runtime publish terminal tool event **sau commit** result/error; không publish terminal success nếu DB commit thất bại.
 - Technical schema checks chỉ kiểm tra input/output envelope. `subagent.output` là text string; không buộc JSON nghiệp vụ.
 - **Không cam kết exactly-once cho side effects.** Sau crash giữa thực thi và xác nhận, outcome có thể **unknown**. Đánh dấu `interrupted`, không auto-replay; cần xác minh thủ công hoặc thao tác idempotent trước khi thực thi lại.
 - Khi restart gặp pending invocation chưa có confirmed result: tuyệt đối không gửi dangling call/result pair vào LLM. Read-only/idempotent tool có thể reconcile theo policy; mutating tool với outcome unknown thì **block execution** cho tới khi xác minh. Sau reconciliation an toàn, session có thể resume nếu còn recovery budget.
 
-## 5.5. Text output lớn
+## 5.5. Large outputs / ArtifactStore (MVP)
 
-Giới hạn phần **model-visible content** theo bytes/lines và ghi metadata `truncated`; giữ raw result trong `tool_invocations.result_json` khi nằm dưới hard persistence size limit. Nếu vượt hard limit, trả lỗi kỹ thuật rõ ràng thay vì âm thầm làm mất dữ liệu. MVP chưa có artifact store tổng quát; sau MVP mới bổ sung artifact references và read-by-offset.
+Model-visible `ToolOutcome.content` có byte/line cap. `tool_invocations.result_json` chỉ chứa bounded text/metadata; raw output vượt hard persistence cap đi qua local immutable `ArtifactStore`. HostTool dùng trusted `ToolContext.artifacts().put/open` để tạo/đọc refs theo effective permissions, owner/workspace/ancestry, integrity và streaming limits, không direct SQL/filesystem. Durable manifests commit qua `SessionStore` checkpoint pointer CAS của internal `invocation_id`, không tạo bảng checkpoints. Xem [17](17-agent-results-artifacts.md), [18](18-embeddable-library.md).
 
 ## 5.6. Prompt injection
 

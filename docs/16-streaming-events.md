@@ -1,6 +1,6 @@
 # 16 — Streaming, Execution Events & Session Family Monitoring
 
-**Status:** Accepted design · **Version:** v4.1 (Ponytail + Codebase Design review) · **Scope:** MVP Rust, Tokio, Axum SSE, SQLx/SQLite.  
+**Status:** Accepted design · **Version:** v5.0 (library-first) · **Scope:** MVP Rust/Tokio, transport-neutral events, host SSE adapter, SQLx/SQLite.  
 **Related:** [01 Architecture](01-architecture.md), [05 Tools](05-tools.md), [06 Delegation](06-delegation.md), [07 Sessions](07-sessions-context.md), [08 Runtime](08-runtime-llm.md), [09 Persistence](09-persistence.md), [12 Tests](12-mvp-test-plan.md), [15 Long-running](15-long-running-sessions.md).
 
 ## 16.1. Decision & non-goals
@@ -13,7 +13,7 @@ MVP gồm: streaming text delta, run/step lifecycle, tool started/progress/termi
 
 ```mermaid
 flowchart TD
-    Client[Web / CLI] -->|POST input| API[Axum]
+    Client[Web / CLI] -->|commands| API[Host transport]
     API --> RT[Shared AgentRuntime]
     RT --> LLM[LlmGateway / provider stream]
     RT --> TX[ToolExecutor]
@@ -23,7 +23,7 @@ flowchart TD
     RT --> DB[SessionStore / SQLite]
     RT --> Feed[ExecutionFeed / Tokio broadcast]
     TX -->|ToolContext.progress| Feed
-    Feed --> SSE[Axum SSE adapter]
+    Feed --> SSE[Host SSE adapter]
     DB --> Snap[Session-family snapshot]
     Snap --> API
     SSE --> Client
@@ -37,7 +37,7 @@ flowchart TD
 | `TaskManager` | `delegate(request, runtime_ref)` | Child ownership/lifecycle; session link dùng `SessionStore`, child events phát từ chính runtime. |
 | `SessionStore` | `commit_*`, `family_snapshot(root)` | SQLite transactions, session revisions, child ancestry, ordered history. |
 | `ExecutionFeed` | `publish(event)`, `subscribe()` | **Một concrete module**, fan-out/bounded lag policy; không tạo trait/broker framework hay truyền transport vào Tool. |
-| Axum SSE adapter | `GET .../events` | Auth, root-family filtering, bounded delivery, heartbeat, resync signal. |
+| Host SSE adapter | `GET .../events` | Auth, root-family filtering, bounded delivery, heartbeat, resync signal. |
 
 `ExecutionFeed` là seam của domain observation → client transport, chỉ live best-effort; không persist và không quyết định semantic success. Interface `ToolExecutor::execute(&self, call, context, runtime: &AgentRuntime)` theo [05](05-tools.md) là **một hợp đồng duy nhất** trong MVP; runtime handle được borrow, không tạo vòng `Arc`.
 
@@ -143,15 +143,8 @@ sequenceDiagram
 `ToolContext` có phương thức `progress(update)` trên concrete struct, che giấu sender nội bộ. Không thêm public `ProgressReporter` type/trait chỉ có một phương thức:
 
 ```rust
-pub struct ToolContext<'a> {
-    pub session_id: &'a str,
-    pub run_id: &'a str,
-    pub call_id: &'a str,
-    // private live event sender / tracing context
-}
-impl ToolContext<'_> {
-    pub fn progress(&self, update: ToolProgress) { /* best-effort, nonblocking */ }
-}
+// Canonical scoped ToolContext is specified once at docs/18 §18.6.2.
+// It includes progress, cancellation, scoped identity/artifact reads and checkpoint CAS.
 ```
 
 `subagent` và `skill` là ordinary tool calls. Parent `tool.started` xuất hiện sau requested invocation; child creation/link transaction phát `session.changed` (revision parent) để UI refresh family; child tự phát `run.started`/steps/tools. Parent `tool.completed` chỉ sau khi child final text **và parent result** đều committed. `skill` load thành công đi qua `tool.completed`, không cần `skill.loaded`. Client nhìn child events trước parent completion.
@@ -160,7 +153,7 @@ Tool mutation có outcome unknown sau crash → mark interrupted/block, không g
 
 ## 16.7. SQLite snapshot & `state_revision`
 
-Giữ **4 bảng**; chỉ thêm `sessions.state_revision`. Transaction thay đổi durable UI state của một session tăng revision một lần/session và trả revision sau commit; các transactions chạm parent và child tăng revision tương ứng.
+Baseline v5.0 giữ **5 bảng** (`sessions/messages/agent_runs/tool_invocations/artifacts`); `sessions.state_revision` thuộc canonical `SessionStore`. Transaction thay đổi durable UI state của một session tăng revision một lần/session và trả revision sau commit; các transactions chạm parent và child tăng revision tương ứng.
 
 ```sql
 UPDATE sessions
@@ -176,7 +169,7 @@ RETURNING state_revision;
 
 `state_revision` khác `messages.next_sequence`: run/tool transitions không nhất thiết tạo message. Revision không phải event replay cursor. Ephemeral text/progress render tức thì nhưng không được ghi đè terminal state từ snapshot.
 
-## 16.8. SSE endpoints, disconnect & reconnect
+## 16.8. Host SSE endpoints, disconnect & reconnect
 
 Hai read endpoints mới; submit/cancel/history được định nghĩa tại [08](08-runtime-llm.md) và [07](07-sessions-context.md).
 
@@ -191,7 +184,8 @@ SSE trả `Content-Type: text/event-stream`, `Cache-Control: no-cache`, auth b�
 2. Client gọi `snapshot`, hydrate canonical UI với revision của từng session.
 3. Nếu buffer có committed invalidations với revision cao hơn snapshot, refresh (debounce) cho tới khi cập nhật; không replay các payload như patches. Chỉ render ephemeral previews nếu entity/step còn active.
 4. Khi nhận committed invalidation mới, schedule snapshot refresh; local UI có thể hiển thị tool state tạm thời nhưng snapshot luôn thắng.
-5. Disconnect, broadcast `Lagged` hoặc `resync.required`: bỏ các partial previews chưa confirmed, mở lại SSE trước rồi fetch snapshot như bước 1.
+5. Disconnect, broadcast `Lagged` hoặc `resync.required`: bỏ partial previews chưa confirmed, mở lại SSE trước rồi fetch snapshot như bước 1.
+6. **Trong khi snapshot còn active run**, host client định kỳ lấy lại canonical snapshot/revision (ví dụ 30s, configurable), **ngay cả khi SSE/heartbeat còn sống**. Kết thúc periodic refresh khi family không còn active work. Đây là fallback cho terminal DB commit bị miss publish; không thêm event log.
 
 Khi child vừa tạo/resume, parent-side `session.changed` hoặc child `run.started` làm invalidate family snapshot. Server lọc child membership theo **ancestry được xác nhận trong SQLite**, không chỉ theo danh sách child ban đầu. `root_session_id` trong envelope không thay thế authorization check. Không có `Last-Event-ID` replay trong MVP.
 
@@ -243,6 +237,7 @@ MVP dùng **một concrete `tokio::sync::broadcast` channel** cho server process
 | ST-13 | Provider đã stream `ToolCallReady` rồi lỗi trước `Finished` | ToolExecutor **không được gọi**, không có tool side effect. |
 | ST-14 | Hai tool calls trong một assistant response | Persist đủ calls trước dispatch tuần tự; chỉ mở next LLM step sau mọi outcomes. |
 | ST-15 | Revision 16 publish trước revision 15 | Snapshot refresh lên ít nhất 16, không mất committed state dù bỏ event 15. |
+| ST-16 | Terminal DB commit nhưng notification mất trong lúc SSE vẫn sống | Active-run periodic snapshot hội tụ canonical terminal state mà không chờ reconnect. |
 
 ## 16.12. OpenCode reference & differences
 

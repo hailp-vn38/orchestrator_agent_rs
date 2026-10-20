@@ -1,21 +1,18 @@
 # Orchestrator Agent RS — Tài liệu thiết kế
 
-**Trạng thái:** Baseline **v4.1 — Continuous Sessions + SSE Observability, post-review** · **Ngày:** 2026-10-20 · **Đích:** Repository `hailp-vn38/orchestrator_agent_rs`
+**Trạng thái:** Baseline **v5.0 — Embeddable Rust Library + Artifacts (Accepted design)** · **Ngày:** 2026-10-20 · **Đích:** Repository `hailp-vn38/orchestrator_agent_rs`
 
 Bộ tài liệu là **thiết kế dự kiến**, không khẳng định source code đã được triển khai. Mô hình tham khảo: OpenCode `anomalyco/opencode`, nhưng implementation mới sử dụng Rust, Tokio, crate `llm`, SQLx và SQLite.
 
-## Thay đổi chính trong bản v4.1
+## Thay đổi chính trong v5.0
 
-- Không còn `OrchestratorEngine` và `ContextManager` riêng; `PromptBuilder` tạo context, `AgentRuntime` persist transcript.
-- Chỉ 4 bảng SQLite: `sessions`, `messages`, `agent_runs`, `tool_invocations`; delegation liên kết child bằng `tool_invocations.child_session_id`.
-- Một active run/session nhờ unique partial index; `session` chỉ `open/archived`, lỗi nằm ở `run`.
-- Agent `steps` là tùy chọn; **không giới hạn bước mặc định** cho Root/Child, không có `child_timeout_s: 120` cho toàn child.
-- Continuous execution không bị ràng buộc bởi tuổi thọ HTTP request; giữ session và history bền vững.
-- Auto summary compaction trước khi context đầy; recovery bounded sau restart ở safe point.
-- Foreground child trước; background subagent notifications sau MVP. Không bắt buộc semantic validation.
-- Side-effect tool outcome sau crash có thể unknown: không tự replay.
-- **SSE quan sát Root/Child/Tool từ MVP**: live text delta và tool progress, committed state trong SQLite; disconnect không ngừng run.
-- Snapshot + `sessions.state_revision` để resync client; committed events invalidate snapshot, không apply state patches; không lưu token hoặc SSE historical replay.
+- Library-first: `Orchestrator` là public deep module; host sở hữu Tokio, AuthN, HTTP/gRPC/SSE; `AgentRuntime` là runner nội bộ.
+- Năm bảng SQLite: thêm `artifacts`, durable `child_turn_id`, checkpoint pointer, final message lineage và provider fingerprint. Không có `tasks` table/event log.
+- Idempotent child admission keyed by parent invocation ID; provider tool-call ID khác internal invocation ID.
+- Scoped `ToolContext.artifacts().put/open`, owner/workspace/ancestry authorization; checkpoint CAS từ SessionStore.
+- Shutdown chỉ release owner guard sau khi local write-capable tasks quiesce/join.
+- Active-turn compaction theo settled exchanges, periodic canonical snapshot refresh khi mất notification mà SSE vẫn sống.
+- Đây là **thiết kế**, chưa có Rust implementation hoặc evidence từ provider/fault tests.
 
 ## Mục lục
 
@@ -37,7 +34,9 @@ Bộ tài liệu là **thiết kế dự kiến**, không khẳng định source
 | [13. ADRs](13-adrs.md) | Quyết định kiến trúc và alternatives |
 | [14. Glossary](14-glossary.md) | Thuật ngữ chung trong codebase |
 | [15. Long-running Sessions](15-long-running-sessions.md) | Continuous run, compaction, recovery, step limit tùy chọn, cancellation |
-| [16. Streaming & Events](16-streaming-events.md) | SSE, Root/Child tracking, tool progress, event schema, snapshot/reconnect, backpressure |
+| [16. Streaming & Events](16-streaming-events.md) | Transport-neutral streaming, Root/Child tracking, snapshot/resync |
+| [17. Agent Results & Artifacts](17-agent-results-artifacts.md) | Immutable artifacts, manifest CAS, workflow dữ liệu lớn |
+| [18. Embeddable Library](18-embeddable-library.md) | Host integration, public interfaces, provider config, lifecycle |
 
 ## Tài liệu mẫu
 
@@ -49,7 +48,7 @@ Bộ tài liệu là **thiết kế dự kiến**, không khẳng định source
 - [Skill Rust Review mẫu](examples/skills/rust-review/SKILL.md)
 - [Skill Task Planning mẫu](examples/skills/task-planning/SKILL.md)
 
-**Dùng các file mẫu:** copy `docs/examples/agents.yaml` thành `config/agents.yaml`, copy `docs/examples/prompts/*` vào `prompts/`, và `docs/examples/skills/*` vào `skills/` khi khởi tạo project. Các model IDs chỉ minh hoạ, cần kiểm tra provider thực tế.
+**Dùng các file mẫu:** `examples/agents.yaml` là host-side DTO minh họa, không deserialize trực tiếp vào core AgentDefinition. Host map agent key thành ID và `prompt/provider/model/tools/skills` thành typed fields; mandatory base prompt được embed trong library. Khi dùng mẫu, copy `docs/examples/agents.yaml` thành `config/agents.yaml`, copy `docs/examples/prompts/*` vào `prompts/`, và `docs/examples/skills/*` vào `skills/` khi khởi tạo project. Các model IDs chỉ minh hoạ, cần kiểm tra provider thực tế.
 
 ## Nguyên tắc điều hướng
 
@@ -76,7 +75,7 @@ Bộ tài liệu là **thiết kế dự kiến**, không khẳng định source
 - Context compaction: https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/compaction.ts
 - Restart recovery: https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/execution/restart.ts
 
-Thiết kế v4.1 là mục tiêu triển khai trong Rust; chưa khẳng định source code Rust đã hiện thực các tính năng trên.
+Thiết kế v5.0 là mục tiêu triển khai trong Rust; chưa khẳng định source code Rust đã hiện thực các tính năng trên.
 
 ## Streaming references
 
@@ -84,4 +83,4 @@ Thiết kế v4.1 là mục tiêu triển khai trong Rust; chưa khẳng định
 - OpenCode V2 event stream design: https://github.com/anomalyco/opencode/blob/dev/specs/v2/event-stream-architecture.md
 - OpenCode subagent tracker: https://github.com/anomalyco/opencode/blob/dev/packages/tui/src/mini/stream-v2.subagent.ts
 
-Bản v4.1 thay đổi ToolCallReady ordering, committed invalidation, ToolContext::progress và sự kiện Subagent/Skill qua generic tool events. Chỉ tài liệu được commit, chưa triển khai Rust code.
+Baseline v5.0 giữ quy tắc v4.1 về ToolCallReady ordering, committed invalidation, ToolContext::progress và sự kiện Subagent/Skill qua generic tool events. Chỉ tài liệu được commit, chưa triển khai Rust code.

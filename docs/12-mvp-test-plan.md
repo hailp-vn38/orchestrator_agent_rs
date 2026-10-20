@@ -1,17 +1,19 @@
 # 12 — MVP Roadmap & Acceptance Tests
 
-## 12.1. Milestones (tracer bullets)
+## 12.1. Milestones (canonical tracer bullets)
 
 | Milestone | Scope | Điều kiện hoàn thành |
 |---|---|---|
-| M0 — Bootstrap | Cargo, Axum, tracing, SQLx migration, config | Start app, migrate DB, health check. |
-| M1 — Single Agent | Agent registry, llm gateway, prompt, simple chat | 1 agent nhiều lượt, restart đọc lại history. |
-| M2 — Tools | Tool registry, read file, tool loop, permission | LLM gọi tool, đúng call ID, tool denied rõ ràng. |
-| M3 — Skill | Discover SKILL.md, catalog, `skill(id)` | Skill chỉ nạp khi gọi và tồn tại trong session history. |
-| M4 — Parent–Child | TaskManager, subagent foreground + resume; link `child_session_id` với invocation | Root gọi child provider khác, nhận final text và follow-up same session. |
-| M5 — Long-running | Managed continuous execution, no default steps cap, summary compaction | >100 steps và client disconnect không dừng run; context giảm bằng checkpoint. |
-| M6 — Recovery & Safety | Bounded restart resume, tool reconciliation, cancellation, tracing | Safe execution tự resume; uncertain mutation không replay; unique index bảo vệ concurrent runs. |
-| M7 — Live Events & SSE | LlmGateway.stream, ToolContext.progress, Root/Child event family, snapshot/reconnect | Thấy child/tools live, SSE disconnect không dừng run; reconnect phục hồi canonical state. |
+| M0 — Library shell | Cargo `[lib]`, public Orchestrator/HostTool, typed config, embedded base | Rust host builds/instantiates crate without Axum. |
+| M1 — Single Agent | SQLite durable admission, supervisor, host-injected LlmGateway, result/history | Accepted turn không bị mất scheduling trong live process. |
+| M2 — Tools & Skills | HostTool scoped context, permissions, tool loop, skill catalog/load | No transcript double writer, denied skill/tool không execute/leak. |
+| M3 — Parent–Child | Foreground delegation/resume, idempotent atomic child turn claim | Crash không duplicate child objective; same child session supports follow-up. |
+| M4 — Continuous | No default step cap, active-turn compaction, provider full response streaming | >100 steps; no premature stop/tool execution. |
+| M5 — Recovery & Lifecycle | Exclusive owner guard, unknown mutation reconciliation, cancel/shutdown | No blind mutation replay, no unsafe owner handoff. |
+| M6 — Observation | Transport-neutral `subscribe/snapshot`; optional Axum SSE adapter | Lag/reconnect/missed terminal notification converges to canonical state. |
+| M7 — Artifacts | Immutable local store, scoped reads, manifest CAS, bounded `AgentResult` preview | Playlist/document/media refs + fault tests/backup consistency. |
+
+**Đây là roadmap/test catalog canonical cho v5.0**. Tài liệu 17/18 tham chiếu milestone và AT IDs ở đây, không bảo trì kế hoạch song song.
 
 ## 12.2. Test pyramid
 
@@ -19,7 +21,7 @@
 - **Integration:** SQLx real SQLite temp DB, session parent ID, message sequencing, restart recovery, race conditions.
 - **Fake LLM:** deterministic scripted tool calls/text/error, test loop and Root continuation without live provider.
 - **Provider smoke:** ít nhất hai providers cho text delta, tool call/result assembly, usage, timeout và error mid-stream; test streaming **bắt buộc cho MVP** với fallback nếu tool stream capability thiếu.
-- **E2E:** Axum API + SQLite + skill + subagent multi-turn.
+- **E2E:** Tokio Rust host embeds library + SQLite + skill + subagent multi-turn; Axum optional smoke adapter.
 
 ## 12.3. Acceptance tests chi tiết
 
@@ -62,6 +64,19 @@
 | AT-35 | Provider stream ToolCallReady rồi lỗi trước Finished | Không execute tool và không persist unconfirmed invocation. |
 | AT-36 | Assistant response gồm hai tools | Persist đủ calls rồi dispatch tuần tự; next LLM step chỉ sau cả hai results. |
 | AT-37 | SQLite commits rev 15 rồi 16 nhưng SSE publish 16 trước 15 | Snapshot refresh >=16, không mất canonical state hay bị rollback UI. |
+| AT-38 | Parent crash sau child admission hoặc child completed trước parent tool result, kể cả prompt follow-up trùng | Mỗi parent invocation chỉ admit đúng một child turn, wait đúng final. |
+| AT-39 | Hai session cùng agent với effective skill permissions khác nhau | Denied skill không xuất hiện trong catalog hoặc load được. |
+| AT-40 | HostTool B đọc artifact output của A; ID ngoài scope hoặc bytes corrupt | Scoped bounded stream; deny invalid scope; integrity errors. |
+| AT-41 | Shutdown grace hết, non-cooperative local tool còn write-capable | Không báo stopped/success, owner guard không nhả; engine khác chưa acquire. |
+| AT-42 | New recovery attempt đang chạy, prior attempt có assistant final | AgentResult.output=None; terminal attempt mới trỏ đúng final_message_id. |
+| AT-43 | Provider tái dùng tool_call_id ở hai assistant responses | Hai internal invocations riêng, ghép đúng call/results từng message. |
+| AT-44 | Một active turn vượt context threshold nhiều lần | Compact settled exchanges prefix, giữ objective và tool pairs, không cần prior complete turns. |
+| AT-45 | Suppress terminal publish sau DB commit nhưng SSE còn connected | Periodic snapshot reconciliation hội tụ terminal canonical state. |
+| AT-46 | YAML DTO example + embedded mandatory base | Host converts đúng AgentDefinition fields, mọi model request có base. |
+| AT-47 | Crash quanh manifest publish/CAS | Chỉ last committed pointer authoritative; verified refs, safe replay policy. |
+| AT-48 | Pinned crate llm + 2 provider smoke | Compile, text/tool streaming & Finished semantics, model capabilities, redacted secrets. |
+| AT-49 | Operator resolve unknown mutation outcome | Authorized audited terminal transaction trước resume; no blind replay. |
+| AT-50 | Hai library instances dùng cùng execution store | Second build fails while owner held, only succeeds after safe release. |
 
 ## 12.4. Definition of Done
 
@@ -72,6 +87,7 @@
 - E2E một session nhiều model steps, auto compaction và safe restart, không step cap mặc định.
 - Bổ sung ít nhất một provider thứ hai để chứng minh model routing.
 - Failure trả error có code; tracing spans có session/run/tool-call IDs và child linkage khi relevant.
+- Scoped ArtifactStore reads, manifest checkpoint durability, owner handoff và consistent DB/files backup đều là acceptance scope.
 - SSE + session family snapshots là acceptance scope của MVP, không deferred. Replay toàn bộ delta events/WebSocket chỉ sau MVP. Xem [16](16-streaming-events.md).
 
 ## 12.5. Tính năng để sau

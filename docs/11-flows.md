@@ -6,7 +6,7 @@
 sequenceDiagram
     autonumber
     participant User
-    participant API as Axum
+    participant API as Host transport
     participant RT as AgentRuntime
     participant Store as SessionStore
     participant PB as PromptBuilder
@@ -39,8 +39,9 @@ sequenceDiagram
     R->>S: persist subagent tool call + invocation
     R->>T: execute subagent(reviewer, prompt)
     T->>TM: delegate(request, borrowed runtime)
-    TM->>S: create child + link invocation.child_session_id
-    TM->>C: submit(child_session, prompt) + wait(turn_id)
+    TM->>S: atomic admit_child_turn(parent_invocation_id, child, prompt)
+    S-->>TM: durable child_session_id + child_turn_id
+    TM->>C: schedule/wait(child_turn_id)
     C->>S: persist child messages + run
     C-->>TM: final text
     TM-->>T: {session_id, completed, output}
@@ -49,8 +50,8 @@ sequenceDiagram
     R->>R: assess text
     R->>T: subagent(reviewer, session_id, followup)
     T->>TM: delegate/resume
-    TM->>S: verify ownership + link new invocation to same child
-    TM->>C: submit(child_session, followup) + wait(turn_id)
+    TM->>S: atomic admit new child_turn_id (same child session)
+    TM->>C: schedule/wait(new child_turn_id)
     C-->>TM: final text
     TM-->>T: SubagentOutput
     T-->>R: ToolOutcome
@@ -144,7 +145,7 @@ Xem [15](15-long-running-sessions.md) cho admission/stop/recovery.
 
 ## 11.8. Sau MVP
 
-Background Subagent notification + durable parent inbox, parallel child jobs, provider-native compaction và artifact store. Summary compaction và restart recovery thuộc lõi MVP.
+Background Subagent notification + durable parent inbox, parallel child jobs và provider-native compaction. Local ArtifactStore đã thuộc MVP. Summary compaction và restart recovery thuộc lõi MVP.
 
 ## 11.9. SSE streaming & snapshot/resync (MVP)
 
@@ -169,7 +170,7 @@ sequenceDiagram
     R->>D: persist result + bump revision
     R->>B: tool.completed (committed revision)
     B-->>U: tool.completed
-    Note over U,E: Connection lost or lagged -> re-subscribe + snapshot
+    Note over U,E: Lag/reconnect -> re-subscribe + snapshot; active runs -> periodic refresh even if connected
 ```
 
 Child Tool/LLM events sử dụng session riêng nhưng cùng root family. Các committed event revisions **invalidation → debounce snapshot refresh**, không merge state patches. SQLite không lưu token fragments; SSE disconnect không điều khiển run. Xem [16](16-streaming-events.md).

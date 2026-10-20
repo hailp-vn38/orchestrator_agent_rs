@@ -1,12 +1,12 @@
 # 18 — Embeddable Rust Library & Host Integration
 
-**Status:** Proposed design — cập nhật sau Codebase Design + Ponytail Review; **chưa phải code đã implement**.  
+**Status:** Accepted (v5.0) design — cập nhật sau Codebase Design + Ponytail Review; **chưa phải code đã implement**.  
 **Ngày:** 2026-10-20.  
 **Mục tiêu:** Xây dựng `orchestrator_agent_rs` thành Rust library có thể nhúng trực tiếp vào một Rust server hiện có.  
 **Phạm vi:** External seam, LLM provider configuration/injection, lifecycle, host tool integration, persistence, observation, recovery, packaging, testing.  
 **Liên quan:** [00 — Decisions](00-decisions.md), [01 — Architecture](01-architecture.md), [02 — Agents](02-agents.md), [05 — Tools](05-tools.md), [06 — Delegation](06-delegation.md), [07 — Sessions](07-sessions-context.md), [08 — Runtime/LLM](08-runtime-llm.md), [09 — Persistence](09-persistence.md), [10 — Security](10-security-operations.md), [12 — MVP/Test](12-mvp-test-plan.md), [15 — Long-running](15-long-running-sessions.md), [16 — Streaming](16-streaming-events.md), [17 — Agent Results & Artifacts](17-agent-results-artifacts.md).
 
-> **Tính chất tài liệu:** Đây là đề xuất mở rộng/điều chỉnh kiến trúc hiện có, không khẳng định những interface bên dưới đã được compile hay đưa vào repository. Những điểm mâu thuẫn với tài liệu v4.1 được chỉ rõ tại mục 18.15; chưa âm thầm ghi đè các quyết định cũ.
+> **Tính chất tài liệu:** Đây là thiết kế đã Accepted trong baseline v5.0, **không** khẳng định Rust interface bên dưới đã compile hay triển khai. Những thay đổi so với baseline v4.1 được đồng bộ tại mục 18.15 và ADR-015–017.
 
 ## 18.1. Problem statement và design goals
 
@@ -24,7 +24,7 @@ Repository hiện định hình **Shared AgentRuntime + parent–child sessions*
 
 **Non-goals trong MVP:** core bắt buộc Axum/HTTP; dynamic plugins, remote/distributed workers; lossless event replay; generalized storage/provider traits; workflow scheduler/semantic validation bắt buộc. Giữ các giới hạn đã ghi ở [00](00-decisions.md), [15](15-long-running-sessions.md) và [17](17-agent-results-artifacts.md), không liệt kê lại một bộ runtime policy thứ hai.
 
-## 18.2. Quyết định kiến trúc (proposed)
+## 18.2. Quyết định kiến trúc (Accepted design)
 
 | ID | Quyết định | Lý do |
 |---|---|---|
@@ -98,7 +98,7 @@ flowchart TB
 
 **Dependency direction:** Host phụ thuộc vào public types của crate. Nội bộ Orchestrator không phụ thuộc vào host application crate. Đăng ký `HostTool` đảo chiều dependency qua interface; engine không import mã nghiệp vụ của host. Không có vòng `Arc<AgentRuntime>` trong `TaskManager`: như [06](06-delegation.md), truyền runtime borrowed tại nhánh subagent.
 
-## 18.4. Public interface đề xuất
+## 18.4. Public interface (thiết kế đã chốt)
 
 ### 18.4.1. Scope và identities
 
@@ -114,10 +114,6 @@ Không thay đổi nghĩa của các IDs đang có: `session_id`, `turn_id`, `ru
 pub struct CallerContext {
     pub owner_id: String,
     pub workspace_id: String,
-}
-
-pub struct AgentInput {
-    pub text: String,
 }
 
 pub struct AcceptedTurn {
@@ -138,7 +134,7 @@ impl Orchestrator {
         &self,
         caller: &CallerContext,
         session_id: &str,
-        input: AgentInput,
+        text: String,
     ) -> Result<AcceptedTurn, OrchestratorError>;
 
     pub async fn result(
@@ -191,7 +187,7 @@ impl Orchestrator {
         &self,
         operator: &OperatorContext,
         session_id: &str,
-        tool_call_id: &str,
+        invocation_id: &str, // internal tool_invocations.id, not provider tool_call_id
         decision: VerifiedToolResolution,
     ) -> Result<(), OrchestratorError>;
 
@@ -203,8 +199,8 @@ impl Orchestrator {
 - `submit` trả `AcceptedTurn` **sau khi** input và run admission claim commit thành công; không đợi final text; one active run/session qua SQLite unique partial index.
 - `result` truy xuất latest `resume_attempt` cho `(session_id, turn_id)`; đang chạy thì `output=None`. Trả bounded artifact preview (không bao giờ inline toàn bộ); `completed` chỉ là execution status, **không** khẳng định business completeness.
 - `history` đọc canonical message views của **một** authorized session theo cursor/limit; không bao gồm secrets, hidden reasoning hay quyền vượt ra khỏi child session. `list_artifacts` phân trang theo turn, kiểm tra ancestry/workspace trên mọi trang; cursor là opaque, gắn với query scope và deterministic ordering, không phải authorization token.
-- `open_artifact` (khả dụng khi ArtifactStore ở E6) trả `ArtifactDownload { metadata, reader }` có reader async/stream được giới hạn và authorization tại thời điểm mở; không expose storage key/path hay load cả binary vào RAM. Host tự map download sang HTTP/gRPC với content disposition an toàn.
-- `resolve_interrupted_invocation` là **operator-only** command được kiểm soát và audit cho tool outcome bị `RECOVERY_BLOCKED`: chỉ chấp nhận bằng chứng đã xác minh, không tự tạo generic `HostTool.reconcile()` (18.6.3).
+- `open_artifact` (khả dụng khi ArtifactStore ở M7) trả `ArtifactDownload { metadata, reader }` có reader async/stream được giới hạn và authorization tại thời điểm mở; không expose storage key/path hay load cả binary vào RAM. Host tự map download sang HTTP/gRPC với content disposition an toàn.
+- `resolve_interrupted_invocation` nhận **internal `invocation_id`** chứ không nhận provider `tool_call_id` (có thể trùng qua assistant messages); là **operator-only** command được kiểm soát và audit cho tool outcome bị `RECOVERY_BLOCKED`: chỉ chấp nhận bằng chứng đã xác minh, không tự tạo generic `HostTool.reconcile()` (18.6.3).
 - `snapshot` là canonical session-family view cho reconnect; đảm bảo ownership/ancestry và đọc transaction nhất quán theo [16](16-streaming-events.md).
 - `subscribe` là best-effort realtime, **không** là replay log; gọi `snapshot` sau đăng ký stream để tránh bỏ lỡ committed state. Chi tiết ở 18.8.
 - `cancel` là explicit cancellation; propagate parent→currently-active child theo semantics cũ; trả về được sau khi yêu cầu hủy được chấp nhận/persist, không cam kết external provider side effect đã đảo ngược.
@@ -225,7 +221,7 @@ pub enum VerifiedToolResolution {
 }
 ```
 
-`history` và `list_artifacts` dùng chung `PageRequest/Page<T>`; limit được cap bởi engine, cursor không thể tái sử dụng ở session/turn khác và mỗi trang đều xác thực scope. `MessageView` chỉ chứa canonical, authorized, redacted conversation data (không raw prompt/system secrets). `ConfirmedCompleted` chỉ được chấp nhận khi evidence được operator xác minh bằng hệ thống nguồn, tool call ID đúng và artifact refs đã committed/authorized. `ConfirmedNoEffect` kết thúc invocation bằng **technical failure**, không báo giả thành công và không tự replay mutation. Transaction ghi quyết định + transcript result tương ứng trước khi supervisor tiếp tục turn tại safe point. Không có reconciliation tự động tổng quát trong MVP.
+`history` và `list_artifacts` dùng chung `PageRequest/Page<T>`; limit được cap bởi engine, cursor không thể tái sử dụng ở session/turn khác và mỗi trang đều xác thực scope. `MessageView` chỉ chứa canonical, authorized, redacted conversation data (không raw prompt/system secrets). `ConfirmedCompleted` chỉ được chấp nhận khi evidence được operator xác minh bằng hệ thống nguồn, internal invocation ID đúng (provider call ID chỉ dùng pairing trong response) và artifact refs đã committed/authorized. `ConfirmedNoEffect` kết thúc invocation bằng **technical failure**, không báo giả thành công và không tự replay mutation. Transaction ghi quyết định + transcript result tương ứng trước khi supervisor tiếp tục turn tại safe point. Không có reconciliation tự động tổng quát trong MVP.
 
 **Phương thức để cân nhắc, chưa bắt buộc external interface MVP:**
 
@@ -374,7 +370,7 @@ let orchestrator = Orchestrator::builder(config)
 
 Crate [`llm`](https://docs.rs/llm/latest/llm/) mô tả unified interfaces cho nhiều backend, streaming và tool calls; có module [`builder`](https://docs.rs/llm/latest/llm/builder/index.html). Đây là căn cứ lựa chọn **internal adapter**, không cam kết mọi model/provider hỗ trợ cùng capabilities. Trước implementation phải **pin chính xác crate version** trong `Cargo.lock`, compile spike với ít nhất hai providers và xác minh multi-turn tool calls, streaming, errors, request timeout, response-finished ordering và model-specific limits. Không copy thẳng `llm` public types ra external interface của Orchestrator.
 
-Provider config contract tests nằm tại **18.12 (EMB-AT-15–19, 23–24)**. Fake `LlmGateway` chỉ dùng trong internal tests; không thêm public generic provider trait.
+Provider config contract tests: [12](12-mvp-test-plan.md) (AT-46/48 và related security/recovery cases). Fake `LlmGateway` chỉ dùng trong internal tests; không thêm public generic provider trait.
 
 **Deferred:** host inject một provider client đã dựng sẵn; dynamic provider registry, hot reload/rotation không restart; automatic cross-provider fallback; per-user arbitrary model selection; remote provider control plane. Chỉ thêm external provider seam khi thực sự tồn tại hai host-owned adapters và contract tests biện minh được complexity.
 
@@ -415,7 +411,7 @@ pub struct ToolDescriptor {
 
 ### 18.6.2. ToolContext là scoped capability, không phải SessionStore
 
-`ToolContext` do trusted runtime khởi tạo; không nhận nguyên args/claims từ LLM làm scope. Có thể expose các **concrete scoped handles**, không mở direct SQL/storage paths:
+`ToolContext` là **canonical public context** (docs/05 và 16 chỉ tham chiếu) do trusted runtime mint; không tin input/claims của LLM. `scope()` phân biệt internal `tool_invocations.id` với provider call ID và mang cancellation/effective permission snapshot. Có thể expose các **concrete scoped handles**, không mở direct SQL/storage paths:
 
 | ToolContext operation | Semantics |
 |---|---|
@@ -423,8 +419,9 @@ pub struct ToolDescriptor {
 | `context.is_cancelled()` / token | Cooperative cancel; external mutation đã thực hiện có thể cần reconcile. |
 | `context.scope()` | Read-only authenticated owner/workspace/session/run/tool-call identity và effective permissions. |
 | `context.artifacts().put(...)` | Immutable commit qua ArtifactStore, trả verified `ArtifactRef`; không viết file trực tiếp ngoài private storage root. |
+| `context.artifacts().open(id)` | Bounded async reader của committed artifact input, enforce effective permissions + owner/workspace + explicit invocation input/ancestry scope, từ chối corrupt/out-of-scope refs; không lộ paths. |
 | `context.checkpoint().current()` | Đọc verified last committed manifest pointer của **đúng invocation**; trả `None` nếu chưa có. Không suy đoán file mới nhất. |
-| `context.checkpoint().commit(manifest_id, expected_previous_id)` | Commit immutable manifest đã verified bằng CAS trên `tool_invocations.checkpoint_artifact_id` của **đúng invocation**, trả conflict nếu pointer đã đổi. |
+| `context.checkpoint().commit(manifest_id, expected_previous_id)` | Commit immutable manifest đã verified bằng CAS trên `tool_invocations.checkpoint_artifact_id` của **đúng internal invocation ID**, trả conflict nếu pointer đã đổi. |
 
 Đây là **concrete scoped capabilities**, không sinh thêm `CheckpointStore` trait hay public `SessionStore`. `current()` chỉ đọc pointer đã commit cho invocation hiện tại; khi follow-up sử dụng **invocation mới**, tool phải được truyền manifest ID cũ bằng trusted continuation và commit làm initial pointer theo [17](17-agent-results-artifacts.md); không tự kế thừa pointer chỉ vì cùng child session. HostTool không sửa history; Runtime là workflow writer.
 
@@ -462,11 +459,11 @@ pub struct AgentResult {
 }
 ```
 
-`AgentResult` không phải record/table mới. `SessionStore` resolve latest attempt theo `resume_attempt`, status và confirmed final text; `ArtifactStore` cung cấp authorized committed refs. Nếu attempt mới còn chạy, không dùng final text của attempt cũ. `artifact_preview` bị cap (gợi ý 20 refs), `artifacts_next_cursor` dùng tiếp qua `list_artifacts(caller, session_id, turn_id, page)`; các trang có stable ordering `(created_at, id)`, opaque cursor scoped theo turn/owner. Không materialize hàng nghìn refs vào `result()`. `completed` không đồng nghĩa nghiệp vụ đã thành công.
+`AgentResult` không phải record/table mới. `SessionStore` resolve latest attempt theo `resume_attempt`, status và `agent_runs.final_message_id` belonging to the same `messages.run_id` attempt; `ArtifactStore` cung cấp authorized committed refs. Nếu attempt mới còn chạy, không dùng final text của attempt cũ. `artifact_preview` bị cap (gợi ý 20 refs), `artifacts_next_cursor` dùng tiếp qua `list_artifacts(caller, session_id, turn_id, page)`; các trang có stable ordering `(created_at, id)`, opaque cursor scoped theo turn/owner. Không materialize hàng nghìn refs vào `result()`. `completed` không đồng nghĩa nghiệp vụ đã thành công.
 
 **Ownership:**
 
-- `SessionStore` sở hữu sessions/turns/runs/messages/tool invocations, revision và `tool_invocations.checkpoint_artifact_id` durable pointer.
+- `SessionStore` sở hữu sessions/turns/runs/messages/tool invocations, `child_turn_id`, `agent_runs.final_message_id`, revision và `tool_invocations.checkpoint_artifact_id` durable pointer.
 - `ArtifactStore` sở hữu immutable bytes, SQLite artifact metadata, staging → atomic publication, authorized reads và integrity verification.
 - `AgentRuntime` sở hữu execution ordering, transcript commits và recovery decisions; `Orchestrator` lắp `AgentResult` như một **read projection** từ hai stores, không tạo stateful `ResultManager`.
 - Tool implementations sở hữu domain manifest schema, provider receipts, idempotency/reconciliation semantics; external IDs không phải local artifact refs.
@@ -482,9 +479,9 @@ pub struct AgentResult {
 
 Backup/restore gồm SQLite **và** artifact files, ở một consistent recovery point. Không backup mỗi `.db` khi WAL đang hoạt động mà bỏ qua WAL; dùng supported SQLite backup flow. Đừng ghi artifact payload lớn vào `messages` hoặc `tool_invocations.result_json`.
 
-**Download/read:** `Orchestrator::open_artifact(caller, artifact_id)` là **MVP contract cùng E6**: trả `ArtifactDownload` gồm committed metadata (MIME/name/size/hash) và **bounded, backpressure-aware async reader**. Reader không expose private path, bytes không bị gom thành `Vec<u8>`; streaming transport do host thực hiện, safe content disposition và download limit enforced. Authorization thuộc library; integrity check được thực hiện khi mở và/hoặc trong quá trình đọc, báo lỗi nếu corrupt (không hứa kiểm chứng toàn bộ checksum trước khi stream bytes). Model-facing `artifact.read` có giới hạn nhỏ hơn host download. Không tạo thêm `ArtifactAccessProvider` trait/`artifacts()` facade.
+**Download/read:** `Orchestrator::open_artifact(caller, artifact_id)` là **MVP contract ở M7**: trả `ArtifactDownload` gồm committed metadata (MIME/name/size/hash) và **bounded, backpressure-aware async reader**. Reader không expose private path, bytes không bị gom thành `Vec<u8>`; streaming transport do host thực hiện, safe content disposition và download limit enforced. Authorization thuộc library; integrity check được thực hiện khi mở và/hoặc trong quá trình đọc, báo lỗi nếu corrupt (không hứa kiểm chứng toàn bộ checksum trước khi stream bytes). Model-facing `artifact.read` có giới hạn nhỏ hơn host download. Không tạo thêm `ArtifactAccessProvider` trait/`artifacts()` facade.
 
-**Checkpoint manifesto:** manifest được commit vào ArtifactStore trước, sau đó SessionStore commit verified pointer với compare-and-swap trên invocation hiện hữu. Sau crash luôn dùng **last committed pointer**, không dùng file mới nhất hoặc SSE event; artifact chưa được pointer tham chiếu không được giả làm completed work. Follow-up qua invocation mới phải explicit carry manifest ID vào invocation mới như [17](17-agent-results-artifacts.md).
+**Checkpoint manifest:** manifest được commit vào ArtifactStore trước, sau đó SessionStore commit verified pointer với compare-and-swap trên invocation hiện hữu. Sau crash luôn dùng **last committed pointer**, không dùng file mới nhất hoặc SSE event; artifact chưa được pointer tham chiếu không được giả làm completed work. Follow-up qua invocation mới phải explicit carry manifest ID vào invocation mới như [17](17-agent-results-artifacts.md).
 
 ## 18.8. Streaming và host transport adapters
 
@@ -519,7 +516,7 @@ sequenceDiagram
 
 **Invariants:**
 
-- Subscribe **trước**, snapshot **sau** để hội tụ kể cả child được tạo trong lúc reconnect. Subscriber chậm phải xử lý `Lagged`/`resync.required`; committed notifications chỉ invalidate snapshot, **không** phải patches.
+- Subscribe **trước**, snapshot **sau** để hội tụ kể cả child được tạo trong lúc reconnect. Host adapter/client định kỳ refresh canonical snapshot (ví dụ 30s) khi có active run kể cả stream vẫn connected, phòng DB terminal commit xảy ra nhưng publication bị mất. Subscriber chậm phải xử lý `Lagged`/`resync.required`; committed notifications chỉ invalidate snapshot, **không** phải patches.
 - `text.delta` và `tool.progress` ephemeral, có thể mất; final committed message và run state đọc lại qua snapshot/result. **Không** hứa `Last-Event-ID`, historical replay hoặc persist từng token.
 - Host adapter chịu authentication, heartbeat, SSE/WebSocket/CLI serialization, connection lifetime và rate limits; connection close không cancel run.
 - Core phải enforce owner/workspace/child ancestry; một `root_session_id` do client đoán không cho phép đọc family người khác. Đối với subscription lâu, host chịu chính sách hết hạn/re-auth, core không mặc nhiên coi connection là authority mới.
@@ -555,7 +552,7 @@ stateDiagram-v2
 1. Supervisor chuyển sang `Draining`; từ chối `submit` mới với `SHUTTING_DOWN` (không nhận rồi làm mất request).
 2. Đang chạy được graceful drain trong **configured host shutdown grace**; không đặt mặc định deadline bình thường cho child chỉ vì server shutdown.
 3. Hết grace: yêu cầu cooperative cancel, dừng khởi động bước/tool mới; nếu side effect đang mơ hồ, ghi `interrupted`/reconciliation-required hoặc giữ durable invocation pending theo recovery protocol — **không** giả kết quả `completed/cancelled`.
-4. Hoàn tất/sync durable state khi có thể, close resources, giải phóng single-owner lock cuối cùng.
+4. Chỉ sau khi **mọi owned local write-capable task đã quiesce/join**, sync durable state, close resources rồi mới giải phóng owner lock. Tool không cooperative sau grace: shutdown trả incomplete/error, **không** báo Stopped hoặc release lock khi local task còn có thể ghi. Force-kill được xử lý như crash; external operation đã gửi vẫn phải reconcile riêng.
 5. `Drop` không thể `await`; nếu host drop handle/force-kill mà không gọi `shutdown`, xử lý như crash khi restart. Không tuyên bố Drop đồng nghĩa graceful shutdown.
 
 Host phải giữ `Orchestrator` sống trong application state và gọi `shutdown` khi process nhận stop signal. `wait` (nếu expose) chỉ là waiter; host request cancellation không có nghĩa cancel execution.
@@ -639,72 +636,16 @@ Host wiring mẫu duy nhất ở **18.5.3**. Host giữ `Arc<Orchestrator>` tron
 
 ## 18.12. Test strategy qua các seams
 
-### A. Public interface contract tests — primary test surface
+**Canonical roadmap và acceptance test catalog:** [12](12-mvp-test-plan.md), AT-01–50. Không bảo trì bảng EMB-AT song song.
 
-| ID | Scenario | Expected observable contract |
-|---|---|---|
-| EMB-AT-01 | Host tạo root session và submit | Input/run claim committed trước Accepted; result đọc được. |
-| EMB-AT-02 | Host ngắt HTTP waiter ngay sau submit | Managed run tiếp tục, final result truy vấn được. |
-| EMB-AT-03 | Hai submits concurrent cùng session | Một admit, một `SESSION_BUSY`; không duplicate turn. |
-| EMB-AT-04 | Root gọi child provider khác | Child chạy shared runtime, history tách biệt, final text vào Root. |
-| EMB-AT-05 | Root follow-up child session cũ | Không tạo child history khác; parent invocation mới link đúng child. |
-| EMB-AT-06 | Workspace A đọc B session/result/artifact/subscribe | Denied; không leak events/refs. |
-| EMB-AT-07 | HostTool registered; LLM đề xuất call hợp lệ | Dispatch đúng adapter sau persisted invocation; result committed một lần. |
-| EMB-AT-08 | Tool denied by agent policy | Adapter **không** được gọi; ToolError technical. |
-| EMB-AT-09 | Session đang chạy, chưa có final | AgentResult `running`, `output=None`, refs đã committed có thể xuất hiện. |
-| EMB-AT-10 | Latest resume attempt chạy sau interrupted attempt | Projection dùng newest attempt, không reuse stale final. |
-| EMB-AT-11 | Subscribe→snapshot, child mới tạo, client lag | Snapshot/resync hội tụ family canonical state. |
-| EMB-AT-12 | Request cancel root đang chạy child | Propagate cancel; persisted status và artifacts tuân thủ policy. |
-| EMB-AT-13 | Graceful shutdown | Stop admission; settled work giữ nguyên; ambiguous work không giả completed. |
-| EMB-AT-14 | Two Orchestrators attempt same store | Second build fails with `STORE_ALREADY_OWNED`. |
-| EMB-AT-15 | Host inject OpenAI/Anthropic config, Root/Child dùng aliases khác nhau | Model routing đúng theo `AgentDefinition`, không cần host tạo provider clients. |
-| EMB-AT-16 | Duplicate/missing provider alias, invalid auth/endpoint | Builder fail fast, không admit agent run với config lỗi. |
-| EMB-AT-17 | Agent/model không hỗ trợ required tools/streaming | Technical capability error, không cố execute partial tool call. |
-| EMB-AT-18 | Credentials từ host secret manager | Không xuất hiện trong `Debug`, SQLite, SSE, artifacts hoặc tool output. |
-| EMB-AT-19 | Provider config đổi sau restart khi còn recoverable turn | Giữ model identity + fingerprint; đổi backend/endpoint → `RECOVERY_BLOCKED`, không silent fallback. |
-| EMB-AT-20 | Một turn có 1000 artifact refs | `result` chỉ preview <= cap; `list_artifacts` paginate ổn định; cursor sai scope bị reject. |
-| EMB-AT-21 | Host `open_artifact` sau và trong run | Reader bounded/streaming; authorized metadata; cross-tenant denied; không leak filesystem path. |
-| EMB-AT-22 | Host đọc history của root hoặc child session | Cursor pagination đúng sequence, không leak parent/other workspace, không full history in memory. |
-| EMB-AT-23 | API key rotation giữa restarts nhưng backend/endpoint giữ nguyên | Provider fingerprint không đổi; safe recovery vẫn có thể tiếp tục. |
-| EMB-AT-24 | Alias giữ nguyên nhưng endpoint/backend/deployment đổi | Fingerprint khác → block; không dùng model mới cho recovered turn. |
-| EMB-AT-25 | Crash khi mutating HostTool đã submit nhưng chưa xác nhận | `RECOVERY_BLOCKED`, không auto gọi `execute`; operator không có evidence vẫn giữ blocked. |
-| EMB-AT-26 | Operator resolution có verified receipt hoặc confirmed no-effect | Chỉ privileged operator cùng scope resolve; commit terminal result/error + audit trước khi supervisor resume; no blind replay. |
-| EMB-AT-27 | Admit commit thành công nhưng supervisor miss spawn và process vẫn sống | Reconciliation schedules đúng một owned task; Accepted turn không stuck running vô hạn. |
-| EMB-AT-28 | Tool invocation mới trong same child session | `checkpoint().current()` là pointer của invocation hiện tại; cần explicit carry verified previous manifest và CAS. |
-| EMB-AT-29 | Provider capability chưa xác định tại build | Builder chỉ static validate; unsupported tool calling được báo rõ lúc provider smoke/request trước side effects. |
+- **Public interface contract:** AT-01–11, AT-38–43, AT-46, AT-49–50 qua `Orchestrator` và fake `HostTool`: permissions, durable child-turn mapping, result lineage, artifact read và owner lifecycle.
+- **Internal fault injection:** AT-12/23–24/35–37/41–45/47 cho crash windows, provider stream failure và missed notification; không đưa implementation private seams vào public interface chỉ để test.
+- **Provider gate:** AT-48 với pinned `llm` crate version và ít nhất hai providers, normalize tool calls/response Finished/usage/errors, credentials redacted.
+- **Host adapter smoke:** Optional Axum kiểm tra HTTP 202, SSE heartbeat/reconnect; runtime độc lập với transport.
 
-### B. Internal implementation / fault-injection tests
+## 18.13. Implementation milestones
 
-- Provider emits `ToolCallReady` rồi stream error trước `Finished`: **không** side effects, không persist unconfirmed tool invocation.
-- Model routing fake: stable `(provider_id,model_id,fingerprint)` per attempt, canonicalization không chứa credential, missing alias/credential/capability detection và sanitized errors; không tạo client tùy ý từ user input.
-- Fault windows: admission committed trước schedule (test cả **process vẫn sống**), tool start trước confirmation, artifact commit trước result commit, manifest publish trước pointer CAS, DB commit trước event publish.
-- Recovery từ last committed invocation checkpoint pointer, rejects corrupt refs; operator-only resolved invocation is atomic/audited; uncertain mutating tool **không** replay; safe reads có thể tiếp tục theo policy.
-- DB terminal commit failure **không** emit terminal success event; subscriber lag chỉ ảnh hưởng reader.
-- Multiple shutdown/restart attempts, process-owner lock acquire/release, stale active run recovery bounded.
-
-### C. Integration with real host and providers
-
-- Mock/Tokio host integration **không** chạy HTTP, chứng minh crate có thể embed độc lập.
-- Một optional Axum example smoke test cho 202 Accepted, SSE adapter, heartbeat và reconnect (test của adapter, không phải kiểm thử mọi trường hợp runtime).
-- Fake `HostTool` + fake LLM deterministic cho Root→Child→HostTool→Artifact→Result.
-- Provider smoke ít nhất hai provider từ host-injected `LlmConfig` cho text delta, multi-turn tool call/result, finish ordering, timeout và mid-stream errors; kiểm tra cache/reuse client và không rò rỉ credentials.
-- Long-running >100 steps + compaction + process restart + artifact manifest checkpoint + restored result.
-
-**Test discipline:** Test qua public interface những behavior host được hứa; test fault injection nội bộ chỉ cho các failure windows không quan sát được bằng contract tests. Không nhân đôi toàn bộ tests của internal wrappers.
-
-## 18.13. Incremental implementation plan
-
-| Increment | Nội dung | Exit criteria |
-|---|---|---|
-| E0 — Library shell | Cargo `[lib]`, export public types, `Orchestrator` builder, compile without Axum | Host Rust project import + instantiate library. |
-| E1 — Embedded single-agent | Host-injected `LlmConfig`, provider fingerprint, `create_session/submit/result/history`, SQLite admission + supervisor reconciliation | Host independent of HTTP; no lost Accepted turn in live process. |
-| E2 — HostTool extension | Registry, schema/permissions, trusted ToolContext, normalized outcomes | Host fake ASR tool chạy, no direct SessionStore writes. |
-| E3 — Existing agent features | SkillManager, TaskManager, Root/Child resume, real multi-provider routing through `llm`, compaction | Two provider smoke tests; preserve v4.1 contracts và Root decisions. |
-| E4 — Safe lifecycle | Exclusive DB owner, `RECOVERY_BLOCKED` + operator resolution, shutdown/cancel, budgets | Crash/restart tests không duplicate mutation và verified outcome được commit trước resume. |
-| E5 — Observation | `subscribe` + `snapshot`, per-family auth, lag/resync; Axum example adapter | Live Root/Child/Tool không phụ thuộc Axum core. |
-| E6 — Artifacts | ArtifactStore, bounded AgentResult preview, `list_artifacts/open_artifact`, manifest `current/commit` CAS | Authorized pagination/streaming + playlist/document/media cases theo [17]. |
-
-Các increments là tracer bullets; không tạo orchestration framework tổng quát trước khi có end-to-end test chứng minh. Bản 17 hiện xem ArtifactStore là phạm vi mở rộng mới; khi chốt baseline MVP phải cập nhật 00/05/09/12 đồng thời, tránh một tài liệu nói MVP còn tài liệu khác nói post-MVP.
+Không có E0–E6 roadmap độc lập; thực hiện M0–M7 tại [12](12-mvp-test-plan.md), ưu tiên từng vertical slice và acceptance tests ở same host-facing seam.
 
 ## 18.14. Alternatives considered / rejected
 
@@ -715,9 +656,9 @@ Các increments là tracer bullets; không tạo orchestration framework tổng 
 | Tách crate cho từng internal module, generalized provider/storage traits | Defer | Chưa có second adapter/use case đủ để biện minh. |
 | Multi-process shared SQLite workers | Defer | Cần leases/fencing; current single-owner lock chỉ hỗ trợ one process. |
 
-## 18.15. Changes required in existing documents
+## 18.15. Đồng bộ khi accept v5.0
 
-**Nếu đề xuất được accepted, cập nhật nhất quán** (không tự động ghi đè trong tài liệu này):
+Các tài liệu dưới đây được cập nhật cùng baseline v5.0 (đây vẫn chỉ là thiết kế, chưa là runtime verification):
 
 1. **`docs/00-decisions.md`**: thêm D-23+ library-first, host-owned transport/auth, process-owner guard, HostTool seam.
 2. **`docs/01-architecture.md`**: thay `Client/Axum → Runtime` bằng `Host → Orchestrator interface → AgentRuntime`; loại `main.rs` khỏi core topology và source tree; không sinh `OrchestratorEngine`.
@@ -725,10 +666,11 @@ Các increments là tracer bullets; không tạo orchestration framework tổng 
 4. **`docs/08-runtime-llm.md`**: host-injected typed config, static-vs-request capability checks, provider fingerprint/recovery, supervisor in-process reconciliation/shutdown; preserve internal `AgentRuntime` contract.
 5. **`docs/09-persistence.md`**: dedicated execution DB ownership, single-owner lock, `agent_runs.provider_config_fingerprint` migration, operator resolution/audit transaction; cập nhật ArtifactStore scope khi chốt 17.
 6. **`docs/10-security-operations.md`**: host authentication vs runtime authorization, secret acquisition vs runtime credential use, endpoint trust, subscription scope, optional auth expiry handling.
-7. **`docs/12-mvp-test-plan.md`**: embedding/E0–E6, provider fingerprint+secret rotation, pagination, operator resolution, missed scheduling acceptance tests; Axum optional adapter smoke.
+7. **`docs/12-mvp-test-plan.md`**: canonical M0–M7, provider fingerprint+secret rotation, pagination, operator resolution, missed scheduling acceptance tests; Axum optional adapter smoke.
 8. **`docs/16-streaming-events.md`**: core event stream transport-neutral, SSE adapter nằm ở host; không thay semantics snapshot/revision.
 9. **`docs/17-agent-results-artifacts.md`**: `AgentResult` bounded preview + artifact cursor, authorized `list_artifacts/open_artifact` streaming; checkpoint pointer ownership/CAS giữ nguyên.
-10. **`docs/README.md` và root `README.md`**: đổi mô tả mục tiêu thành embeddable Rust library; link tài liệu 18, chỉnh chỉ mục.
+10. **`docs/README.md` và root `README.md`**: mục tiêu library-first, link docs 17/18 và trạng thái Accepted.
+11. **`docs/13-adrs.md`**: thêm ADR-015–017, supersede phần entry point của ADR-009/014, giữ invariant cũ.
 
 ## 18.16. Open questions cần chốt lúc implementation spike
 
@@ -736,4 +678,8 @@ Các increments là tracer bullets; không tạo orchestration framework tổng 
 - Chốt giá trị cấu hình operational: page size/download quota, host shutdown grace, owner/workspace cost budget và chính sách lưu audit evidence phù hợp tính nhạy cảm của từng tool.
 - Xác minh provider fingerprint canonicalization và migration compatibility trên các backend thực tế; không lưu secrets.
 
-**Recommendation:** Chốt **EMB-01..17** làm kiến trúc mục tiêu; triển khai `Orchestrator` + `HostTool` bằng một Cargo library trước. Sau đó điều chỉnh những tài liệu khác trong **một commit đồng bộ**, thay vì phát triển song song hai hướng “Axum server” và “embeddable library”.
+**Decision:** EMB-01..17 accepted trong baseline thiết kế v5.0; chưa có Rust implementation/provider/SQLite fault-test evidence. [12](12-mvp-test-plan.md) là roadmap canonical.
+
+### Durable child-turn admission, final lineage and tool identity (v5.0)
+
+Internal `SessionStore.admit_child_turn(parent_invocation_id, child_session, input)` atomically persists child input/run claim plus `child_session_id/child_turn_id` mapping. Repeated call with **same parent invocation ID** returns existing child turn; another invocation, even with an identical prompt, admits a new turn in same child session. Parent waits for latest confirmed attempt of that child turn. `tool_invocations.id` is internal durable identity used also for operator reconciliation; tool-result `messages.tool_invocation_id` binds each persisted tool result to its exact invocation. Provider tool-call ID is scoped by assistant message and retained unmodified in model call/result pairing. `agent_runs.final_message_id` and `messages.run_id` provide unambiguous final-attempt lineage. All of this remains behind the small public `Orchestrator` interface.

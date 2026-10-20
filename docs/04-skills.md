@@ -50,16 +50,16 @@ pub struct LoadedSkill {
 pub struct SkillManager { /* immutable startup index */ }
 
 impl SkillManager {
-    pub fn available(&self, agent_id: &str) -> Vec<SkillSummary> {
+    pub fn available(&self, session: &ResolvedSessionScope) -> Vec<SkillSummary> {
         todo!() // filter permissions
     }
-    pub async fn load(&self, session_id: &str, id: &str) -> Result<LoadedSkill, SkillError> {
-        todo!() // session permissions + safe read
+    pub async fn load(&self, session: &ResolvedSessionScope, id: &str) -> Result<LoadedSkill, SkillError> {
+        todo!() // same effective session permission snapshot + safe read
     }
 }
 ```
 
-Không thêm trait `SkillRegistry` / `SkillLoader` riêng. `available()` và `load()` **đều** tính quyền thực tế; không coi catalog là cơ chế bảo mật. `session_id` được dùng để resolve permissions; chính `AgentRuntime` sở hữu việc persist tool result.
+Không thêm trait `SkillRegistry` / `SkillLoader` riêng. `available()` và `load()` **đều** tính quyền thực tế; không coi catalog là cơ chế bảo mật. `ResolvedSessionScope` là trusted internal session/agent/permission snapshot do runtime resolve, không lấy từ LLM args. Cả `available` và `load` dùng **cùng effective permissions**; `load` phải kiểm tra quyền tại invocation và PromptBuilder không leak denied metadata. AgentRuntime vẫn là transcript writer.
 
 ## 4.5. Skill Tool
 
@@ -83,7 +83,7 @@ Base directory: /project/skills/rust-review
 - Child không tự kế thừa skill contents của Root; load vào đúng session hiện tại.
 - SKILL.md không cấp thêm quyền tool, không ghi đè runtime policy. Bất kỳ resource read đều đi qua tool permission/path confinement.
 - Truy vết tool call ID, skill ID và path. Startup snapshot giúp cố định nội dung đã nạp trong một process lifetime; tham chiếu file ngoài `SKILL.md` vẫn được đọc bằng tool với quyền riêng.
-- Test: startup discovery/snapshot, duplicate ID, missing frontmatter, deny-by-agent, deny-on-load, successful `skill()` và child history isolation.
+- Test: startup discovery/snapshot, duplicate ID, missing frontmatter, deny-by-agent, two same-agent sessions with different permissions (catalog+load denied), deny-on-load, successful `skill()` và child history isolation.
 
 ### Sau MVP
 

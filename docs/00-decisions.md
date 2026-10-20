@@ -2,7 +2,7 @@
 
 ## 0.1. Mục tiêu
 
-Xây **Multi-Agent Orchestrator** hỗ trợ Root Agent chủ động phân việc cho Subagent, mỗi agent có cấu hình model, prompt, tool permissions, skill catalog và session riêng. Tất cả chạy trong một **Shared Runtime** Rust, lưu trạng thái bền vững với SQLite và hỗ trợ nhiều provider thông qua crate `llm`.
+Xây **Multi-Agent Orchestrator dạng Rust library có thể nhúng vào server host** hỗ trợ Root Agent chủ động phân việc cho Subagent, mỗi agent có cấu hình model, prompt, tool permissions, skill catalog và session riêng. Tất cả chạy trong một **Shared Runtime** Rust, lưu trạng thái bền vững với SQLite và hỗ trợ nhiều provider thông qua crate `llm`.
 
 ## 0.2. Các quyết định đã chốt
 
@@ -30,15 +30,26 @@ Xây **Multi-Agent Orchestrator** hỗ trợ Root Agent chủ động phân vi�
 | D-20 | Client subscribe SSE trước, đọc session-family snapshot; committed events chỉ invalidate snapshot, không merge state patches; `Lagged` → resync. |
 | D-21 | Tool chỉ dispatch khi toàn provider response `Finished` và đầy đủ các tool calls đã persist; MVP dispatch tuần tự, next model step chờ mọi tool results. |
 | D-22 | `subagent`/`skill` sử dụng generic tool events; `ToolContext::progress` không cần public ProgressReporter; snapshot refresh theo invalidation thay vì event reducer. |
+| D-23 | Library-first: host sở hữu Tokio, AuthN, transport; expose một public `Orchestrator`, không tạo `OrchestratorEngine` thứ hai. |
+| D-24 | Typed host-injected `LlmConfig` + non-secret provider routing fingerprint mỗi run attempt. |
+| D-25 | HostTool scoped artifacts put/open + checkpoint CAS; ArtifactStore local và bảng `artifacts` thuộc MVP, không GC/TTL/remote trait. |
+| D-26 | Parent invocation ID là idempotency key; atomic admission persist child input/run và `child_turn_id`. |
+| D-27 | `agent_runs.final_message_id` và `messages.run_id` xác định final đúng terminal attempt. |
+| D-28 | Internal invocation ID khác provider `tool_call_id`; provider ID scoped theo assistant message. |
+| D-29 | Process owner lock chỉ nhả khi local write-capable tasks đã quiesce/join; unknown external mutations cần reconciliation. |
+| D-30 | Skill catalog/load cùng effective session permissions; denied skill không xuất hiện trong prompt. |
+| D-31 | Compaction được phép lấy settled exchange prefix ngay trong active turn; không cắt call/result pair. |
+| D-32 | SSE best-effort, canonical snapshot; periodic revision reconcile khi vẫn connected và active run. |
 
 ## 0.3. MVP bao gồm
 
-- Axum nhận input bền vững, trả Accepted cùng session/turn ID; Tokio managed execution chạy độc lập với HTTP request.
+- Public `Orchestrator` admit input bền vững rồi trả `AcceptedTurn`; Tokio managed execution độc lập với host transport (Axum chỉ là optional adapter).
 - Registry, Prompt Builder, Tool Executor, Skill Loader, SQLite history và multi-provider LlmGateway.
 - LLM → Tools/Subagents → LLM **liên tục, không step cap mặc định**.
 - Foreground `subagent`, child history riêng, Root tự đánh giá final text và follow-up qua session ID.
 - Auto summary compaction, durable checkpoint, keeping original messages.
-- Startup safe recovery (bounded), cancellation, technical errors và tracing.
+- Startup safe recovery (bounded), cancellation, owner lock/shutdown an toàn, technical errors và tracing.
+- Local ArtifactStore immutable, scoped read/download, manifest CAS checkpoint, bounded AgentResult artifact preview.
 - **Streaming MVP:** LlmGateway normalized text/tool-call stream; SSE quan sát run/step/tool/progress và child sessions; authenticated session-family snapshot/resync.
 
 ## 0.4. Không thuộc MVP
@@ -59,12 +70,15 @@ Xây **Multi-Agent Orchestrator** hỗ trợ Root Agent chủ động phân vi�
 | `llm_request_timeout_s` | Ví dụ 120 | Timeout từng model request, không phải cả run. |
 | `tool_timeout_s` | Tool-specific | Timeout từng operation, không mặc định 120s cho shell dài. |
 | `compaction.auto` | true | Auto summary khi context gần đầy. |
-| `compaction.keep_recent_tokens` | Ví dụ 15.000 | Giữ complete recent turns cạnh summary. |
+| `compaction.keep_recent_tokens` | Ví dụ 15.000 | Giữ recent settled exchanges cạnh summary, kể cả active turn. |
 | `recovery.max_attempts_per_turn` | Ví dụ 10 | Chống crash-loop. |
 | `max_concurrent_children` | 1 ở MVP | Không phải giới hạn tổng số child gọi **tuần tự**. |
 | `max_tool_output_bytes/lines` | 50 KiB / 2.000 | Giới hạn model-visible result, không giới hạn full history. |
 | `events.broadcast_capacity` | Ví dụ 4.096 | Ring buffer realtime; lagged SSE client resync. |
 | `events.heartbeat_s` | Ví dụ 15 | Heartbeat riêng từng SSE connection, không ảnh hưởng runtime. |
+| `events.active_snapshot_refresh_s` | Ví dụ 30 | Host resync snapshot định kỳ khi family có active run, kể cả SSE còn kết nối. |
+| `shutdown.grace_s` | Deployment-defined | Không release owner guard nếu local write-capable task chưa quiesce. |
+| `artifacts.max_bytes/quotas` | Deployment-defined | Hard quota và disk headroom, không GC/TTL trong MVP. |
 
 Các số tham chiếu là cấu hình gợi ý cho **dự án Rust**, không phải hard defaults của OpenCode. Cost/quota cap nếu được cấu hình, permission và explicit cancellation vẫn bắt buộc.
 

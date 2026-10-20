@@ -52,9 +52,9 @@ Resource guards still matter: explicit cancel, permissions, quotas/cost limits, 
 
 ## 15.6. Context compaction
 
-Estimate token usage including instructions, tool schemas, history and output reserve. Near threshold, summarize older complete turns; append checkpoint message (`summary`, `keep_from_sequence`, `version`, `model_ref`) and build context from mandatory system + summary + recent *complete* turns. Preserve tool-call/result pairing and user objective, important decisions, evidence and artifact pointers. Keep **full original transcript** in SQLite.
+Estimate token usage including instructions, tool schemas, history and output reserve. Near threshold, summarize older **settled model/tool exchanges** (including prefix of the active turn); append checkpoint message (`summary`, `keep_from_sequence`, `version`, `model_ref`) and build context from mandatory system + summary + recent *settled* exchanges. Preserve tool-call/result pairing and user objective, important decisions, evidence and artifact pointers. Keep **full original transcript** in SQLite.
 
-If provider rejects context for length *before producing output*, auto compact and retry **once** for the logical step; if still too long, return `CONTEXT_LIMIT` recoverable. Summary is lossy. Skill can be loaded again via `skill(id)` after compaction. MVP summary via configured model; native provider compaction is future work.
+If provider rejects context for length *before producing output*, auto compact and retry **once** for the logical step; if still too long, return `CONTEXT_LIMIT` recoverable. A single first turn can compact repeatedly before terminal; no need for earlier completed user turns. Summary is lossy. Skill can be loaded again via `skill(id)` after compaction. MVP summary via configured model; native provider compaction is future work.
 
 ## 15.7. Safe startup recovery
 
@@ -73,7 +73,7 @@ flowchart TD
     H -->|No| L[Needs attention]
 ```
 
-`agent_runs.turn_id` survives restart; `resume_attempt` increments per recovery, default recommended cap 10. This is *at-least-once recovery*, **not exactly-once execution**. For an unknown outcome of write/shell/network mutation, do not retry and do not fabricate a tool result; operator/user must reconcile. Read-only/idempotent tools may be reconciled automatically only under proven safe policy. Startup sweep assumes prior server has stopped; multi-process execution requires leases/leader election.
+`agent_runs.turn_id` survives restart; `resume_attempt` increments per recovery, default recommended cap 10. This is *at-least-once recovery*, **not exactly-once execution**. For an unknown outcome of write/shell/network mutation, do not retry and do not fabricate a tool result; operator/user must reconcile. Read-only/idempotent tools may be reconciled automatically only under proven safe policy. Startup sweep requires exclusive owner guard; prior owner's local write-capable tasks must have quiesced/joined or process terminated; multi-process execution requires leases/leader election.
 
 ## 15.8. Stop semantics table
 

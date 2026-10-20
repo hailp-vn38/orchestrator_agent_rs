@@ -1,4 +1,8 @@
-# Rust project's example schema; NOT OpenCode's official config.
+# Host YAML DTO example, NOT core Rust AgentDefinition serde or OpenCode config.
+# Host converts agents.<key> to AgentDefinition.id, and
+# prompt/provider/model/tools/skills to prompt_path/provider_id/model_id/allowed_tools/allowed_skills.
+# Provider aliases must exist in typed host-injected LlmConfig.providers.
+# Mandatory base prompt is embedded in library, no prompts/base.md file needed.
 runtime:
   max_subagent_depth: 1
   max_concurrent_children: 1       # foreground MVP; no cap on sequential delegations
@@ -14,6 +18,7 @@ runtime:
   events:
     broadcast_capacity: 4096    # live only; lagged receiver must resync
     heartbeat_s: 15             # per SSE connection, outside broadcast
+    active_snapshot_refresh_s: 30  # host fallback when terminal notification lost
     # text coalescing and hard event payload cap are internal MVP constants,
     # with strict redaction; configure only after benchmarks require it.
   # No child_timeout_s and no default max_steps.
@@ -47,4 +52,5 @@ agents:
     tools: [skill, read_file, search_code]
     skills: [rust-review]
 
-# Model IDs are illustrative; verify availability/tool capability at startup.
+# Provider/model IDs are illustrative; host converts aliases to typed LlmConfig.
+# Builder validates local config; tool capability/reachability verified on request/smoke.

@@ -7,7 +7,9 @@
 | `session_id` | Hội thoại bền vững, có `parent_session_id`, có thể resume nhiều lần | `sessions` |
 | `run_id` | Một execution attempt gồm nhiều LLM/tool steps | `agent_runs` |
 | `turn_id` | User/delegation input identity, giữ nguyên khi restart recovery | `agent_runs.turn_id` |
-| `tool_call_id` | Pair tool call/result trong một session | `tool_invocations` + `messages` |
+| `tool_call_id` | Provider call/result ID, scoped theo assistant message | `tool_invocations` + `messages` |
+| `tool_invocations.id` | Internal invocation key/idempotency identity | `tool_invocations` |
+| `child_turn_id` | Logical child turn cho parent invocation | `tool_invocations.child_turn_id` |
 | `child_session_id` | Child được gắn với một `subagent` tool invocation | `tool_invocations.child_session_id` |
 
 Không có bảng `tasks` riêng ở MVP. `Session` không đồng nghĩa `Run`; child có thể có nhiều lượt run nối tiếp.
@@ -35,7 +37,7 @@ stateDiagram-v2
 
 ## 7.4. Message model
 
-- `messages` ghi user, assistant, tool result với `content_json`, `sequence`; assistant tool calls thuộc assistant content và có `tool_call_id` khớp tool result.
+- `messages` ghi user, assistant, tool result với `content_json`, `sequence`; assistant tool calls thuộc assistant content và có provider `tool_call_id` khớp tool result. Mọi tool-result message mới phải có `messages.tool_invocation_id` trỏ internal invocation của call tương ứng, không chỉ dựa vào provider ID.
 - `next_sequence` được reserve atomically; `UNIQUE(session_id, sequence)` bảo đảm thứ tự.
 - `AgentRuntime` là owner duy nhất ghi transcript; `ToolExecutor` và `TaskManager` không ghi messages thay runtime.
 - Trước khi gọi LLM, không để dangling tool call/result pair còn `requested/running/interrupted` mà chưa reconcile.
@@ -44,7 +46,7 @@ stateDiagram-v2
 
 `SessionStore.start_run()` thực hiện SQLite `INSERT INTO agent_runs(status='running')` trong transaction ngắn. **Unique partial index** `(session_id) WHERE status='running'` quyết định admission; khi xung đột trả `SESSION_BUSY` thay vì đợi khóa ngầm. Không cần `sessions.active_run_id` hoặc per-session Tokio mutex thứ hai ở MVP.
 
-Khi run hoàn thành, `finish_run()` persist final text + terminal status. **Safe restart recovery**: scan stale `agent_runs.running`; nếu không có ambiguous mutating tools, mark attempt cũ `interrupted`, thêm attempt mới cùng `turn_id` + `resume_attempt` tăng và continuation marker, rồi tiếp tục session. Nếu tool outcome unknown thì block để reconcile, không tự replay side effects. Startup recovery chỉ khi previous instance đã ngừng.
+Khi run hoàn thành, `finish_run()` atomically persist final assistant message, `agent_runs.final_message_id` và terminal status; result không query assistant text cuối cùng của toàn session. **Safe restart recovery**: scan stale `agent_runs.running`; nếu không có ambiguous mutating tools, mark attempt cũ `interrupted`, thêm attempt mới cùng `turn_id` + `resume_attempt` tăng và continuation marker, rồi tiếp tục session. Nếu tool outcome unknown thì block để reconcile, không tự replay side effects. Startup recovery chỉ khi previous instance đã ngừng.
 
 ## 7.6. Context construction
 
@@ -52,7 +54,7 @@ Chỉ **PromptBuilder.build(session_id)** tạo model context (base + agent + pr
 
 ## 7.7. Continuous execution, context checkpoint và HTTP lifecycle
 
-User turn có thể chạy nhiều giờ; `steps` không đặt mặc định. API persist input + active execution claim rồi có thể trả `202 Accepted`; managed Tokio runtime tiếp tục độc lập với HTTP disconnect. Tại context threshold, **automatic summary compaction** tạo message `role='compaction'` với `summary`, `keep_from_sequence`, `version`, rồi `PromptBuilder` dựng lại model context; original transcript vẫn ở SQLite. Không cắt giữa tool call và result, không tự bịa outcome missing. Có thể load lại skill sau compaction. Xem [15](15-long-running-sessions.md).
+User turn có thể chạy nhiều giờ; `steps` không đặt mặc định. API persist input + active execution claim rồi có thể trả `202 Accepted`; managed Tokio runtime tiếp tục độc lập với HTTP disconnect. Tại context threshold, **automatic summary compaction** trên settled exchanges prefix ngay trong active turn (không cắt tool pairs) tạo message `role='compaction'` với `summary`, `keep_from_sequence`, `version`, rồi `PromptBuilder` dựng lại model context; original transcript vẫn ở SQLite. Không cắt giữa tool call và result, không tự bịa outcome missing. Có thể load lại skill sau compaction. Xem [15](15-long-running-sessions.md).
 
 ## 7.8. Ownership
 
@@ -61,3 +63,9 @@ User turn có thể chạy nhiều giờ; `steps` không đặt mặc định. A
 ## 7.9. Session-family revision và reconnect
 
 `sessions.state_revision` tăng khi committed UI state đổi, độc lập với message sequence. `SessionStore.family_snapshot(root_id)` trả canonical Root/Child view trong một SQLite read transaction. **SSE committed events chỉ làm invalidation**, không phải state patches; reconnect cần snapshot refresh. Hợp đồng đầy đủ ở [16](16-streaming-events.md).
+
+## 7.10. Attempt và child-turn lineage
+
+`SessionStore.admit_child_turn(parent_invocation_id, child_session, input)` là atomic và idempotent: verify owner/workspace/ancestry, append child input, create child run claim, link parent `child_session_id/child_turn_id`, hoặc trả mapping đã commit. Parent chờ đúng child turn. Một invocation khác dù prompt giống nhau vẫn có turn riêng.
+
+`agent_runs.final_message_id` trỏ assistant final của **cùng run/session** với `messages.run_id`, chỉ gán trong terminal transaction. Provider tool-call IDs giữ nguyên khi phát lại model history nhưng chỉ unique trong assistant message; internal invocation ID dùng cho recovery. Xem [09](09-persistence.md).

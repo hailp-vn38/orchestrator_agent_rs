@@ -39,7 +39,7 @@ impl AgentRuntime {
 }
 ```
 
-`submit` persist input và run claim **trước khi trả Accepted**; managed Tokio execution tiếp tục ngoài vòng đời của HTTP request. `AgentRuntime` sở hữu transcript writes, ToolExecutor chỉ trả outcome. Root và child dùng cùng runtime: foreground `TaskManager` gọi `submit(child, prompt)` rồi `wait(child, turn_id)` để nhận final text mà không giữ HTTP request. Child recursion được box tại call seam nếu cần. `TaskManager` không sở hữu self-referential Arc.
+`submit` persist input và run claim **trước khi trả Accepted**; host chỉ gọi thông qua public `Orchestrator`, không gọi thẳng internal `AgentRuntime`;  managed Tokio execution tiếp tục ngoài vòng đời của HTTP request. `AgentRuntime` sở hữu transcript writes, ToolExecutor chỉ trả outcome. Root và child dùng cùng runtime: foreground `TaskManager` gọi `submit(child, prompt)` rồi `wait(child, turn_id)` để nhận final text mà không giữ HTTP request. Child recursion được box tại call seam nếu cần. `TaskManager` không sở hữu self-referential Arc.
 
 ## 8.3. LlmGateway — seam nhỏ
 
@@ -67,14 +67,16 @@ Adapter chuyển messages/tool calls/results sang crate `llm` và chuẩn hóa s
 
 ## 8.4. Multi-provider
 
+- Host inject typed `LlmConfig` khi build; `LlmGateway` tự tạo clients. Mỗi attempt persist non-secret provider routing fingerprint; restart đổi backend/endpoint bị block cho recoverable turn, thay credentials thuần túy không đổi fingerprint.
 - `(provider_id, model_id)` là định danh model, có thể khác nhau cho parent/child.
 - Key lấy từ secrets/env; không lưu vào DB/log/prompt.
 - Chỉ cho phép model có tool-calling capability nếu agent dùng tools; không tự động fallback provider.
-- Tool call/result ID phải được bảo toàn qua history và mapping riêng cho từng provider.
+- Provider tool-call ID phải bảo toàn qua model history, scoped theo một assistant response/message; `tool_invocations.id` là internal recovery key. `ToolOutcome.call_id` chứa provider ID để ghép result, không phải durable primary key.
 
 ## 8.5. Tokio và resource limits
 
-- MVP foreground: `TaskManager.delegate` await child run; **không spawn untracked tasks**. Runtime có thể box recursive future tại nhánh `subagent` để thỏa Rust async sizing.
+- Host Tokio runtime chạy managed supervisor. Shutdown stop admission → drain/cancel → quiesce/join local write-capable tasks → release owner guard. Nếu tool vẫn có quyền ghi sau grace, shutdown không trả success giả.
+- MVP foreground: `TaskManager.delegate` await đúng child turn; **không spawn untracked tasks**. Runtime có thể box recursive future tại nhánh `subagent` để thỏa Rust async sizing.
 - `CancellationToken` propagate explicit cancel parent → child; per-request LLM timeout và per-tool operation timeout. **Không có overall child/session timeout mặc định**. Không giữ SQL transaction xuyên provider latency.
 - `agent.steps: Option<u32>` mặc định None. Depth=1, tool output visibility cap, optional quota/cost policy; không giới hạn tổng child calls tuần tự mặc định. Global child semaphore thêm khi triển khai concurrent children.
 - Usage có thể ước lượng nếu provider không trả số liệu; ghi rõ measured/estimated.
@@ -92,7 +94,7 @@ Ví dụ Rust trong tài liệu là **illustrative interface**, chưa phải cod
 
 ## 8.7. Compaction, retry và recovery cho long-running execution
 
-- Auto compaction khi context gần đầy, ghi durable `messages.role='compaction'` (summary + frontier) rồi build model context lại; original transcript không bị xóa. Khi provider từ chối vì overflow trước output, compact/retry **tối đa một lần** ở logical step.
+- Auto compaction settled exchange prefix ngay trong active turn khi context gần đầy, ghi durable `messages.role='compaction'` (summary + frontier) rồi build model context lại; original transcript không bị xóa. Khi provider từ chối vì overflow trước output, compact/retry **tối đa một lần** ở logical step.
 - Optional `steps` cap (`None` theo mặc định) khiến model nhận final text-only guidance và `tool_choice=none`, báo việc còn lại; session vẫn `open`.
 - Restart scan stale active claim, mark old run `interrupted`, nếu safe tạo new run cùng `turn_id`, `resume_attempt+1` (giới hạn ví dụ 10) và synthetic continuation marker. Unknown mutating tool outcome **block**, không replay.
 - Session status/history theo dõi được ngay cả khi client HTTP disconnect. Background Subagent notification dành cho sau MVP.

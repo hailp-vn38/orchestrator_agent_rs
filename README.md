@@ -1,11 +1,7 @@
-# Orchestrator Agent RS — Design Documents (v4.1 — Streaming Review)
+# Orchestrator Agent RS — Design Documents (v5.0, Embeddable Library)
 
-Tài liệu thiết kế cho Rust + Tokio + crate `llm` + SQLx/SQLite; Shared Runtime + Parent–Child Sessions theo hướng OpenCode.
+Tài liệu thiết kế **Rust library nhúng vào server hiện có**: shared Root/Subagent AgentRuntime, Tokio của host, crate `llm`, SQLx/SQLite và immutable local ArtifactStore. Host sở hữu transport/AuthN và đăng ký domain tools qua `HostTool`; core không phụ thuộc Axum.
 
-**Bắt đầu tại [docs/README.md](docs/README.md)** để xem 17 mục thiết kế, migration SQLite và cấu hình mẫu.
+Bắt đầu ở [docs/README.md](docs/README.md), [architecture](docs/01-architecture.md), [ADRs](docs/13-adrs.md), [artifact workflows](docs/17-agent-results-artifacts.md), [public library contract](docs/18-embeddable-library.md). [Review report](docs/research/design-review-report.md) là historical snapshot trước khi chốt v5.0.
 
-Bản v4.1 giữ session-driven continuous execution của v3 và bổ sung SSE theo dõi Root/Child/Tools, live text/progress, SQLite state revision và snapshot/resync. Không có step cap mặc định, deadline toàn child hay auto-replay mutating tool outcome chưa rõ.
-
-Đây là tài liệu thiết kế, chưa phải source code triển khai. Xem [long-running sessions](docs/15-long-running-sessions.md) để hiểu flow chạy nhiều giờ.
-
-Bản v4.1 đã review và commit, bổ sung [docs/16-streaming-events.md](docs/16-streaming-events.md): SSE observation cho Root/Child, live text/tool progress, session-family snapshot/reconnect, và `sessions.state_revision`. Chỉ stream realtime; SQLite lưu committed state, không lưu mỗi token hay hứa lịch sử SSE replay. Đọc [ADR-014](docs/13-adrs.md#adr-014--streaming-ephemeral-events--durable-session-snapshots).
+v5.0 chốt ở mức **thiết kế**: idempotent parent-invocation → child-turn, final message lineage của run attempt, scoped artifact reads, safe owner shutdown handoff, active-turn compaction và periodic canonical snapshot reconciliation. Không có source code Rust hay provider/migration/fault-test evidence được xác nhận trong repo tại thời điểm cập nhật.

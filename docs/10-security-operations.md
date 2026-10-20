@@ -38,3 +38,7 @@ Depth=1 trong MVP. `agent.steps` tùy chọn, mặc định không có step cap.
 ## 10.7. Realtime event privacy
 
 Event payload cho UI độc lập với transcript/LLM payload: có redaction và giới hạn riêng, đặc biệt tool arguments, shell command outputs và provider metadata. Không stream hidden chain-of-thought, API credentials hay thông tin workspace ngoài quyền truy cập. Theo dõi family phải được xác thực với cùng owner/workspace cho mọi child, kể cả child phát sinh sau khi SSE bắt đầu. Xem [16](16-streaming-events.md).
+
+## 10.8. Host-facing permissions and artifact scope (v5.0)
+
+Host authenticate principal; public `Orchestrator` authorize every operation by owner/workspace, session ancestry and effective permissions. `SkillManager.available/load` use the same resolved session scope; denied skills must neither show in prompt catalog nor load. Trusted runtime mints `ToolContext`; `artifacts().open` accepts only authorized invocation inputs or explicitly permitted session/ancestry artifacts, **not** any same-workspace artifact. Streams enforce byte caps, path hiding and integrity errors. Operator reconciliation requires trusted operator scope plus durable audit; shutdown cannot hand off process-owner lock while any old local task can still write.

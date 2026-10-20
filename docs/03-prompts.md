@@ -8,7 +8,7 @@ Mỗi model request được xây từ một context có thể giải thích và
 
 | Nguồn | Mức độ | Nội dung |
 |---|---|---|
-| Runtime Base | Hệ thống | Agent là ai, nguyên tắc tool/delegation, an toàn. |
+| Runtime Base | Hệ thống | Mandatory base embed vào crate (`include_str!`) và validate tại build; host không phải cung cấp file `prompts/base.md`. |
 | Agent Prompt | Hệ thống | Root/explorer/reviewer role và phương thức làm việc. |
 | Project Instructions | Hướng dẫn workspace | `AGENTS.md`, conventions, repo-specific rules. |
 | Skill Catalog | Catalog | `id`, `name`, `description` các skill được phép. |
@@ -69,7 +69,7 @@ impl PromptBuilder {
 
 ## 3.7. Automatic context compaction
 
-`PromptBuilder` dự trữ output budget, tính system + tool schemas + session history. Khi gần đầy context, `AgentRuntime` sinh summary checkpoint bền vững trong SQLite và rebuild context bằng `mandatory system + latest summary + recent complete turns`. **Không xóa full history**. Frontier không được cắt giữa assistant tool call và tool result.
+`PromptBuilder` dự trữ output budget, tính system + tool schemas + session history. Khi gần đầy context, `AgentRuntime` sinh summary checkpoint bền vững trong SQLite và rebuild context bằng `mandatory system + latest summary + recent settled exchanges (bao gồm settled prefix của active turn)`. **Không xóa full history**. Frontier chỉ tiến qua settled exchanges, kể cả trong active turn; không cắt giữa assistant tool call và tool result.
 
 Nếu provider từ chối vì context overflow trước khi phát output, được compact/retry một lần; nếu vẫn không đủ chỗ, trả `CONTEXT_LIMIT` recoverable, không âm thầm bỏ dữ liệu. Summary có thể mất chi tiết, do đó phải giữ user objective, decisions, evidence và artifact refs. Nếu skill instructions không còn model-visible, agent có thể gọi lại `skill(id)`.
 
@@ -80,3 +80,7 @@ Tham khảo [15 — Long-running Sessions](15-long-running-sessions.md).
 - https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/model-request.ts
 - https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/context.ts
 - https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/system-prompt.ts
+
+### Bootstrap invariant
+
+`Orchestrator::builder` nạp mandatory base resource versioned trong library và đưa vào mỗi Root/Child model request. Agent/project prompts không thay thế base. Bootstrap bằng bộ examples phải vượt test base-presence; không tạo prompt loader abstraction mới.

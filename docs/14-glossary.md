@@ -8,9 +8,12 @@
 | **Session** | Hội thoại bền vững có `session_id`, agent, parent ID và history. |
 | **Child Session** | Session có `parent_session_id`; quyền sở hữu gắn với parent/workspace. |
 | **Run** | Một execution attempt của AgentRuntime trong session, có thể gồm rất nhiều LLM/tool steps. |
-| **Delegation** | Một `subagent` tool invocation của parent; `child_session_id` có thể trỏ tới child được resume nhiều lần. MVP không có bảng `tasks` riêng. |
+| **Delegation** | Parent subagent invocation persist `child_session_id` và đúng `child_turn_id`, không có bảng tasks riêng. |
 | **Tool** | Chức năng mà LLM có thể yêu cầu hệ thống thực thi qua ToolExecutor. |
-| **Tool Call ID** | Mã ghép tool call/result trong model history; phải giữ nguyên. |
+| **Tool Call ID** | Provider ID dùng ghép assistant call/result, scoped theo assistant message; không là internal invocation ID. |
+| **Invocation ID** | `tool_invocations.id`, stable internal key cho recovery/idempotency. |
+| **Child Turn ID** | Logical child turn atomically admit bởi parent invocation; vẫn giữ khi run attempt recovery. |
+| **Final Message Lineage** | `agent_runs.final_message_id` trỏ đúng assistant final thuộc terminal run attempt. |
 | **Skill** | Gói instructions/workflow (`SKILL.md` và tài nguyên phụ), load theo nhu cầu. |
 | **Skill Catalog** | Metadata ID/name/description cho agent khám phá skill. |
 | **Prompt Builder** | Module dựng system context, instructions, skill catalog, history, available tool definitions. |
@@ -20,7 +23,7 @@
 | **Semantic Validation** | Kiểm tra chất lượng nội dung nhiệm vụ; **không bắt buộc** với Subagent. |
 | **Technical Validation** | Check quyền, schema tool inputs, session ownership và giới hạn runtime; **bắt buộc**. |
 | **Progressive Disclosure** | Chỉ load toàn nội dung Skill khi agent chọn `skill(id)` thay vì nhồi tất cả vào prompt. |
-| **Artifact** | Cơ chế lưu dữ liệu lớn ngoài model-visible result (mở rộng sau MVP). |
+| **Artifact** | Immutable committed bytes + SQLite metadata, scoped read trong MVP; external Knowledge/provider IDs không phải artifacts. |
 | **Foreground** | Parent chờ Subagent hoàn thành trước khi có final tool result. |
 | **Background** | Child chạy độc lập và gửi completion event vào parent inbox; chưa có input/output trong schema MVP. |
 | **Module** | Phần có interface và implementation, bất kể cỡ lớn nhỏ. |
@@ -33,7 +36,7 @@
 | **Step** | Một iteration LLM và tools; không tương đương Run hay business Task. |
 | **Optional Steps Limit** | `agent.steps` mặc định unset; nếu set sẽ buộc model text-only progress tại giới hạn. |
 | **Continuous Execution** | Session runner lặp LLM → Tool/Subagent → LLM đến final/cancel/error, không tự giới hạn 20 steps. |
-| **Compaction Checkpoint** | Summary lưu SQLite, model thấy summary + recent turns; full history vẫn ở DB. |
+| **Compaction Checkpoint** | SQLite summary + recent settled exchanges (kể cả active turn); full history vẫn ở DB. |
 | **Synthetic Message** | Lời nhắc kỹ thuật của runtime, không phải user input. |
 | **Recovery Attempt** | Run mới cùng `turn_id` sau restart, `resume_attempt` bounded để tránh crash-loop. |
 | **Execution Claim** | Durable `agent_runs.status=running` dùng cho startup recovery + single-run admission. |
@@ -52,3 +55,12 @@
 | **SSE** | Server-Sent Events: HTTP server → client, best-effort live feed, không phải command channel. |
 | **ToolContext::progress** | Method dùng private publisher của runtime để gửi tool.progress, không cho Tool phụ thuộc Axum/SSE. |
 | **Resync** | Khi reconnect/Lagged, mở SSE trước, lấy snapshot; committed events invalidate view để refresh, partial previews chưa confirmed bị bỏ. |
+
+## Library-first additions
+
+| Thuật ngữ | Định nghĩa |
+|---|---|
+| **HostTool** | Host-owned adapter dùng trusted scoped `ToolContext`, không direct SQL/private artifact paths. |
+| **Process Owner Guard** | Exclusive single-store owner; khác SQLite single-running-run/session index. |
+| **Artifact Manifest Pointer** | Last committed verified manifest ID trên invocation, compare-and-swap owned by SessionStore. |
+| **Active Snapshot Reconciliation** | Periodic canonical snapshot read khi active run, kể cả SSE chưa disconnect. |

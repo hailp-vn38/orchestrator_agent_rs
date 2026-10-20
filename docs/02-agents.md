@@ -45,9 +45,10 @@ impl AgentRegistry {
 }
 ```
 
-MVP chỉ có YAML-backed registry. Không tạo trait với một implementation; fake model/tool có thể được cấp ở các seam khác khi test.
+MVP dùng concrete typed `AgentRegistry` nhận `Vec<AgentDefinition>` từ host config. YAML/TOML loader là tùy chọn ở host/example, không là dependency bắt buộc của core. Không tạo registry trait một implementation.
 
-- Load YAML lúc startup, validate unique IDs, prompt path tồn tại và model reference hợp lệ ở mức cú pháp.
+- Host truyền typed definitions lúc build; validate unique IDs, prompt path tồn tại và model reference hợp lệ ở mức cú pháp.
+- Với `docs/examples/agents.yaml`: map `agents.<key>` → `id`, `prompt/provider/model/tools/skills` → `prompt_path/provider_id/model_id/allowed_tools/allowed_skills`. Validate provider aliases và modes; không deserialize YAML example trực tiếp vào AgentDefinition.
 - Root phải có mode `Primary|All`, child phải có mode `Subagent|All`.
 - Cấu hình được load tại startup; thay đổi file cần restart. Mỗi run dùng snapshot definition đã resolve, không hot reload trong MVP.
 - MVP mỗi AgentDefinition cấu hình `(provider_id, model_id)` tường minh; child dùng model riêng, không hỗ trợ model override qua tool. Model inheritance/override theo OpenCode chỉ bổ sung khi có use case và đã kiểm chứng adapter.

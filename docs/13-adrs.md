@@ -145,3 +145,27 @@ Mỗi quyết định dưới đây có trạng thái **Accepted** theo thảo l
 **Alternatives rejected:** WebSocket ngay từ MVP, Kafka/Redis, ghi mọi delta vào SQLite, `Last-Event-ID` replay chưa có durable log, per-agent event modules hoặc UI trực tiếp query TaskManager internals.
 
 **Consequences:** Realtime stream best-effort, preview có thể mất; cần revision, family auth, bounded broadcast lag policy, terminal publish-after-commit và out-of-order invalidation tests. **Step ordering:** đợi provider stream `Finished` rồi persist mọi tool calls trước khi dispatch tuần tự, không execute từ `ToolCallReady` giữa stream. Nếu cần lossless event timeline, tạo ADR mới và durable event-log riêng. Chi tiết: [16 — Streaming](16-streaming-events.md).
+
+## ADR-015 — Embeddable Library + Host-Owned Transport
+
+**Status:** Accepted (2026-10-20); **supersedes only the public entry point in ADR-009 and Axum coupling in ADR-014**.
+
+**Decision:** Cargo `[lib]` exposes public `Orchestrator` + `HostTool`; host owns Tokio, AuthN and transport (Axum/SSE is an optional adapter). The existing shared `AgentRuntime`, one transcript writer, `ExecutionFeed` and SQLite canonical snapshot invariants remain valid.
+
+**Why:** A Rust server host already has transport and business context. Avoid duplicate orchestration layers.
+
+## ADR-016 — ArtifactStore, Delegation & Message Lineage
+
+**Status:** Accepted (2026-10-20); **extends ADR-007/010/013**, no business tasks table.
+
+**Decision:** MVP has concrete local immutable ArtifactStore with fifth SQLite metadata table; SessionStore owns manifest checkpoint CAS pointer. Parent invocation ID is idempotency key for atomic child-turn admission. `agent_runs.final_message_id` plus `messages.run_id` bind the final to a terminal attempt. Internal invocation key is distinct from provider tool-call ID scoped by assistant message. HostTool reads/writes artifacts with runtime-minted scoped context. No GC/TTL/remote adapters.
+
+**Why:** Durable large media/docs and crash recovery without ambiguous child turns or stale final responses.
+
+## ADR-017 — Owner Handoff and Snapshot Reconciliation
+
+**Status:** Accepted (2026-10-20); **clarifies ADR-013/014**.
+
+**Decision:** Shutdown releases store process-owner lock only after local write-capable tasks quiesce/join; an incomplete shutdown cannot report success. External uncertain mutations still require reconciliation. Best-effort SSE notifications are supplemented by periodic canonical snapshot refresh while active runs exist, even if connection stays open. No durable event-log.
+
+**Why:** Preserve single-owner execution and UI convergence without distributed scheduling or replay infrastructure.
