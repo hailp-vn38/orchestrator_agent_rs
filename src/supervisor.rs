@@ -7,6 +7,10 @@
 //! M5: mỗi worker có `CancellationToken` riêng (con của token shutdown) để `cancel` một run mà
 //! không ảnh hưởng run khác; shutdown là giao thức nhiều pha (docs/18 §18.9): đóng admission →
 //! drain có hạn → cancel hợp tác → quiesce/join → đóng store → nhả owner lock.
+//!
+//! Worker trả `Unsettled` (không commit được, run vẫn `running`) thì run đó chỉ được spawn lại
+//! sau backoff mũ; quá [`MAX_UNSETTLED_ATTEMPTS`] lần liên tiếp thì runtime chuyển run sang
+//! `interrupted/STORE_UNAVAILABLE` để không gọi lại model vô hạn khi store ghi lỗi kéo dài.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,8 +25,14 @@ use tracing::{debug, warn};
 
 use crate::error::{ErrorCode, OrchestratorError};
 use crate::owner_lock::OwnerLock;
-use crate::runtime::AgentRuntime;
+use crate::runtime::{AgentRuntime, Settlement};
 use crate::store::SessionStore;
+
+/// Số lần `Unsettled` liên tiếp của một run trước khi bỏ cuộc (mỗi lần có thể là một lần gọi
+/// model). Run bỏ cuộc vẫn phục hồi được ở lần khởi động sau.
+const MAX_UNSETTLED_ATTEMPTS: u32 = 5;
+/// Trần backoff tính theo bội số của chu kỳ sweep.
+const MAX_BACKOFF_FACTOR: u32 = 16;
 
 /// Kênh đánh thức supervisor sau khi một claim vừa commit (root submit hoặc child admission).
 /// Clone được chia sẻ giữa `Orchestrator` (submit) và `TaskManager` (child admission).
@@ -56,18 +66,30 @@ impl AdmissionSignal {
 struct Owned {
     handle: JoinHandle<()>,
     cancel: CancellationToken,
+    /// Root run (không có parent): tính vào `max_root_runs`.
+    root: bool,
+}
+
+/// Run vừa kết thúc `Unsettled`: số lần liên tiếp và thời điểm sớm nhất được spawn lại.
+struct Retry {
+    failures: u32,
+    not_before: Instant,
 }
 
 struct Shared {
     store: SessionStore,
     runtime: AgentRuntime,
     owned: Mutex<HashMap<String, Owned>>,
+    /// Backoff của run `Unsettled` (in-memory; restart dùng recovery bounded thay thế).
+    retries: Mutex<HashMap<String, Retry>>,
     signal: AdmissionSignal,
     /// Token shutdown: hủy hợp tác mọi run và dừng loop.
     cancel: CancellationToken,
     /// Báo khi một worker rời `owned` (phục vụ chờ idle trong shutdown).
     idle: Notify,
     sweep: Duration,
+    /// `RuntimeConfig::max_concurrent_root_runs`; child không bị tính.
+    max_root_runs: Option<usize>,
     /// Chỉ nhả sau khi mọi local write-capable task đã join (hoặc khi Shared bị drop).
     owner_lock: Mutex<Option<OwnerLock>>,
 }
@@ -92,6 +114,7 @@ impl Supervisor {
         store: SessionStore,
         runtime: AgentRuntime,
         sweep: Duration,
+        max_root_runs: Option<usize>,
         owner_lock: OwnerLock,
         signal: AdmissionSignal,
         shutdown: CancellationToken,
@@ -100,10 +123,12 @@ impl Supervisor {
             store,
             runtime,
             owned: Mutex::new(HashMap::new()),
+            retries: Mutex::new(HashMap::new()),
             signal,
             cancel: shutdown,
             idle: Notify::new(),
             sweep,
+            max_root_runs,
             owner_lock: Mutex::new(Some(owner_lock)),
         });
         let handle = tokio::spawn(Arc::clone(&shared).run_loop());
@@ -173,7 +198,7 @@ impl Supervisor {
         self.shared.cancel.cancel();
         // Admission lọt vào ngay trước khi đóng: cho nó một worker để bị cancel đúng cách
         // (interrupted/SHUTTING_DOWN) thay vì để claim `running` không owner.
-        self.shared.spawn_unowned().await;
+        self.shared.spawn_unowned(true).await;
 
         let loop_handle = lock(&self.loop_task).take();
         let shared = Arc::clone(&self.shared);
@@ -204,6 +229,46 @@ impl Drop for Supervisor {
 }
 
 impl Shared {
+    /// Ghi nhận kết quả của worker **trước** khi nó rời `owned`, để lần reconcile kế tiếp
+    /// thấy backoff. Quá [`MAX_UNSETTLED_ATTEMPTS`] lần liên tiếp thì bỏ cuộc (terminal
+    /// `interrupted`); nếu cả việc đó cũng không ghi được thì tiếp tục backoff ở mức trần.
+    async fn record_settlement(&self, run_id: &str, settlement: Settlement) {
+        if settlement == Settlement::Terminal {
+            lock(&self.retries).remove(run_id);
+            return;
+        }
+        let failures = lock(&self.retries)
+            .get(run_id)
+            .map_or(0, |r| r.failures)
+            .saturating_add(1);
+        let settlement = if failures >= MAX_UNSETTLED_ATTEMPTS {
+            warn!(
+                run_id,
+                failures, "run keeps failing to record progress; giving up"
+            );
+            self.runtime.give_up(run_id).await
+        } else {
+            debug!(run_id, failures, "run unsettled; retrying after backoff");
+            settlement
+        };
+        let mut retries = lock(&self.retries);
+        if settlement == Settlement::Terminal {
+            retries.remove(run_id);
+        } else {
+            let factor = 1u32
+                .checked_shl(failures.saturating_sub(1))
+                .unwrap_or(u32::MAX)
+                .min(MAX_BACKOFF_FACTOR);
+            retries.insert(
+                run_id.to_owned(),
+                Retry {
+                    failures,
+                    not_before: Instant::now() + self.sweep.saturating_mul(factor),
+                },
+            );
+        }
+    }
+
     async fn run_loop(self: Arc<Self>) {
         self.reconcile().await;
         let mut tick = tokio::time::interval_at(Instant::now() + self.sweep, self.sweep);
@@ -243,24 +308,43 @@ impl Shared {
         if self.cancel.is_cancelled() {
             return;
         }
-        self.spawn_unowned().await;
+        self.spawn_unowned(false).await;
     }
 
     /// Như `reconcile` nhưng cũng chạy khi đã shutdown (để claim còn lại được cancel đúng).
-    async fn spawn_unowned(self: &Arc<Self>) {
-        let ids = match self.store.running_run_ids().await {
-            Ok(ids) => ids,
+    /// `shutting_down`: bỏ qua backoff và giới hạn concurrency, vì shutdown cần mọi claim có
+    /// owner để kết thúc đúng cách (`interrupted/SHUTTING_DOWN`).
+    async fn spawn_unowned(self: &Arc<Self>, shutting_down: bool) {
+        let claims = match self.store.running_claims().await {
+            Ok(claims) => claims,
             Err(_) => {
                 warn!("reconcile could not list running runs; will retry on next sweep");
                 return;
             }
         };
+        let now = Instant::now();
         let mut owned = lock(&self.owned);
+        let mut retries = lock(&self.retries);
+        // Run không còn `running` thì không cần giữ backoff.
+        retries.retain(|id, _| claims.iter().any(|(c, _)| c == id));
         // Handle đã kết thúc mà chưa tự xóa (vd. worker panic) không còn là owner hợp lệ.
         owned.retain(|_, o| !o.handle.is_finished());
-        for id in ids {
+        let mut active_roots = owned.values().filter(|o| o.root).count();
+        for (id, is_child) in claims {
             if owned.contains_key(&id) {
                 continue;
+            }
+            if !shutting_down {
+                if retries.get(&id).is_some_and(|r| r.not_before > now) {
+                    continue;
+                }
+                // Claim vượt giới hạn vẫn durable và chờ slot theo thứ tự admission.
+                if !is_child && self.max_root_runs.is_some_and(|max| active_roots >= max) {
+                    continue;
+                }
+            }
+            if !is_child {
+                active_roots += 1;
             }
             let me = Arc::clone(self);
             let run_id = id.clone();
@@ -269,19 +353,20 @@ impl Shared {
             // Spawn khi đang giữ lock: worker xóa entry của chính nó cũng cần lock này nên
             // luôn thấy entry đã được insert.
             let handle = tokio::spawn(async move {
-                let settled = me.runtime.execute(&run_id, &worker_token).await;
+                let settlement = me.runtime.execute(&run_id, &worker_token).await;
+                me.record_settlement(&run_id, settlement).await;
                 lock(&me.owned).remove(&run_id);
                 me.idle.notify_waiters();
-                if settled {
-                    // Có thể còn claim khác đang chờ owner.
-                    me.signal.wake.notify_one();
-                }
+                // Slot vừa trống: claim khác có thể đang chờ owner. Run vừa `Unsettled` không
+                // bị spawn lại ngay vì đang trong backoff.
+                me.signal.wake.notify_one();
             });
             owned.insert(
                 id,
                 Owned {
                     handle,
                     cancel: token,
+                    root: !is_child,
                 },
             );
         }

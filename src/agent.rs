@@ -27,6 +27,10 @@ pub struct AgentDefinition {
     pub allowed_skills: Vec<String>,
     /// `None` = không giới hạn; `Some(n)` yêu cầu `n > 0`.
     pub steps: Option<u32>,
+    /// Context window (token ước lượng) của model agent này, dùng cho compaction. `None` =
+    /// `RuntimeConfig::context_limit_tokens`; `Some(n)` yêu cầu `n > 0`. Root và Child có thể
+    /// dùng model có window khác nhau.
+    pub context_limit_tokens: Option<usize>,
 }
 
 impl AgentDefinition {
@@ -47,6 +51,7 @@ impl AgentDefinition {
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
             steps: None,
+            context_limit_tokens: None,
         }
     }
 
@@ -85,6 +90,11 @@ impl AgentDefinition {
 
     pub fn with_steps(mut self, steps: u32) -> Self {
         self.steps = Some(steps);
+        self
+    }
+
+    pub fn with_context_limit_tokens(mut self, tokens: usize) -> Self {
+        self.context_limit_tokens = Some(tokens);
         self
     }
 }
@@ -165,6 +175,12 @@ async fn validate_definition(
         return err(
             ConfigReason::InvalidSteps,
             format!("agent '{id}': steps must be > 0 when set"),
+        );
+    }
+    if def.context_limit_tokens == Some(0) {
+        return err(
+            ConfigReason::InvalidRuntimeConfig,
+            format!("agent '{id}': context_limit_tokens must be > 0 when set"),
         );
     }
     for tool in &def.allowed_tools {

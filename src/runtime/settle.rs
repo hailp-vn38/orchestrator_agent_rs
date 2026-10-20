@@ -12,7 +12,7 @@ use crate::store::{PendingInvocation, RunRecord};
 use crate::tool::ToolScope;
 use crate::types::RunStatus;
 
-use super::{AgentRuntime, Flow};
+use super::{AgentRuntime, Flow, Settlement};
 
 impl AgentRuntime {
     /// Dispatch tuần tự các invocation `requested`; settle đủ trước khi trả `Continue`.
@@ -54,7 +54,7 @@ impl AgentRuntime {
         eff: &Effective,
         inv: &PendingInvocation,
         cancel: &CancellationToken,
-    ) -> Option<bool> {
+    ) -> Option<Settlement> {
         let settled = match self
             .executor
             .prepare(&inv.tool_name, inv.arguments.clone(), eff)
@@ -64,8 +64,8 @@ impl AgentRuntime {
             Prepared::Run(runnable) => {
                 match self.store.begin_invocation(run_id, &inv.id).await {
                     Ok(true) => {}
-                    Ok(false) => return Some(true),
-                    Err(_) => return Some(false),
+                    Ok(false) => return Some(Settlement::Terminal),
+                    Err(_) => return Some(Settlement::Unsettled),
                 }
                 let scope = self.scope(run, eff, inv, run_id);
                 match self.executor.run(runnable, scope, eff, cancel).await {
@@ -109,12 +109,12 @@ impl AgentRuntime {
                     .await;
                 None
             }
-            Ok(false) => Some(true),
+            Ok(false) => Some(Settlement::Terminal),
             Err(_) => {
                 // Tool có thể đã chạy xong nhưng không xác nhận được: invocation vẫn `running`,
                 // lần sweep sau sẽ chặn thay vì replay.
                 warn!("could not commit the tool result; the outcome stays unconfirmed");
-                Some(false)
+                Some(Settlement::Unsettled)
             }
         }
     }

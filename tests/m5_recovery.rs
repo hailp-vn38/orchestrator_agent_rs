@@ -1850,6 +1850,240 @@ async fn blocked_child_blocks_the_parent_and_one_resolution_resumes_both() {
     o.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn resolving_a_child_the_parent_already_gave_up_on_does_not_resume_it() {
+    let env = Env::new();
+    // Tool Mutating của child vượt timeout → outcome unknown → child `interrupted` ngay trong
+    // process; parent nhận `CHILD_FAILED` và tự kết thúc turn (ADR-002).
+    let (mt, mt_runs) = Probe::new(
+        "mt",
+        ToolEffect::Mutating,
+        Behavior::Ignore(Duration::from_millis(400)),
+    );
+    let agents = || vec![env.root("model-x", &["subagent"]), env.reviewer(&["mt"])];
+    let gw = ScriptedGateway::new();
+    gw.push_tool_calls("", vec![("c1", "subagent", sub_new("job"))]);
+    gw.push_tool_calls("", vec![("k1", "mt", json!({"text": "a"}))]);
+    gw.push_text("parent handled the failure");
+    let mut cfg = env.config(agents());
+    cfg.runtime.tool_timeout = Duration::from_millis(100);
+    let o = build(cfg, &gw, vec![mt.clone()]).await.unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+    let t = o.submit(&alice(), &sid, "delegate".into()).await.unwrap();
+    let r = wait_terminal(&o, &sid, &t.turn_id).await;
+    assert_eq!(r.status, RunStatus::Completed, "{:?}", r.error);
+    assert!(tool_texts(&history(&o, &sid).await)[0].contains("CHILD_FAILED"));
+
+    let (child_sid, child_turn, child_inv) = {
+        let mut c = env.sql().await;
+        let row = sqlx::query(
+            "SELECT p.child_session_id, p.child_turn_id, k.id FROM tool_invocations p \
+             JOIN tool_invocations k ON k.session_id = p.child_session_id \
+             WHERE p.session_id = ?1",
+        )
+        .bind(&sid)
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+        (
+            row.get::<String, _>(0),
+            row.get::<String, _>(1),
+            row.get::<String, _>(2),
+        )
+    };
+    let child = o.result(&alice(), &child_sid, &child_turn).await.unwrap();
+    assert_eq!(child.error.unwrap().code, "TOOL_OUTCOME_UNKNOWN");
+    assert_eq!(gw.call_count(), 3);
+
+    o.resolve_interrupted_invocation(
+        &operator(),
+        &child_sid,
+        &child_inv,
+        VerifiedToolResolution::ConfirmedNoEffect {
+            evidence: "nothing was written".into(),
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        gw.call_count(),
+        3,
+        "no orphan child attempt nobody would consume"
+    );
+    let child = o.result(&alice(), &child_sid, &child_turn).await.unwrap();
+    assert_eq!((child.status, child.attempt), (RunStatus::Interrupted, 0));
+    assert_eq!(child.error.unwrap().code, "DELEGATION_CLOSED");
+
+    // Root vẫn tiếp tục được child session đó theo session_id (ADR-003).
+    gw.push_tool_calls(
+        "",
+        vec![(
+            "c2",
+            "subagent",
+            json!({
+                "agent": "reviewer",
+                "description": "retry",
+                "prompt": "try again",
+                "session_id": child_sid,
+            }),
+        )],
+    );
+    gw.push_text("child done on request");
+    gw.push_text("root done");
+    let t2 = o.submit(&alice(), &sid, "retry".into()).await.unwrap();
+    let r = wait_terminal(&o, &sid, &t2.turn_id).await;
+    assert_eq!(r.status, RunStatus::Completed, "{:?}", r.error);
+    let texts = tool_texts(&history(&o, &sid).await);
+    assert!(texts[1].contains("child done on request"), "{texts:?}");
+    assert_eq!(
+        mt_runs.load(Ordering::SeqCst),
+        1,
+        "the mutation is never replayed"
+    );
+    o.shutdown().await.unwrap();
+}
+
+// ───────────────────────── Concurrency limit ─────────────────────────
+
+#[tokio::test]
+async fn root_runs_beyond_the_concurrency_limit_wait_durably_for_a_slot() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    let mut cfg = env.config(env.agents(&[]));
+    cfg.runtime.max_concurrent_root_runs = Some(1);
+    let o = build(cfg, &gw, vec![]).await.unwrap();
+    let s1 = o.create_session(&alice(), "root").await.unwrap();
+    let s2 = o.create_session(&alice(), "root").await.unwrap();
+    gw.hold();
+    let t1 = o.submit(&alice(), &s1, "first".into()).await.unwrap();
+    wait_until(|| gw.call_count() == 1).await;
+    let t2 = o.submit(&alice(), &s2, "second".into()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(gw.call_count(), 1, "the second root run waits for a slot");
+    assert_eq!(
+        o.result(&alice(), &s2, &t2.turn_id).await.unwrap().status,
+        RunStatus::Running,
+        "accepted and durable while queued"
+    );
+
+    gw.release();
+    let r1 = wait_terminal(&o, &s1, &t1.turn_id).await;
+    let r2 = wait_terminal(&o, &s2, &t2.turn_id).await;
+    assert_eq!(
+        (r1.status, r2.status),
+        (RunStatus::Completed, RunStatus::Completed)
+    );
+    assert_eq!(r2.output.as_deref(), Some("echo: second"));
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_child_never_waits_behind_the_root_concurrency_limit() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    gw.push_tool_calls("", vec![("c1", "subagent", sub_new("job"))]);
+    gw.push_text("child result");
+    gw.push_text("root result");
+    let mut cfg = env.config(env.agents(&["subagent"]));
+    cfg.runtime.max_concurrent_root_runs = Some(1);
+    let o = build(cfg, &gw, vec![]).await.unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+    let t = o.submit(&alice(), &sid, "delegate".into()).await.unwrap();
+    let r = wait_terminal(&o, &sid, &t.turn_id).await;
+    assert_eq!(r.status, RunStatus::Completed, "{:?}", r.error);
+    assert_eq!(r.output.as_deref(), Some("root result"));
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_zero_root_concurrency_limit_is_rejected() {
+    let env = Env::new();
+    let mut cfg = env.config(env.agents(&[]));
+    cfg.runtime.max_concurrent_root_runs = Some(0);
+    let e = build(cfg, &ScriptedGateway::new(), vec![])
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(
+        e.reason().map(|r| r.as_str()),
+        Some("INVALID_RUNTIME_CONFIG")
+    );
+}
+
+// ───────────────────────── Persistent store write failure ─────────────────────────
+
+/// Mô phỏng ghi lỗi kéo dài (đĩa đầy, DB read-only một phần) bằng trigger SQLite: commit
+/// assistant + invocation luôn thất bại, còn đọc và ghi terminal vẫn được.
+async fn break_tool_call_commits(env: &Env) {
+    let mut c = env.sql().await;
+    sqlx::query(
+        "CREATE TRIGGER fail_tool_calls BEFORE INSERT ON tool_invocations \
+         BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END",
+    )
+    .execute(&mut c)
+    .await
+    .unwrap();
+}
+
+async fn heal_tool_call_commits(env: &Env) {
+    let mut c = env.sql().await;
+    sqlx::query("DROP TRIGGER fail_tool_calls")
+        .execute(&mut c)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn unsettled_run_backs_off_and_stops_calling_the_model_when_writes_keep_failing() {
+    let env = Env::new();
+    let (mt, mt_runs) = Probe::new("mt", ToolEffect::Mutating, Behavior::Echo);
+    let gw = ScriptedGateway::new();
+    for i in 0..50 {
+        gw.push_tool_calls("", vec![(&format!("c{i}"), "mt", json!({"text": "a"}))]);
+    }
+    let mut cfg = env.config(env.agents(&["mt"]));
+    cfg.runtime.supervisor_sweep = Duration::from_millis(10);
+    let o = build(cfg, &gw, vec![mt.clone()]).await.unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+    break_tool_call_commits(&env).await;
+
+    let t = o.submit(&alice(), &sid, "go".into()).await.unwrap();
+    let r = wait_terminal(&o, &sid, &t.turn_id).await;
+    assert_eq!(r.status, RunStatus::Interrupted, "{r:?}");
+    assert_eq!(r.error.unwrap().code, "STORE_UNAVAILABLE");
+    let calls = gw.call_count();
+    assert_eq!(
+        calls, 5,
+        "model calls are bounded while writes keep failing"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        gw.call_count(),
+        calls,
+        "no further model call after giving up"
+    );
+    assert_eq!(
+        mt_runs.load(Ordering::SeqCst),
+        0,
+        "no tool ran without a durable call"
+    );
+
+    // Store khỏe lại: lần khởi động sau phục hồi đúng turn đó (không mất input).
+    heal_tool_call_commits(&env).await;
+    o.shutdown().await.unwrap();
+    drop(o);
+    let gw2 = ScriptedGateway::new();
+    gw2.push_text("recovered after the store healed");
+    let o2 = build(env.config(env.agents(&["mt"])), &gw2, vec![mt])
+        .await
+        .unwrap();
+    let r = wait_terminal(&o2, &sid, &t.turn_id).await;
+    assert_eq!(r.status, RunStatus::Completed, "{r:?}");
+    assert_eq!(r.attempt, 1);
+    o2.shutdown().await.unwrap();
+}
+
 // ───────────────────────── AT-25 ─────────────────────────
 
 #[tokio::test]

@@ -93,6 +93,12 @@ impl OrchestratorBuilder {
         for tool in self.tools {
             let desc = tool.descriptor();
             validate_descriptor(&desc)?;
+            if tool.timeout().is_some_and(|t| t.is_zero()) {
+                return Err(OrchestratorError::config(
+                    ConfigReason::InvalidTimeout,
+                    format!("tool '{}': timeout must be > 0 when set", desc.name),
+                ));
+            }
             if tools.contains_key(&desc.name) {
                 return Err(OrchestratorError::config(
                     ConfigReason::DuplicateTool,
@@ -302,6 +308,7 @@ impl OrchestratorBuilder {
             store.clone(),
             runtime,
             self.config.runtime.supervisor_sweep,
+            self.config.runtime.max_concurrent_root_runs,
             owner_lock,
             signal,
             shutdown,

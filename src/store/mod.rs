@@ -22,7 +22,9 @@ mod tests;
 
 pub(crate) use codec::new_id;
 pub(crate) use observe::EventInfo;
-pub(crate) use recovery::{RecoveryPolicy, Resolution, CODE_NO_EFFECT, CODE_SHUTTING_DOWN};
+pub(crate) use recovery::{
+    RecoveryPolicy, Resolution, CODE_NO_EFFECT, CODE_SHUTTING_DOWN, CODE_STORE_UNAVAILABLE,
+};
 pub(crate) use types::{
     Checkpoint, ChildAdmission, ChildAdmitError, ChildTarget, Context, NewCheckpoint,
     PendingInvocation, RunRecord, RunRoute, StoredToolCall, TranscriptEntry,

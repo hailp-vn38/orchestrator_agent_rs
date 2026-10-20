@@ -121,6 +121,10 @@ pub struct RuntimeConfig {
     pub artifact_preview_limit: u32,
     /// Thời gian ân hạn trước khi orphan sweep xóa file staging/unpublished chưa có metadata.
     pub artifact_staging_grace: Duration,
+    /// Số **root** run được chạy đồng thời; claim vượt mức vẫn durable (`running`) và chờ slot
+    /// theo thứ tự admission. Child run không bị tính để parent đang chờ không bao giờ deadlock
+    /// (depth 1 + tool tuần tự nên mỗi root có tối đa một child active). `None` = không giới hạn.
+    pub max_concurrent_root_runs: Option<usize>,
 }
 
 impl Default for RuntimeConfig {
@@ -150,6 +154,7 @@ impl Default for RuntimeConfig {
             download_max_bytes: 256 * MIB,
             artifact_preview_limit: 20,
             artifact_staging_grace: Duration::from_secs(300),
+            max_concurrent_root_runs: None,
         }
     }
 }
@@ -164,6 +169,9 @@ impl RuntimeConfig {
         };
         if self.supervisor_sweep.is_zero() {
             return bad("supervisor_sweep must be > 0");
+        }
+        if self.max_concurrent_root_runs == Some(0) {
+            return bad("max_concurrent_root_runs must be > 0 when set");
         }
         if self.shutdown_grace.is_zero() {
             return bad("shutdown_grace must be > 0");

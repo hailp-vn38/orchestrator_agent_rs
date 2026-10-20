@@ -17,7 +17,7 @@ use crate::gateway::{
 use crate::prompt::context_messages;
 use crate::store::{new_id, RunRecord};
 
-use super::{AgentRuntime, STEP_LIMIT_GUIDANCE};
+use super::{AgentRuntime, Settlement, STEP_LIMIT_GUIDANCE};
 
 impl AgentRuntime {
     pub(super) async fn build_request(
@@ -46,14 +46,24 @@ impl AgentRuntime {
         eff: &Effective,
         capped: bool,
         cancel: &CancellationToken,
-    ) -> Result<(ModelResponse, String), bool> {
+    ) -> Result<(ModelResponse, String), Settlement> {
         let run_id = run.run_id.as_str();
-        let mut request = self.step_request(run, eff, capped).await.ok_or(false)?;
-        if estimate_tokens(&request) >= self.context.threshold() {
+        let mut request = self
+            .step_request(run, eff, capped)
+            .await
+            .ok_or(Settlement::Unsettled)?;
+        let agent_limit = self
+            .agents
+            .get(&run.agent_id)
+            .and_then(|a| a.context_limit_tokens);
+        if estimate_tokens(&request) >= self.context.threshold(agent_limit) {
             // Lỗi compact chủ động không chặn run: request vẫn có thể vừa; overflow thật sẽ
             // đi qua nhánh retry bên dưới.
             if let Ok(true) = self.compact(run, cancel).await {
-                request = self.step_request(run, eff, capped).await.ok_or(false)?;
+                request = self
+                    .step_request(run, eff, capped)
+                    .await
+                    .ok_or(Settlement::Unsettled)?;
             }
         }
         let mut retried = false;
@@ -68,7 +78,10 @@ impl AgentRuntime {
                     retried = true;
                     match self.compact(run, cancel).await {
                         Ok(true) => {
-                            request = self.step_request(run, eff, capped).await.ok_or(false)?;
+                            request = self
+                                .step_request(run, eff, capped)
+                                .await
+                                .ok_or(Settlement::Unsettled)?;
                         }
                         Ok(false) => {
                             return Err(self.fail(run_id, GatewayError::ContextOverflow).await)

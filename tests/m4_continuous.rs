@@ -799,3 +799,97 @@ async fn at11_per_operation_timeout_still_applies_to_a_single_tool() {
     let tool = h.iter().find(|m| m.role == MessageRole::Tool).unwrap();
     assert!(tool.text.contains("TOOL_TIMEOUT"), "{}", tool.text);
 }
+
+// ───────────────────────── Per-agent context limit / per-tool timeout ─────────────────────────
+
+/// Tool tự khai báo timeout riêng (vd. tải/transcribe dài) thay cho `tool_timeout` toàn cục.
+struct WithTimeout(Arc<Probe>, Duration);
+
+#[async_trait::async_trait]
+impl HostTool for WithTimeout {
+    fn descriptor(&self) -> ToolDescriptor {
+        self.0.descriptor()
+    }
+
+    fn timeout(&self) -> Option<Duration> {
+        Some(self.1)
+    }
+
+    async fn execute(&self, ctx: ToolContext, args: Value) -> Result<ToolOutcome, ToolError> {
+        self.0.execute(ctx, args).await
+    }
+}
+
+#[tokio::test]
+async fn a_tool_with_its_own_timeout_outlives_the_global_tool_timeout() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    let (slow, _, _) = Probe::new("slow", Behavior::Sleep(Duration::from_secs(150)));
+    push_call(&gw, "c1", "slow", "x");
+    gw.push_text("done");
+    let mut cfg = env.config(vec![env.root(&["slow"])]);
+    cfg.runtime.tool_timeout = Duration::from_secs(120);
+    let tool = Arc::new(WithTimeout(slow, Duration::from_secs(200)));
+    let (o, sid) = root_session(&env, cfg, &gw, vec![tool]).await;
+
+    tokio::time::pause();
+    let r = run_turn(&o, &sid, "go").await;
+    assert_eq!(r.status, RunStatus::Completed, "{r:?}");
+    let h = history(&o, &sid).await;
+    let tool = h.iter().find(|m| m.role == MessageRole::Tool).unwrap();
+    assert_eq!(tool.text, "slow:slept");
+}
+
+#[tokio::test]
+async fn a_zero_tool_timeout_is_rejected_at_build() {
+    let env = Env::new();
+    let (slow, _, _) = Probe::new("slow", Behavior::Echo);
+    let tool: Arc<dyn HostTool> = Arc::new(WithTimeout(slow, Duration::ZERO));
+    let e = Orchestrator::builder(env.config(vec![env.root(&["slow"])]))
+        .with_gateway(ScriptedGateway::new())
+        .register_tool(tool)
+        .build()
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(e.reason().map(|r| r.as_str()), Some("INVALID_TIMEOUT"));
+}
+
+#[tokio::test]
+async fn an_agent_context_limit_overrides_the_global_one() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    let (big, _, _) = Probe::new("big", Behavior::Big(2_000));
+    for i in 0..8 {
+        push_call(&gw, &format!("c{i}"), "big", &format!("n{i}"));
+    }
+    gw.push_text("final report");
+    // Global giữ mặc định (100k token): chỉ giới hạn riêng của agent mới ép compaction.
+    let mut cfg = env.config(vec![env.root(&["big"]).with_context_limit_tokens(3_000)]);
+    cfg.runtime.compaction_threshold_percent = 50;
+    cfg.runtime.compaction_keep_recent = 2;
+    let (o, sid) = root_session(&env, cfg, &gw, vec![big]).await;
+
+    let r = run_turn(&o, &sid, OBJECTIVE).await;
+    assert_eq!(r.status, RunStatus::Completed, "{r:?}");
+    assert!(
+        !checkpoints(&env).await.is_empty(),
+        "the agent limit must trigger compaction"
+    );
+}
+
+#[tokio::test]
+async fn a_zero_agent_context_limit_is_rejected_at_build() {
+    let env = Env::new();
+    let cfg = env.config(vec![env.root(&[]).with_context_limit_tokens(0)]);
+    let e = Orchestrator::builder(cfg)
+        .with_gateway(ScriptedGateway::new())
+        .build()
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(
+        e.reason().map(|r| r.as_str()),
+        Some("INVALID_RUNTIME_CONFIG")
+    );
+}

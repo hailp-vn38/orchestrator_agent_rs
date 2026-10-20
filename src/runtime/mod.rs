@@ -57,8 +57,10 @@ pub(crate) struct ContextPolicy {
 }
 
 impl ContextPolicy {
-    fn threshold(&self) -> usize {
-        self.limit_tokens
+    /// Ngưỡng compaction; `agent_limit` (nếu agent khai báo) thay cho limit toàn cục.
+    fn threshold(&self, agent_limit: Option<usize>) -> usize {
+        agent_limit
+            .unwrap_or(self.limit_tokens)
             .saturating_mul(usize::from(self.threshold_percent))
             / 100
     }
@@ -78,11 +80,21 @@ pub(crate) struct AgentRuntime {
     emitter: Emitter,
 }
 
+/// Kết quả của một lần `execute`: supervisor dựa vào đây để quyết định thử lại.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum Settlement {
+    /// Run đã ở trạng thái terminal bền vững (hoặc vốn đã terminal ở nơi khác).
+    Terminal,
+    /// Không commit được trạng thái kế tiếp; run vẫn `running` và cần thử lại.
+    Unsettled,
+}
+
 /// Kết luận của một bước điều phối: tiếp tục vòng lặp hay kết thúc `execute`.
 enum Flow {
     Continue,
     /// Giá trị trả về của `execute` (xem doc của nó).
-    Stop(bool),
+    Stop(Settlement),
 }
 
 impl AgentRuntime {
@@ -110,9 +122,10 @@ impl AgentRuntime {
         }
     }
 
-    /// Chạy một run đã được claim. Trả `true` khi run đã ở trạng thái terminal bền vững
-    /// (hoặc vốn đã terminal); `false` khi không commit được (supervisor sẽ sweep lại).
-    pub(crate) async fn execute(&self, run_id: &str, cancel: &CancellationToken) -> bool {
+    /// Chạy một run đã được claim. [`Settlement::Terminal`] khi run đã ở trạng thái terminal
+    /// bền vững (hoặc vốn đã terminal); [`Settlement::Unsettled`] khi không commit được
+    /// (supervisor thử lại có backoff).
+    pub(crate) async fn execute(&self, run_id: &str, cancel: &CancellationToken) -> Settlement {
         let span = tracing::info_span!(
             "agent_run",
             run_id = %run_id,
@@ -121,11 +134,11 @@ impl AgentRuntime {
         self.execute_inner(run_id, cancel).instrument(span).await
     }
 
-    async fn execute_inner(&self, run_id: &str, cancel: &CancellationToken) -> bool {
+    async fn execute_inner(&self, run_id: &str, cancel: &CancellationToken) -> Settlement {
         let run = match self.store.load_run(run_id).await {
             Ok(Some(r)) if r.status == RunStatus::Running => r,
-            Ok(_) => return true,
-            Err(_) => return false,
+            Ok(_) => return Settlement::Terminal,
+            Err(_) => return Settlement::Unsettled,
         };
         tracing::Span::current().record("session_id", tracing::field::display(&run.session_id));
         self.emitter
@@ -145,7 +158,7 @@ impl AgentRuntime {
         // `running` mà chưa có result nghĩa là outcome không xác định → chặn, không replay.
         let mut pending = match self.store.pending_invocations(run_id).await {
             Ok(p) => p,
-            Err(_) => return false,
+            Err(_) => return Settlement::Unsettled,
         };
         if pending.iter().any(|p| p.started) {
             return self
@@ -172,7 +185,7 @@ impl AgentRuntime {
             // Tới cap: request text-only, response là kết quả của run (không tạo run mới).
             let capped = match (agent.steps, self.store.run_steps(run_id).await) {
                 (Some(limit), Ok(done)) => done >= limit,
-                (_, Err(_)) => return false,
+                (_, Err(_)) => return Settlement::Unsettled,
                 _ => false,
             };
             let (response, step_id) = match self.model_step(&run, &eff, capped, cancel).await {
@@ -207,7 +220,7 @@ impl AgentRuntime {
                                 .run_terminal(run_id, RunStatus::Completed, None)
                                 .await;
                         }
-                        true
+                        Settlement::Terminal
                     }
                     Err(_) => {
                         // Không để terminal dở dang: thử ghi failed; nếu cũng lỗi thì sweep lại.
@@ -247,8 +260,9 @@ impl AgentRuntime {
                 .await
             {
                 Ok(Some(p)) => p,
-                Ok(None) => return true, // run đã terminal ở nơi khác
-                Err(_) => return false,  // chưa có invocation nào → sweep gọi lại LLM, an toàn
+                Ok(None) => return Settlement::Terminal, // run đã terminal ở nơi khác
+                // Chưa có invocation nào → thử lại (có backoff) sẽ gọi lại LLM, an toàn.
+                Err(_) => return Settlement::Unsettled,
             };
             self.emitter
                 .committed_run(

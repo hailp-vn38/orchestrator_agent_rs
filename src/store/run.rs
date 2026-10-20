@@ -8,6 +8,7 @@ use crate::types::{AgentResult, CallerContext, ResultError, RunStatus};
 use sqlx::Row;
 
 impl SessionStore {
+    #[cfg(test)]
     pub(crate) async fn running_run_ids(&self) -> Result<Vec<String>, OrchestratorError> {
         sqlx::query_scalar(
             "SELECT id FROM agent_runs WHERE status = 'running' ORDER BY started_at, id",
@@ -15,6 +16,27 @@ impl SessionStore {
         .fetch_all(&self.pool)
         .await
         .map_err(db("list running runs"))
+    }
+
+    /// Mọi claim `running` theo thứ tự admission, kèm cờ child (session có parent) để
+    /// supervisor áp giới hạn concurrency chỉ cho root.
+    pub(crate) async fn running_claims(&self) -> Result<Vec<(String, bool)>, OrchestratorError> {
+        let rows = sqlx::query(
+            "SELECT r.id, s.parent_session_id IS NOT NULL AS is_child FROM agent_runs r \
+             JOIN sessions s ON s.id = r.session_id WHERE r.status = 'running' \
+             ORDER BY r.started_at, r.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db("list running runs"))?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get("id").map_err(db("read run id"))?,
+                    r.try_get("is_child").map_err(db("read child flag"))?,
+                ))
+            })
+            .collect()
     }
 
     pub(crate) async fn load_run(

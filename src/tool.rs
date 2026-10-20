@@ -5,6 +5,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::json;
 
@@ -300,6 +301,12 @@ impl From<OrchestratorError> for ToolError {
 #[async_trait::async_trait]
 pub trait HostTool: Send + Sync {
     fn descriptor(&self) -> ToolDescriptor;
+
+    /// Timeout riêng của một thao tác tool này; `None` = `RuntimeConfig::tool_timeout`.
+    /// Phải `> 0` (kiểm tra lúc build). Quá hạn được phân loại theo `effect` như timeout chung.
+    fn timeout(&self) -> Option<Duration> {
+        None
+    }
 
     async fn execute(
         &self,

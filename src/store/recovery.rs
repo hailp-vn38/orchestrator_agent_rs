@@ -22,13 +22,19 @@ pub(crate) const CODE_SHUTTING_DOWN: &str = "SHUTTING_DOWN";
 pub(crate) const CODE_CONFIG_CHANGED: &str = "PROVIDER_CONFIG_CHANGED";
 pub(crate) const CODE_BLOCKED: &str = "RECOVERY_BLOCKED";
 pub(crate) const CODE_EXHAUSTED: &str = "RECOVERY_ATTEMPTS_EXHAUSTED";
+/// Supervisor bỏ cuộc sau nhiều lần liên tiếp không commit được (store ghi lỗi kéo dài).
+/// Phục hồi được ở lần khởi động sau, theo đúng điều kiện an toàn như mọi attempt khác.
+pub(crate) const CODE_STORE_UNAVAILABLE: &str = "STORE_UNAVAILABLE";
+/// Child turn không được resume vì tool call `subagent` của parent đã có kết quả (parent đã
+/// nhận lỗi và đi tiếp): không ai tiêu thụ output nữa. Không chặn admission của child session.
+pub(crate) const CODE_DELEGATION_CLOSED: &str = "DELEGATION_CLOSED";
 /// Operator xác nhận tool không tạo side effect: invocation thành technical failure.
 pub(crate) const CODE_NO_EFFECT: &str = "TOOL_NO_EFFECT_CONFIRMED";
 
 /// `error_code` của một attempt `interrupted` mà startup/operator được phép thử phục hồi.
 /// `RECOVERY_ATTEMPTS_EXHAUSTED` cố ý không có ở đây: cần người xử lý, không vòng lặp vô hạn.
 const RECOVERABLE_CODES: &str = "'INTERRUPTED','SHUTTING_DOWN','TOOL_OUTCOME_UNKNOWN',\
-                                 'PROVIDER_CONFIG_CHANGED','RECOVERY_BLOCKED'";
+                                 'PROVIDER_CONFIG_CHANGED','RECOVERY_BLOCKED','STORE_UNAVAILABLE'";
 
 /// Điều kiện của attempt đáng được phục hồi (tham số `r` là alias của `agent_runs`): attempt
 /// mới nhất của turn mới nhất trong session, đã `interrupted` vì lý do phục hồi được, và
@@ -380,6 +386,19 @@ async fn recover_run_inner(
         tracing::warn!(session_id = %session_id, run_id, code, "recovery blocked");
         return Ok(TurnRecovery::Blocked(code));
     }
+    if delegation_closed(tx, &session_id, &turn_id).await? {
+        set_blocked(
+            tx,
+            run_id,
+            &session_id,
+            current_code.as_deref(),
+            CODE_DELEGATION_CLOSED,
+            "the delegating tool call already has a result; the subagent turn was not resumed",
+        )
+        .await?;
+        tracing::info!(session_id = %session_id, run_id, "child turn not resumed: delegation closed");
+        return Ok(TurnRecovery::NotApplicable);
+    }
     let route = route.expect("route checked above");
 
     let next = attempt + 1;
@@ -463,6 +482,25 @@ async fn load_unsettled(
             })
         })
         .collect()
+}
+
+/// Tool call `subagent` của parent đã giao `child_turn` và đã có kết quả cuối (parent đã đi
+/// tiếp). `false` cho root session hoặc khi parent vẫn đang chờ (vd. cùng bị ngắt do crash).
+async fn delegation_closed(
+    tx: &mut sqlx::SqliteConnection,
+    child_session: &str,
+    child_turn: &str,
+) -> Result<bool, OrchestratorError> {
+    let closed: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM tool_invocations WHERE child_session_id = ?1 AND child_turn_id = ?2 \
+         AND status IN ('completed', 'failed', 'cancelled')",
+    )
+    .bind(child_session)
+    .bind(child_turn)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db("read delegating invocation"))?;
+    Ok(closed.is_some())
 }
 
 /// Child turn đang ở trạng thái chờ operator/config (không phải terminal cuối cùng).

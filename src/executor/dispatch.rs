@@ -110,7 +110,8 @@ impl ToolExecutor {
             cancelled.store(true, Ordering::Release);
             std::future::pending::<()>().await;
         };
-        let timed = tokio::time::timeout(self.limits.timeout, async {
+        let limit = tool.timeout().unwrap_or(self.limits.timeout);
+        let timed = tokio::time::timeout(limit, async {
             tokio::select! {
                 r = guarded => r,
                 () = watcher => unreachable!("the cancel watcher never completes"),
