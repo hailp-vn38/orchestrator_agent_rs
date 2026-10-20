@@ -24,6 +24,7 @@ SQLite + SQLx, WAL, `foreign_keys=ON`, `busy_timeout`, một shared Rust process
 - `CREATE UNIQUE INDEX ... ON agent_runs(session_id) WHERE status='running'` là **single active run admission**. Không dùng `sessions.active_run_id`, không dùng cùng lúc một per-session mutex khác ở MVP.
 - `child_session_id` là nullable FK đến `sessions(id)`. Khi không null, `tool_name` phải là `subagent`; app kiểm tra `child.parent_session_id = parent invocation.session_id` và owner/workspace.
 - `session.status` chỉ `open/archived`. Failed/timed-out là **run state**, không phải session state.
+- `sessions.state_revision` là monotonic UI revision **theo session**, tăng trong transaction khi committed run/message/invocation/link/compaction state thay đổi. **Không** thêm `events` table hoặc lưu từng token delta.
 
 ## 9.4. Transactions quan trọng
 
@@ -39,7 +40,7 @@ Một transaction: lấy và tăng `sessions.next_sequence`, insert message đú
 
 1. AgentRuntime persist assistant message có tool calls và `tool_invocations` trạng thái `requested` **trước** khi execute.
 2. Với `subagent` lần đầu: `TaskManager` tạo child session và update `tool_invocations.child_session_id` trong một transaction ngắn. Khi resume: check ownership rồi link child cũ.
-3. AgentRuntime persist tool-result message **cùng transaction** với update invocation `completed/failed`. Final assistant message và `finish_run(completed)` được ghi bền vững trước khi báo thành công.
+3. AgentRuntime persist tool-result message **cùng transaction** với update invocation `completed/failed`; tăng `sessions.state_revision` rồi publish terminal SSE event **sau commit**. Final assistant message và `finish_run(completed)` được ghi bền vững trước khi báo thành công.
 4. Tool call thiếu confirmed result sau crash ở trạng thái `interrupted`: **không tự retry**, không tự tạo fake result để tiếp tục model. Cần reconciliation hoặc quyết định của Root/User.
 
 ## 9.5. Startup recovery (single instance)
@@ -57,3 +58,7 @@ WAL, FK per connection, busy timeout; pool nhỏ (1–5 connections) và transac
 ## 9.8. Compaction checkpoint (không thêm bảng)
 
 `messages.role='compaction'` chứa JSON gồm `summary`, `keep_from_sequence`, `version`, `model_ref`. `PromptBuilder` dùng checkpoint mới nhất + recent **complete** turns, original messages vẫn còn. `messages.role='synthetic'` chứa internal restart continuation marker, không giả danh user input. `agent_runs.turn_id` và `resume_attempt` hỗ trợ recovery bounded. SQLite migration ví dụ đã cập nhật tương ứng. Xem [15](15-long-running-sessions.md).
+
+## 9.9. Session-family snapshot (SSE reconnect)
+
+`SessionStore.family_snapshot(root_id)` đọc family membership và per-session committed state/revision trong một transaction ngắn; history dài phân trang. `state_revision` không phải `next_sequence` hay SSE cursor. Committed notifications chỉ invalidate snapshot; không rebuild state bằng cách merge event payload. Xem [16](16-streaming-events.md).

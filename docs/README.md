@@ -1,10 +1,10 @@
 # Orchestrator Agent RS — Tài liệu thiết kế
 
-**Trạng thái:** Baseline **v3 — OpenCode-style continuous session execution** · **Ngày:** 2026-10-20 · **Đích:** Repository `hailp-vn38/orchestrator_agent_rs`
+**Trạng thái:** Baseline **v4.1 — Continuous Sessions + SSE Observability, post-review** · **Ngày:** 2026-10-20 · **Đích:** Repository `hailp-vn38/orchestrator_agent_rs`
 
 Bộ tài liệu là **thiết kế dự kiến**, không khẳng định source code đã được triển khai. Mô hình tham khảo: OpenCode `anomalyco/opencode`, nhưng implementation mới sử dụng Rust, Tokio, crate `llm`, SQLx và SQLite.
 
-## Thay đổi chính trong bản v3
+## Thay đổi chính trong bản v4.1
 
 - Không còn `OrchestratorEngine` và `ContextManager` riêng; `PromptBuilder` tạo context, `AgentRuntime` persist transcript.
 - Chỉ 4 bảng SQLite: `sessions`, `messages`, `agent_runs`, `tool_invocations`; delegation liên kết child bằng `tool_invocations.child_session_id`.
@@ -14,6 +14,8 @@ Bộ tài liệu là **thiết kế dự kiến**, không khẳng định source
 - Auto summary compaction trước khi context đầy; recovery bounded sau restart ở safe point.
 - Foreground child trước; background subagent notifications sau MVP. Không bắt buộc semantic validation.
 - Side-effect tool outcome sau crash có thể unknown: không tự replay.
+- **SSE quan sát Root/Child/Tool từ MVP**: live text delta và tool progress, committed state trong SQLite; disconnect không ngừng run.
+- Snapshot + `sessions.state_revision` để resync client; committed events invalidate snapshot, không apply state patches; không lưu token hoặc SSE historical replay.
 
 ## Mục lục
 
@@ -27,7 +29,7 @@ Bộ tài liệu là **thiết kế dự kiến**, không khẳng định source
 | [05. Tool](05-tools.md) | Tool registry, execution, permissions, tool result và error |
 | [06. Giao tiếp Root ↔ Subagent](06-delegation.md) | `subagent` tool, kết quả, resume, failure, background sau MVP |
 | [07. Session & Context](07-sessions-context.md) | Parent–child sessions, history, compaction, isolation |
-| [08. Shared Runtime & LLM](08-runtime-llm.md) | Agent loop, Tokio, multi-provider, budget; streaming sau MVP |
+| [08. Shared Runtime & LLM](08-runtime-llm.md) | Agent loop, Tokio, multi-provider, budget; SSE streaming trong MVP |
 | [09. SQLite Persistence](09-persistence.md) | Schema, transaction, WAL, crash recovery |
 | [10. Security & Operations](10-security-operations.md) | Permission enforcement, secret, file access, tracing |
 | [11. End-to-end Flows](11-flows.md) | Mermaid sequence diagrams cho các kịch bản chính |
@@ -35,6 +37,7 @@ Bộ tài liệu là **thiết kế dự kiến**, không khẳng định source
 | [13. ADRs](13-adrs.md) | Quyết định kiến trúc và alternatives |
 | [14. Glossary](14-glossary.md) | Thuật ngữ chung trong codebase |
 | [15. Long-running Sessions](15-long-running-sessions.md) | Continuous run, compaction, recovery, step limit tùy chọn, cancellation |
+| [16. Streaming & Events](16-streaming-events.md) | SSE, Root/Child tracking, tool progress, event schema, snapshot/reconnect, backpressure |
 
 ## Tài liệu mẫu
 
@@ -64,7 +67,7 @@ Bộ tài liệu là **thiết kế dự kiến**, không khẳng định source
 - OpenCode session context: https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/context.ts
 - Rust `llm`: https://docs.rs/llm/latest/llm/
 
-**Lưu ý:** Thiết kế tham khảo hành vi OpenCode, không sao chép mã nguồn hoặc bảo đảm tương thích binary/API. Trước khi code cần khoá phiên bản crate và chạy spike xác minh tool calling, streaming của các provider thực tế.
+**Lưu ý:** Thiết kế tham khảo hành vi OpenCode, không sao chép mã nguồn hoặc bảo đảm tương thích binary/API. Trước khi code cần khoá phiên bản crate và chạy spike xác minh text/tool-call streaming và timeout của các provider thực tế.
 
 ## OpenCode long-running references
 
@@ -73,4 +76,12 @@ Bộ tài liệu là **thiết kế dự kiến**, không khẳng định source
 - Context compaction: https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/compaction.ts
 - Restart recovery: https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/execution/restart.ts
 
-Thiết kế v3 là mục tiêu triển khai trong Rust; chưa khẳng định source code Rust đã hiện thực các tính năng trên.
+Thiết kế v4.1 là mục tiêu triển khai trong Rust; chưa khẳng định source code Rust đã hiện thực các tính năng trên.
+
+## Streaming references
+
+- OpenCode event schema: https://github.com/anomalyco/opencode/blob/dev/packages/schema/src/session-event.ts
+- OpenCode V2 event stream design: https://github.com/anomalyco/opencode/blob/dev/specs/v2/event-stream-architecture.md
+- OpenCode subagent tracker: https://github.com/anomalyco/opencode/blob/dev/packages/tui/src/mini/stream-v2.subagent.ts
+
+Bản v4.1 thay đổi ToolCallReady ordering, committed invalidation, ToolContext::progress và sự kiện Subagent/Skill qua generic tool events. Chỉ tài liệu được commit, chưa triển khai Rust code.

@@ -133,3 +133,15 @@ Mỗi quyết định dưới đây có trạng thái **Accepted** theo thảo l
 **Why:** Task nhiều giờ phải sống qua disconnect/restart, tránh crash loops và side-effect duplication.
 
 **Consequences:** Cần admission, checkpoints, recovery idempotence và cơ chế unblock. Không cần business Task scheduler chỉ để vượt step cap.
+
+## ADR-014 — Streaming Ephemeral Events + Durable Session Snapshots
+
+**Status:** Accepted (2026-10-20); reviewed and committed with v4.1 documentation.
+
+**Decision:** LlmGateway chuẩn hóa provider text/tool-call stream; AgentRuntime phát lifecycle events, ToolExecutor thông báo progress qua ToolContext. Dùng concrete `ExecutionFeed`/Tokio broadcast và Axum SSE để theo dõi cả Root/Child sessions. **SQLite giữ canonical states** và thêm `sessions.state_revision`, không thêm event store hay persist từng token. Committed events phát sau transaction, ephemeral deltas/progress không được replay. Client subscribe trước snapshot, committed notifications invalidate canonical view và trigger debounced snapshot refresh; không merge SSE payloads thành state patches. SSE disconnect không hủy run.
+
+**Why:** Task hàng giờ cần live observability, tool/child visibility và reconnect; thiết kế deep modules giữ ToolExecutor độc lập HTTP, SessionStore là owner của state, tránh duplicated data/event infrastructure.
+
+**Alternatives rejected:** WebSocket ngay từ MVP, Kafka/Redis, ghi mọi delta vào SQLite, `Last-Event-ID` replay chưa có durable log, per-agent event modules hoặc UI trực tiếp query TaskManager internals.
+
+**Consequences:** Realtime stream best-effort, preview có thể mất; cần revision, family auth, bounded broadcast lag policy, terminal publish-after-commit và out-of-order invalidation tests. **Step ordering:** đợi provider stream `Finished` rồi persist mọi tool calls trước khi dispatch tuần tự, không execute từ `ToolCallReady` giữa stream. Nếu cần lossless event timeline, tạo ADR mới và durable event-log riêng. Chi tiết: [16 — Streaming](16-streaming-events.md).

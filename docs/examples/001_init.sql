@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     workspace_id TEXT NOT NULL DEFAULT 'default',
     status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','archived')),
     next_sequence INTEGER NOT NULL DEFAULT 1 CHECK (next_sequence >= 1),
+    state_revision INTEGER NOT NULL DEFAULT 0 CHECK (state_revision >= 0),
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
     CHECK (id <> COALESCE(parent_session_id,''))
@@ -84,3 +85,11 @@ CREATE INDEX IF NOT EXISTS idx_invocations_child ON tool_invocations(child_sessi
 -- 9) mutating tool outcome unknown => block; never replay without reconciliation
 -- 10) messages.role='compaction' JSON has summary/keep_from_sequence/version;
 --     original messages remain stored and checkpoint frontier preserves complete tool pairs
+
+-- Streaming/reconnect invariants (no event_log table):
+-- 11) Every transaction that changes committed session-visible state bumps
+--     sessions.state_revision once per affected session; publish SSE terminal
+--     events only AFTER commit using the returned revision.
+-- 12) sessions.next_sequence is only for message ordering; not UI state revision.
+-- 13) ephemeral model text/tool progress deltas are not stored in SQLite.
+-- 14) family_snapshot reads parent/child canonical states in one read transaction.

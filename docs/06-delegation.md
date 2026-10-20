@@ -107,3 +107,7 @@ Background (`background=true`), output `running`, durable synthetic notification
 ## 6.9. Subagent chạy hàng giờ
 
 `TaskManager.delegate` foreground chờ child session execution hoàn thành, không dùng `child_timeout_s` cho toàn chuỗi. Child có thể thực hiện nhiều model/tool steps và auto compaction trước khi trả final text. Client HTTP disconnect **không** tự cancel parent; explicit cancel propagate parent → child. Sau restart, child phải recover/reconcile an toàn trước khi parent nhận final. Nếu `steps` được cấu hình trên child, report tại cap chỉ là execution outcome; Root vẫn tự đánh giá và có thể follow-up cùng `session_id`. Xem [15](15-long-running-sessions.md).
+
+## 6.10. Live child observation
+
+Foreground Root await child nhưng family SSE vẫn thấy child `run/step/text/tool` events. `subagent` và `skill` không cần custom lifecycle events: dùng `tool_name`, child session link và `session.changed` để invalidate snapshot. Parent `tool.completed` chỉ sau child final và parent result commit. Chi tiết protocol ở [16 — Streaming](16-streaming-events.md).

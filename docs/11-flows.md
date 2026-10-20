@@ -145,3 +145,31 @@ Xem [15](15-long-running-sessions.md) cho admission/stop/recovery.
 ## 11.8. Sau MVP
 
 Background Subagent notification + durable parent inbox, parallel child jobs, provider-native compaction và artifact store. Summary compaction và restart recovery thuộc lõi MVP.
+
+## 11.9. SSE streaming & snapshot/resync (MVP)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as UI
+    participant E as Axum SSE
+    participant B as ExecutionFeed
+    participant R as AgentRuntime
+    participant D as SQLite
+    U->>E: GET /sessions/root/events?include_children=true
+    E->>B: subscribe live before snapshot
+    E-->>U: stream.connected
+    U->>D: GET /sessions/root/snapshot
+    D-->>U: family + per-session revisions
+    R->>D: persist tool requested + bump revision
+    R->>B: tool.started (committed revision)
+    B-->>U: tool.started
+    R->>B: text.delta / tool.progress (ephemeral)
+    B-->>U: text.delta / tool.progress
+    R->>D: persist result + bump revision
+    R->>B: tool.completed (committed revision)
+    B-->>U: tool.completed
+    Note over U,E: Connection lost or lagged -> re-subscribe + snapshot
+```
+
+Child Tool/LLM events sử dụng session riêng nhưng cùng root family. Các committed event revisions **invalidation → debounce snapshot refresh**, không merge state patches. SQLite không lưu token fragments; SSE disconnect không điều khiển run. Xem [16](16-streaming-events.md).

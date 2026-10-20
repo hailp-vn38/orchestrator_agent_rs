@@ -20,7 +20,7 @@ Credentials từ environment/secret store. Không đưa keys, sensitive request 
 
 Sử dụng `tracing` spans làm parent-child hierarchy: run span có `session_id`, `run_id`, `agent_id`; subagent child span thêm `parent_session_id` và `tool_call_id`; model span thêm `provider_id`, `model_id`; tool span thêm name/status. Không ép mọi event mang tất cả identifiers.
 
-Các sự kiện hữu ích: `run.started/finished`, `tool.started/finished`, `subagent.created/resumed`, `skill.loaded`. Metrics tokens/cost/timing gắn vào event có dữ liệu tương ứng; không chế số token chính xác nếu provider không trả.
+`tracing` có thể ghi nội bộ thông tin `subagent.created/resumed` và `skill.loaded`; **SSE public không phát event riêng trùng lặp**: sử dụng `tool.*`/`session.changed`, `run.*`. Metrics tokens/cost/timing gắn vào event có dữ liệu; không tự tạo usage giả.
 
 ## 10.5. Runtime limits
 
@@ -29,6 +29,12 @@ Depth=1 trong MVP. `agent.steps` tùy chọn, mặc định không có step cap.
 ## 10.6. Recovery & safety tests
 
 - Trace nối được Root → Subagent → Skill → Tool, kiểm tra secrets không bị leak.
+- SSE + snapshot endpoints phải authorize root ownership/child ancestry/workspace; nhận child tạo sau subscription, không leak event của tenant khác. Redact tool args/results/secrets/private reasoning khỏi public events.
+- Lagged SSE reader nhận resync signal/connection close; **không** làm nghẽn publisher/AgentRuntime. Event stream disconnect không đồng nghĩa explicit cancel.
 - Parent cancel dừng child (nếu provider/tool hỗ trợ cancel) và persist trạng thái interrupted/cancelled thích hợp.
 - Restart có thể tự resume safe execution cùng `turn_id` qua new attempt (bounded). Nếu pending mutating-tool outcome unknown thì **block và reconcile** trước khi chạy tiếp; không tự replay.
 - SQLite admission bằng unique partial index: hai run đồng thời trên cùng session chỉ một được chấp nhận.
+
+## 10.7. Realtime event privacy
+
+Event payload cho UI độc lập với transcript/LLM payload: có redaction và giới hạn riêng, đặc biệt tool arguments, shell command outputs và provider metadata. Không stream hidden chain-of-thought, API credentials hay thông tin workspace ngoài quyền truy cập. Theo dõi family phải được xác thực với cùng owner/workspace cho mọi child, kể cả child phát sinh sau khi SSE bắt đầu. Xem [16](16-streaming-events.md).

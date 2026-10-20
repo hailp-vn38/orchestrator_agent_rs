@@ -11,13 +11,14 @@
 | M4 — Parent–Child | TaskManager, subagent foreground + resume; link `child_session_id` với invocation | Root gọi child provider khác, nhận final text và follow-up same session. |
 | M5 — Long-running | Managed continuous execution, no default steps cap, summary compaction | >100 steps và client disconnect không dừng run; context giảm bằng checkpoint. |
 | M6 — Recovery & Safety | Bounded restart resume, tool reconciliation, cancellation, tracing | Safe execution tự resume; uncertain mutation không replay; unique index bảo vệ concurrent runs. |
+| M7 — Live Events & SSE | LlmGateway.stream, ToolContext.progress, Root/Child event family, snapshot/reconnect | Thấy child/tools live, SSE disconnect không dừng run; reconnect phục hồi canonical state. |
 
 ## 12.2. Test pyramid
 
 - **Unit:** Agent selection, permissions, prompt assembly, skill metadata, JSON tool input parsing.
 - **Integration:** SQLx real SQLite temp DB, session parent ID, message sequencing, restart recovery, race conditions.
 - **Fake LLM:** deterministic scripted tool calls/text/error, test loop and Root continuation without live provider.
-- **Provider smoke:** ít nhất hai providers cho text, tool call/result, usage, timeout; chạy trong môi trường test có credentials. Streaming thử nghiệm trong spike, không bắt buộc cho MVP.
+- **Provider smoke:** ít nhất hai providers cho text delta, tool call/result assembly, usage, timeout và error mid-stream; test streaming **bắt buộc cho MVP** với fallback nếu tool stream capability thiếu.
 - **E2E:** Axum API + SQLite + skill + subagent multi-turn.
 
 ## 12.3. Acceptance tests chi tiết
@@ -49,6 +50,18 @@
 | AT-23 | Crash tại safe point | Auto resume bounded attempt trong same turn_id. |
 | AT-24 | Crash giữa write và confirmed result | Block; không replay mutation khi outcome unknown. |
 | AT-25 | HTTP disconnect sau `202 Accepted` | Managed run tiếp tục; client query status/history được. |
+| AT-26 | Provider stream 20 text fragments | Live text đúng thứ tự; chỉ full committed assistant message được lưu SQLite. |
+| AT-27 | Provider chia tool arguments qua nhiều fragments | Tool không execute cho đến khi toàn provider response `Finished`, tất cả calls hợp lệ và persisted. |
+| AT-28 | Tool có progress và final result | Live progress có thể mất; terminal tool event sau SQLite commit và snapshot tái dựng được. |
+| AT-29 | Foreground child đang chạy + Root chờ | SSE family nhìn thấy Child events trước khi parent tool result hoàn tất. |
+| AT-30 | SSE reader chậm bị broadcast Lagged | Reader resync/đóng riêng; execution + reader khác tiếp tục bình thường. |
+| AT-31 | SSE reconnect/snapshot race với child vừa tạo | Committed events làm refresh family snapshot; client hội tụ đúng child list/terminal state. |
+| AT-32 | Subscribe child khác owner hoặc stream có secret | Deny/redact, không rò rỉ dữ liệu. |
+| AT-33 | DB terminal transaction fail | Không phát confirmed `tool.completed`/`run.completed` giả. |
+| AT-34 | Server crash giữa mutation/tool result | Recovery đánh dấu interrupted, không replay, SSE snapshot hiển thị unresolved. |
+| AT-35 | Provider stream ToolCallReady rồi lỗi trước Finished | Không execute tool và không persist unconfirmed invocation. |
+| AT-36 | Assistant response gồm hai tools | Persist đủ calls rồi dispatch tuần tự; next LLM step chỉ sau cả hai results. |
+| AT-37 | SQLite commits rev 15 rồi 16 nhưng SSE publish 16 trước 15 | Snapshot refresh >=16, không mất canonical state hay bị rollback UI. |
 
 ## 12.4. Definition of Done
 
@@ -59,6 +72,7 @@
 - E2E một session nhiều model steps, auto compaction và safe restart, không step cap mặc định.
 - Bổ sung ít nhất một provider thứ hai để chứng minh model routing.
 - Failure trả error có code; tracing spans có session/run/tool-call IDs và child linkage khi relevant.
+- SSE + session family snapshots là acceptance scope của MVP, không deferred. Replay toàn bộ delta events/WebSocket chỉ sau MVP. Xem [16](16-streaming-events.md).
 
 ## 12.5. Tính năng để sau
 

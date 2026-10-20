@@ -38,3 +38,17 @@
 | **Recovery Attempt** | Run mới cùng `turn_id` sau restart, `resume_attempt` bounded để tránh crash-loop. |
 | **Execution Claim** | Durable `agent_runs.status=running` dùng cho startup recovery + single-run admission. |
 | **Outcome Unknown** | Trạng thái tool side-effect đã được yêu cầu nhưng chưa có durable result sau crash; không tự replay. |
+
+## Streaming additions
+
+| Thuật ngữ | Định nghĩa |
+|---|---|
+| **ExecutionFeed** | Concrete Rust module phân phối typed execution events qua Tokio broadcast; không lưu transcript. |
+| **Committed Event** | Event báo state đã commit vào SQLite; có `state_revision`, có thể tái dựng current state từ snapshot. Không nhất thiết replay được SSE frame. |
+| **Ephemeral Event** | Live-only delta, progress, step signals; có thể mất khi disconnect. |
+| **Session Family** | Root session và các child sessions của nó; UI theo dõi bằng root ID và parent-child relationship. |
+| **Family Snapshot** | SQLite read-transaction trả canonical state của Root/child cùng per-session revisions. |
+| **State Revision** | `sessions.state_revision` tăng cho mỗi transaction thay đổi durable UI state; không phải message sequence hay SSE replay cursor. |
+| **SSE** | Server-Sent Events: HTTP server → client, best-effort live feed, không phải command channel. |
+| **ToolContext::progress** | Method dùng private publisher của runtime để gửi tool.progress, không cho Tool phụ thuộc Axum/SSE. |
+| **Resync** | Khi reconnect/Lagged, mở SSE trước, lấy snapshot; committed events invalidate view để refresh, partial previews chưa confirmed bị bỏ. |

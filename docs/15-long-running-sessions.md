@@ -40,7 +40,7 @@ flowchart TD
 
 ## 15.4. HTTP-independent admission
 
-`POST /sessions/{id}/messages` atomically persists input and `agent_runs.status='running'` claim before returning `202 Accepted(session_id,turn_id)`. Managed Tokio tasks have an owner/supervisor and are not canceled merely by client disconnect. `GET /sessions/{id}/status` and `GET /sessions/{id}/messages` provide status/history. Streaming/SSE is a later UX enhancement.
+`POST /sessions/{id}/messages` atomically persists input and `agent_runs.status='running'` claim before returning `202 Accepted(session_id,turn_id)`. Managed Tokio tasks have an owner/supervisor and are not canceled merely by client disconnect. `GET /sessions/{id}/status` and `GET /sessions/{id}/messages` provide status/history. SSE observation + Root/Child session-family snapshot are part of the MVP (see [16](16-streaming-events.md)).
 
 One active run per session is enforced by unique partial index. Busy input returns `SESSION_BUSY` in MVP; queued/steer inbox like OpenCode can be added later. Foreground child may wait long for final text without a hard child timeout.
 
@@ -92,7 +92,7 @@ flowchart TD
 
 ## 15.9. Scope and verification
 
-**MVP core:** continuous loop, optional steps, durable admission, child without overall timeout, summary compaction, safe recovery and cancellation. **After MVP:** background Subagent notification/inbox, concurrent child jobs, provider-native compaction, rich event streaming and distributed scheduling.
+**MVP core:** continuous loop, optional steps, durable admission, child without overall timeout, summary compaction, safe recovery and cancellation. **After MVP:** background Subagent notification/inbox, concurrent child jobs, provider-native compaction, lossless event replay and distributed scheduling. SSE text/tool progress thuộc MVP.
 
 **Integration tests:** >100 model/tool steps no cap; configured 5-step text-only stop; child runs >120 seconds without timeout; context threshold checkpoint; provider overflow retried once; crash at safe boundary auto resume; crash with unknown write blocks; client disconnect after Accepted does not stop managed run.
 
@@ -105,3 +105,7 @@ flowchart TD
 - [Compaction docs](https://github.com/anomalyco/opencode/blob/dev/services/www/src/docs/content/compaction.mdx)
 - [Restart recovery](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/execution/restart.ts)
 - [Subagent tool](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/tool/plugin/subagent.ts)
+
+## 15.11. Quan sát task dài qua SSE
+
+Một turn chạy nhiều giờ không phụ thuộc lifetime của SSE/HTTP. Client subscribe vào Root **session family**, quan sát child tool calls và `text.delta` ngay cả khi Root đang chờ foreground child. Tool progress và partial deltas không lưu vĩnh viễn; sau reconnect client rehydrate canonical SQLite snapshot per-session revisions. Không sử dụng SSE làm nguồn kết quả/tool replay; commit state trước publish terminal event. Xem [16](16-streaming-events.md).

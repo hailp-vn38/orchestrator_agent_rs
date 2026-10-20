@@ -25,6 +25,11 @@ Xây **Multi-Agent Orchestrator** hỗ trợ Root Agent chủ động phân vi�
 | D-15 | Không đặt deadline cho toàn child/session; chỉ timeout từng LLM/tool operation. |
 | D-16 | Auto summary compaction với SQLite checkpoint khi context gần đầy, giữ nguyên full transcript. |
 | D-17 | Session restart recovery bounded, an toàn với uncertain tool side effects; không có business `Task` scheduler cho MVP. |
+| D-18 | SSE + unified execution events cho Root, Child, Tool, Skill và model text delta; stream độc lập với tuổi thọ run. |
+| D-19 | SQLite lưu canonical committed states và per-session `state_revision`; progress/delta ephemeral, không replay SSE qua `Last-Event-ID` trong MVP. |
+| D-20 | Client subscribe SSE trước, đọc session-family snapshot; committed events chỉ invalidate snapshot, không merge state patches; `Lagged` → resync. |
+| D-21 | Tool chỉ dispatch khi toàn provider response `Finished` và đầy đủ các tool calls đã persist; MVP dispatch tuần tự, next model step chờ mọi tool results. |
+| D-22 | `subagent`/`skill` sử dụng generic tool events; `ToolContext::progress` không cần public ProgressReporter; snapshot refresh theo invalidation thay vì event reducer. |
 
 ## 0.3. MVP bao gồm
 
@@ -34,6 +39,7 @@ Xây **Multi-Agent Orchestrator** hỗ trợ Root Agent chủ động phân vi�
 - Foreground `subagent`, child history riêng, Root tự đánh giá final text và follow-up qua session ID.
 - Auto summary compaction, durable checkpoint, keeping original messages.
 - Startup safe recovery (bounded), cancellation, technical errors và tracing.
+- **Streaming MVP:** LlmGateway normalized text/tool-call stream; SSE quan sát run/step/tool/progress và child sessions; authenticated session-family snapshot/resync.
 
 ## 0.4. Không thuộc MVP
 
@@ -41,6 +47,7 @@ Xây **Multi-Agent Orchestrator** hỗ trợ Root Agent chủ động phân vi�
 - Business `tasks` table, task scheduler độc lập, Redis/Kafka và distributed agents.
 - Background Subagent notification/inbox, parallel child runs, arbitrarily deep nesting, skill hot reload.
 - Provider-native compaction (MVP dùng summary). Không bảo đảm exactly-once cho mutating tools.
+- WebSocket; lossless SSE/event-log replay; persist từng text delta; event broker.
 
 ## 0.5. Giới hạn và cấu hình
 
@@ -56,6 +63,8 @@ Xây **Multi-Agent Orchestrator** hỗ trợ Root Agent chủ động phân vi�
 | `recovery.max_attempts_per_turn` | Ví dụ 10 | Chống crash-loop. |
 | `max_concurrent_children` | 1 ở MVP | Không phải giới hạn tổng số child gọi **tuần tự**. |
 | `max_tool_output_bytes/lines` | 50 KiB / 2.000 | Giới hạn model-visible result, không giới hạn full history. |
+| `events.broadcast_capacity` | Ví dụ 4.096 | Ring buffer realtime; lagged SSE client resync. |
+| `events.heartbeat_s` | Ví dụ 15 | Heartbeat riêng từng SSE connection, không ảnh hưởng runtime. |
 
 Các số tham chiếu là cấu hình gợi ý cho **dự án Rust**, không phải hard defaults của OpenCode. Cost/quota cap nếu được cấu hình, permission và explicit cancellation vẫn bắt buộc.
 

@@ -9,7 +9,7 @@ flowchart TB
     PB --> A[AgentRegistry - concrete]
     PB --> SK[SkillManager]
     PB --> S[SessionStore]
-    AR --> LL[LlmGateway / crate llm]
+    AR --> LL[LlmGateway / crate llm - stream]
     LL --> P[OpenAI / Anthropic / Gemini / Ollama]
     AR --> TX[ToolExecutor]
     AR --> EX[Managed Session Execution]
@@ -20,6 +20,12 @@ flowchart TB
     TM --> S
     TM -. borrowed runtime, not owned .-> AR
     S --> DB[(SQLite WAL)]
+    AR --> EV[ExecutionFeed / broadcast]
+    TX -->|Tool progress| EV
+    EV --> SSE[Axum SSE endpoint]
+    S --> SNAP[Family snapshot / revision]
+    SNAP --> SSE
+    SSE --> U
 ```
 
 **Không có `OrchestratorEngine` hoặc business task scheduler riêng trong MVP.** Root và Subagent đều dùng `AgentRuntime` với session-driven continuous execution. Parent và child **không chia sẻ history**, chỉ chia sẻ runtime, modules và storage.
@@ -34,7 +40,8 @@ flowchart TB
 | `ToolExecutor` | `execute(call, context)` | Validate input, permissions, dispatch, normalize/truncate result; **không persist message**. |
 | `SkillManager` | `available(agent)`, `load(session, skill_id)` | Scan `skills/` lúc startup, permission, safe local file reads. |
 | `TaskManager` | `delegate(request, runtime_ref)` | Check mode/ownership/depth, create/resume child, invoke child runtime, return final text. |
-| `LlmGateway` | `complete(model, context)` | Adapter crate `llm`, tool protocol conversion, multi-provider capability/errors. |
+| `LlmGateway` | `stream(model, context)` | Adapter crate `llm`, normalize text deltas + complete tool calls, provider capability/errors. |
+| `ExecutionFeed` | `publish(event)`, `subscribe()` | Concrete Tokio broadcast; typed event envelope + bounded live delivery, **không** persist event log. |
 | `AgentRegistry` | `get`, `list` | Concrete struct load YAML một lần lúc startup; chưa có trait/hot reload. |
 
 `TaskManager` chỉ được giữ nếu che giấu toàn bộ **delegation lifecycle**, không phải lớp chuyển tiếp mỏng. `LlmGateway` là seam có giá trị vì protocol và fake LLM thực sự khác nhau; không tạo thêm wrapper/provider traits khi chưa cần.
@@ -42,6 +49,8 @@ flowchart TB
 ## 1.3. Ownership và dependency rules
 
 - **`AgentRuntime` là nơi duy nhất điều phối việc ghi user/assistant/tool-call/tool-result/synthetic/compaction vào transcript** qua `SessionStore`. `ToolExecutor` chỉ trả `ToolOutcome`.
+- **Commit trước, publish committed event sau:** SQLite `state_revision` tăng trong transaction, rồi EventFeed phát lifecycle event. Progress/delta realtime không phải canonical state; `ToolContext.progress` gửi qua reporter thay vì Tool import SSE/EventBus.
+- `ExecutionFeed` là concrete Tokio broadcast; `api.rs` chịu auth/filter/heartbeat/lag signal, còn `SessionStore.family_snapshot` cung cấp canonical state. Committed notifications **chỉ invalidate snapshot**; text/tool progress vẫn live ephemeral.
 - `TaskManager` sở hữu logic tạo/tiếp tục child và chờ child qua `AgentRuntime.submit` + `wait`; liên kết `child_session_id` với tool invocation thông qua `SessionStore`. Nó **không** ghi bản sao output vào bảng `tasks`.
 - `ToolExecutor` gọi `TaskManager` cho `subagent`; chuyển borrowed `&AgentRuntime` ở execution time để tránh vòng sở hữu `Arc`. Nếu compiler yêu cầu do async recursion, box future **tại nhánh child invocation**, không thiết kế một tầng abstraction mới.
 - `PromptBuilder` là owner duy nhất của context construction; **không tạo `ContextManager` thứ hai**.
@@ -60,7 +69,8 @@ src/
 ├── tool.rs                 # ToolExecutor + tool types
 ├── subagent.rs             # TaskManager + subagent tool
 ├── session.rs              # SessionStore + session/run types
-├── llm.rs                  # LlmGateway + protocol mapping
+├── llm.rs                  # LlmGateway + streaming protocol mapping
+├── events.rs               # Concrete ExecutionFeed; ToolContext::progress uses private sender
 └── api.rs                  # minimal routes
 config/agents.yaml
 prompts/{base.md,root.md,reviewer.md}
@@ -88,4 +98,4 @@ Khởi đầu **một Cargo package**. Tách file/trait/crate khi thay đổi th
 
 ## 1.7. Sau MVP
 
-Background Subagent + durable parent inbox, parallel child jobs, provider-native compaction, artifact store, skill hot reload/multi-source và distributed workers.
+Background Subagent + durable parent inbox, parallel child jobs, provider-native compaction, **lossless event replay/WebSocket**, artifact store, skill hot reload/multi-source và distributed workers. SSE realtime + snapshot thuộc MVP. Xem [16](16-streaming-events.md).

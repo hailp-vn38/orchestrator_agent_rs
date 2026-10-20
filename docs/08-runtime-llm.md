@@ -4,21 +4,24 @@
 
 ```mermaid
 flowchart TD
-    A[Durable user / child input + execution claim] --> B[Managed session runner]
-    B --> C[PromptBuilder.build from checkpoint + history]
-    C --> D{Near context limit?}
-    D -->|Yes| E[Persist summary compaction checkpoint]
+    A[Durable input + execution claim] --> B[Managed session runner]
+    B --> C[PromptBuilder from checkpoint + history]
+    C --> D{Context near limit?}
+    D -->|Yes| E[Persist compaction checkpoint]
     E --> C
-    D -->|No| F[LlmGateway.complete]
-    F --> G{Tool calls?}
-    G -->|Yes| H[Persist calls then execute ToolExecutor]
-    H --> I[Persist tool result/error]
-    I --> B
-    G -->|Final| J[Persist final + complete run]
-    F -->|Terminal error| K[Persist failure / cancel]
+    D -->|No| F[LlmGateway.stream]
+    F --> G[Accumulate TextDelta preview + complete ToolCallReady]
+    G --> H{Provider response finished?}
+    H -->|Error/cancel| I[Discard unconfirmed calls; persist technical state]
+    H -->|Finished| J{Any tool calls?}
+    J -->|Yes| K[Commit assistant message + ALL requested invocations]
+    K --> L[Execute tools sequentially with progress]
+    L --> M[Commit every tool outcome and terminal state]
+    M --> B
+    J -->|No| N[Commit assistant final + run completed]
 ```
 
-**Một user turn có thể chạy hàng giờ với nhiều model/tool/subagent steps; không có `steps` cap mặc định.** Step cap tùy chọn đưa agent về text-only progress response và dừng tool, không tự fail hay spawn run mới. Context checkpoint được compact tự động, full SQLite transcript được giữ.
+**Không execute khi provider mới stream một `ToolCallReady`**: tất cả tool calls phải có arguments hợp lệ, toàn response phải kết thúc thành công và các requested invocations đã được persist. MVP dispatch tuần tự, **next LLM step chỉ bắt đầu sau khi mọi tool results đã settled**. Text deltas stream live như preview; nếu stream lỗi, không commit preview thành final. Session có thể chạy hàng giờ, không có steps cap mặc định. Thứ tự chuẩn xem [16](16-streaming-events.md).
 
 ## 8.2. Interface và HTTP-independent execution
 
@@ -51,14 +54,16 @@ pub struct CompletionRequest {
     pub context: PromptContext,
 }
 
-pub struct CompletionResult {
-    pub final_text: String,
-    pub tool_calls: Vec<ToolCall>,
-    pub usage: Option<TokenUsage>,
+pub enum ModelEvent {
+    TextDelta { message_id: String, ordinal: u64, text: String },
+    ToolCallReady(ToolCall),  // only after full arguments have been assembled
+    Finished { usage: Option<TokenUsage>, finish_reason: String },
 }
+// LlmGateway::stream(request) -> stream of Result<ModelEvent, LlmError>
+// Exact Rust stream return type is selected after provider spike.
 ```
 
-Adapter chuyển mô hình messages/tool calls/results sang crate `llm`. Tránh xây hệ provider wrappers mới trên một thư viện vốn đã hỗ trợ đa provider. Trong test, có thể thay adapter bằng fake LLM; không cần trait cho mỗi provider.
+Adapter chuyển messages/tool calls/results sang crate `llm` và chuẩn hóa stream. `ToolCallReady` cho biết call đã assemble/validate, nhưng **không kích hoạt execution**; Runtime đợi `Finished` của toàn provider response, persist mọi calls rồi mới dispatch tuần tự. Nếu provider tool-calling chỉ hỗ trợ non-streaming, adapter có thể emit call sau full response. Test cả trường hợp provider stream lỗi sau `ToolCallReady`: không có tool side effect. Không xây provider wrapper framework lần hai.
 
 ## 8.4. Multi-provider
 
@@ -81,7 +86,7 @@ Trước khi phụ thuộc sâu crate `llm`, khóa phiên bản rồi kiểm ch�
 1. Text completion và multi-turn history.
 2. Tool call → tool result → continuation (giữ nguyên IDs).
 3. Provider-specific error mapping, tool capability, timeout/cancellation.
-4. Token usage; streaming khảo sát cho giai đoạn sau.
+4. **Streaming bắt buộc MVP:** text delta và tool call assembly; fallback non-streaming tool calling khi provider không hỗ trợ partial calls; test usage + error mid-stream.
 
 Ví dụ Rust trong tài liệu là **illustrative interface**, chưa phải code đã compile.
 
@@ -93,3 +98,7 @@ Ví dụ Rust trong tài liệu là **illustrative interface**, chưa phải cod
 - Session status/history theo dõi được ngay cả khi client HTTP disconnect. Background Subagent notification dành cho sau MVP.
 
 Chi tiết: [15 — Long-running sessions](15-long-running-sessions.md).
+
+## 8.8. ExecutionFeed & event ordering (MVP)
+
+`AgentRuntime` phát live `text.delta`/tool progress và **committed invalidations sau SQLite commit**. `ToolContext::progress` không đi qua HTTP. SSE không giữ execution sống. `state_revision` chỉ dùng để biết cần refresh family snapshot, **không** để reducer áp state patches. Hợp đồng đầy đủ (ordering, retry, SSE, reconnect, revision) ở [16](16-streaming-events.md).

@@ -57,3 +57,7 @@ User turn có thể chạy nhiều giờ; `steps` không đặt mặc định. A
 ## 7.8. Ownership
 
 `parent_session_id` cố định; mọi resume phải kiểm tra đúng parent, owner/workspace và permissions hiện tại. Một shared Rust process không có nghĩa nhiều users/sessions mặc nhiên tin cậy nhau.
+
+## 7.9. Session-family revision và reconnect
+
+`sessions.state_revision` tăng khi committed UI state đổi, độc lập với message sequence. `SessionStore.family_snapshot(root_id)` trả canonical Root/Child view trong một SQLite read transaction. **SSE committed events chỉ làm invalidation**, không phải state patches; reconnect cần snapshot refresh. Hợp đồng đầy đủ ở [16](16-streaming-events.md).

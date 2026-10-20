@@ -28,6 +28,10 @@ pub struct ToolContext {
     pub session_id: String,
     pub run_id: String,
     pub agent_id: String,
+    // private live event publisher
+}
+impl ToolContext {
+    pub fn progress(&self, update: ToolProgress) { /* best-effort; nonblocking */ }
 }
 
 pub struct ToolOutcome {
@@ -47,7 +51,7 @@ impl ToolExecutor {
 }
 ```
 
-Ví dụ chỉ nêu **interface dự kiến**, không phải Rust code đã compile. `runtime` là borrowed handle từ call site, chỉ nhánh `subagent` sử dụng để chạy child; không tạo cyclic ownership.
+Ví dụ chỉ nêu **interface dự kiến**, không phải Rust code đã compile. `runtime` là borrowed handle từ call site, chỉ nhánh `subagent` sử dụng để chạy child; không tạo cyclic ownership. Tool execution chỉ bắt đầu **sau khi toàn provider response đã kết thúc thành công**, đầy đủ các tool calls của assistant message đã được persist. Calls trong một response được execute tuần tự trong MVP, sau đó mới mở next model step. Chi tiết thứ tự stream tại [16](16-streaming-events.md).
 
 ## 5.4. Execution & transcript ownership
 
@@ -63,6 +67,7 @@ flowchart TD
 
 - Lưu assistant message có tool calls và `tool_invocations.status=requested` **trước khi thực hiện side effect**. ToolExecutor không mở transcript transaction riêng.
 - Sau khi tool trả: runtime ghi tool result/error và cập nhật invocation `completed/failed` **trong cùng transaction**. Luôn bảo toàn `tool_call_id`.
+- **Events:** `tool.started` chỉ emit sau invocation requested/running được persist. `ToolContext::progress(..)` emit ephemeral `tool.progress` không ghi SQLite. Runtime publish terminal tool event **sau commit** result/error; không publish terminal success nếu DB commit thất bại.
 - Technical schema checks chỉ kiểm tra input/output envelope. `subagent.output` là text string; không buộc JSON nghiệp vụ.
 - **Không cam kết exactly-once cho side effects.** Sau crash giữa thực thi và xác nhận, outcome có thể **unknown**. Đánh dấu `interrupted`, không auto-replay; cần xác minh thủ công hoặc thao tác idempotent trước khi thực thi lại.
 - Khi restart gặp pending invocation chưa có confirmed result: tuyệt đối không gửi dangling call/result pair vào LLM. Read-only/idempotent tool có thể reconcile theo policy; mutating tool với outcome unknown thì **block execution** cho tới khi xác minh. Sau reconciliation an toàn, session có thể resume nếu còn recovery budget.
@@ -79,3 +84,7 @@ Tool output, repository files, skill instructions và subagent final text là **
 
 - https://github.com/anomalyco/opencode/blob/dev/packages/core/src/tool/runtime.ts
 - https://github.com/anomalyco/opencode/blob/dev/packages/core/src/tool-output.ts
+
+## 5.8. Tool streaming & progress (MVP)
+
+`ToolExecutor.execute` không nhận SSE/WebSocket client. `ToolContext::progress(update)` che giấu sender do runtime inject; dùng được ở `read_file`, `run_tests`, `subagent`, `skill` mà không tạo thêm trait/struct public. Trạng thái terminal cuối cùng được dựng từ `tool_invocations` + confirmed `messages`; progress preview có thể mất khi reconnect. Tool invocation không được bắt đầu trước durable request. Đối với `outcome_unknown`, recovery đánh dấu interrupted, **không** giả kết quả rồi retry. Xem [16 — Streaming](16-streaming-events.md).
