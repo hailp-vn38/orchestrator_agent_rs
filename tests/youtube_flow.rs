@@ -68,8 +68,7 @@ fn caller() -> CallerContext {
 }
 
 fn config(dir: &Path) -> OrchestratorConfig {
-    let prompt = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/youtube_flow/prompt.md");
+    let prompt = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/youtube_flow/prompt.md");
     let mut config = OrchestratorConfig::new(
         LlmConfig {
             providers: vec![LlmProviderConfig {
@@ -80,12 +79,10 @@ fn config(dir: &Path) -> OrchestratorConfig {
                 request_timeout: Duration::from_secs(30),
             }],
         },
-        vec![
-            AgentDefinition::new("root", "fake", "scripted")
-                .with_mode(AgentMode::Primary)
-                .with_prompt_path(prompt)
-                .with_allowed_tools(["fetch_youtube_transcript", "publish_youtube_markdown"]),
-        ],
+        vec![AgentDefinition::new("root", "fake", "scripted")
+            .with_mode(AgentMode::Primary)
+            .with_prompt_path(prompt)
+            .with_allowed_tools(["fetch_youtube_transcript", "publish_youtube_markdown"])],
         dir.join("store"),
     );
     config.runtime.supervisor_sweep = Duration::from_millis(40);
@@ -94,11 +91,7 @@ fn config(dir: &Path) -> OrchestratorConfig {
     config
 }
 
-async fn build(
-    dir: &Path,
-    gw: &Arc<ScriptedGateway>,
-    binary: &Path,
-) -> Orchestrator {
+async fn build(dir: &Path, gw: &Arc<ScriptedGateway>, binary: &Path) -> Orchestrator {
     Orchestrator::builder(config(dir))
         .with_gateway(gw.clone())
         .register_tool(Arc::new(FetchYoutubeTranscript::new(binary)))
@@ -137,11 +130,21 @@ fn assert_transcript_reached_model(req: &ModelRequest) {
     let transcript = req
         .messages
         .iter()
-        .find(|m| m.role == ModelRole::Tool && m.tool_name.as_deref() == Some("fetch_youtube_transcript"))
+        .find(|m| {
+            m.role == ModelRole::Tool && m.tool_name.as_deref() == Some("fetch_youtube_transcript")
+        })
         .expect("expected real transcript tool result in LLM context");
     assert!(transcript.text.contains("Orchestrator xử lý phụ đề."));
-    assert!(transcript.text.contains("Kết quả được lưu dưới dạng Markdown."));
-    assert_eq!(transcript.text.matches("Orchestrator xử lý phụ đề.").count(), 1);
+    assert!(transcript
+        .text
+        .contains("Kết quả được lưu dưới dạng Markdown."));
+    assert_eq!(
+        transcript
+            .text
+            .matches("Orchestrator xử lý phụ đề.")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -225,7 +228,11 @@ async fn url_to_verified_markdown_survives_reopen() {
         .await
         .unwrap();
     assert_eq!(
-        history.items.iter().filter(|m| m.role == MessageRole::Tool).count(),
+        history
+            .items
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .count(),
         2
     );
     o.shutdown().await.unwrap();
@@ -258,7 +265,11 @@ async fn no_subtitles_must_not_publish_a_summary() {
     let tmp = tempfile::tempdir().unwrap();
     let binary = script(tmp.path(), "#!/bin/sh\nexit 0\n");
     let gw = ScriptedGateway::new();
-    gw.push_response(tool_call("download", "fetch_youtube_transcript", json!({"url": VIDEO_URL})));
+    gw.push_response(tool_call(
+        "download",
+        "fetch_youtube_transcript",
+        json!({"url": VIDEO_URL}),
+    ));
     gw.push_text("Không có transcript, không thể tóm tắt.");
     let o = build(tmp.path(), &gw, &binary).await;
     let sid = o.create_session(&caller(), "root").await.unwrap();
@@ -270,7 +281,10 @@ async fn no_subtitles_must_not_publish_a_summary() {
         .history(&caller(), &sid, PageRequest::first(20))
         .await
         .unwrap();
-    assert!(history.items.iter().any(|m| m.role == MessageRole::Tool && m.text.contains("NO_TRANSCRIPT")));
+    assert!(history
+        .items
+        .iter()
+        .any(|m| m.role == MessageRole::Tool && m.text.contains("NO_TRANSCRIPT")));
     o.shutdown().await.unwrap();
 }
 
@@ -295,6 +309,9 @@ async fn untrusted_url_is_rejected_before_external_process() {
         .history(&caller(), &sid, PageRequest::first(20))
         .await
         .unwrap();
-    assert!(history.items.iter().any(|m| m.role == MessageRole::Tool && m.text.contains("INVALID_URL")));
+    assert!(history
+        .items
+        .iter()
+        .any(|m| m.role == MessageRole::Tool && m.text.contains("INVALID_URL")));
     o.shutdown().await.unwrap();
 }
