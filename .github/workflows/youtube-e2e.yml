@@ -35,7 +35,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format
-        run: cargo fmt --check
+        run: rustfmt --edition 2021 --check examples/youtube_flow.rs examples/youtube_flow/tools.rs tests/youtube_flow.rs
       - name: Clippy all targets
         run: cargo clippy --all-targets -- -D warnings
       - name: Offline YouTube integration
