@@ -87,3 +87,7 @@ Giá trị/đơn vị nằm trong `spikes/g0/src/profile.rs` (estimated, trừ m
 - `cargo clippy --locked --all-targets -- -D warnings`: đạt.
 - Provider LAN smoke dùng evidence đã ghi ở trên; không gọi lại dịch vụ trong bước commit.
 - Không đưa build artifacts hoặc credentials vào commit.
+
+## Cập nhật 2026-10-21
+
+Đã chạy bổ sung trên gateway OpenAI-compatible (`tests/m9_live_gateway.rs`, m5): system precedence, semantic tool-result consumption, request-level timeout và live auth error mapping đều PASS. Provider thứ hai được bỏ qua theo quyết định của người dùng (không có API key). Operational profile vẫn estimated. Chi tiết: `docs/evidence/final.md`.

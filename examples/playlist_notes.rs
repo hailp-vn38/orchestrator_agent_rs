@@ -174,10 +174,16 @@ fn clean_mermaid(raw: &str) -> Option<String> {
         .collect();
     let code = code.join("\n").trim().to_string();
     let first = code.lines().next()?.trim();
-    ["flowchart", "graph", "mindmap", "sequenceDiagram", "stateDiagram"]
-        .iter()
-        .any(|k| first.starts_with(k))
-        .then_some(code)
+    [
+        "flowchart",
+        "graph",
+        "mindmap",
+        "sequenceDiagram",
+        "stateDiagram",
+    ]
+    .iter()
+    .any(|k| first.starts_with(k))
+    .then_some(code)
 }
 
 /// Tên note: chỉ chữ/số/`-`/`_`, không đường dẫn; trả về stem (không có `.md`).
@@ -317,7 +323,10 @@ fn fetch_transcript(work: &Path, id: &str, langs: &str) -> std::result::Result<S
     // yt-dlp thoát lỗi khi một biến thể bị 429; vẫn dùng nếu đã có file .vtt.
     if subs.is_empty() {
         return Err(if output.status.success() {
-            tool_err("NO_TRANSCRIPT", format!("Video không có phụ đề cho: {sub_langs}"))
+            tool_err(
+                "NO_TRANSCRIPT",
+                format!("Video không có phụ đề cho: {sub_langs}"),
+            )
         } else {
             tool_err("YTDLP_FAILED", stderr_tail(&output.stderr))
         });
@@ -331,9 +340,8 @@ fn fetch_transcript(work: &Path, id: &str, langs: &str) -> std::result::Result<S
             .unwrap_or(usize::MAX);
         (rank, name)
     });
-    let text = vtt_to_text(
-        &std::fs::read_to_string(&subs[0]).map_err(|e| tool_err("IO", e.to_string()))?,
-    );
+    let text =
+        vtt_to_text(&std::fs::read_to_string(&subs[0]).map_err(|e| tool_err("IO", e.to_string()))?);
     if text.is_empty() {
         return Err(tool_err("NO_TRANSCRIPT", "Phụ đề rỗng"));
     }
@@ -486,7 +494,12 @@ impl HostTool for PlaylistTool {
             Kind::NoteCreate => {
                 let stem = note_stem(str_arg(&args, "note")?)?;
                 let id = str_arg(&args, "id")?;
-                let known = sh.videos.lock().unwrap().iter().any(|v| v.0 == id && v.2 == stem);
+                let known = sh
+                    .videos
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v.0 == id && v.2 == stem);
                 if !known {
                     return Err(tool_err(
                         "UNKNOWN_NOTE",
@@ -508,25 +521,42 @@ impl HostTool for PlaylistTool {
                     }
                     doc.push('\n');
                 }
-                doc.push_str(&format!("## Cấu trúc\n\n{}\n\n", str_arg(&args, "structure")?));
-                if let Some(m) = args.get("mermaid").and_then(Value::as_str).and_then(clean_mermaid)
+                doc.push_str(&format!(
+                    "## Cấu trúc\n\n{}\n\n",
+                    str_arg(&args, "structure")?
+                ));
+                if let Some(m) = args
+                    .get("mermaid")
+                    .and_then(Value::as_str)
+                    .and_then(clean_mermaid)
                 {
                     doc.push_str(&format!("## Sơ đồ\n\n```mermaid\n{m}\n```\n"));
                 }
-                std::fs::create_dir_all(&sh.notes_dir).map_err(|e| tool_err("IO", e.to_string()))?;
+                std::fs::create_dir_all(&sh.notes_dir)
+                    .map_err(|e| tool_err("IO", e.to_string()))?;
                 let mut f = std::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .open(sh.path(&stem))
                     .map_err(|e| match e.kind() {
-                        io::ErrorKind::AlreadyExists => tool_err("ALREADY_EXISTS", "Note đã tồn tại"),
+                        io::ErrorKind::AlreadyExists => {
+                            tool_err("ALREADY_EXISTS", "Note đã tồn tại")
+                        }
                         _ => tool_err("IO", e.to_string()),
                     })?;
-                f.write_all(doc.as_bytes()).map_err(|e| tool_err("IO", e.to_string()))?;
-                Ok(outcome(&ctx, format!("Created {stem}.md"), json!({"note": stem})))
+                f.write_all(doc.as_bytes())
+                    .map_err(|e| tool_err("IO", e.to_string()))?;
+                Ok(outcome(
+                    &ctx,
+                    format!("Created {stem}.md"),
+                    json!({"note": stem}),
+                ))
             }
             Kind::NoteLink => {
-                let (from, to) = (note_stem(str_arg(&args, "from")?)?, note_stem(str_arg(&args, "to")?)?);
+                let (from, to) = (
+                    note_stem(str_arg(&args, "from")?)?,
+                    note_stem(str_arg(&args, "to")?)?,
+                );
                 let reason = str_arg(&args, "reason")?.replace('\n', " ");
                 if from == to {
                     return Err(tool_err("INVALID_ARGUMENT", "from và to phải khác nhau"));
@@ -543,13 +573,20 @@ impl HostTool for PlaylistTool {
                         return Ok(());
                     }
                     let mut new = doc.trim_end().to_string();
-                    new.push_str(if doc.contains("## Liên quan") { "\n" } else { "\n\n## Liên quan\n\n" });
+                    new.push_str(if doc.contains("## Liên quan") {
+                        "\n"
+                    } else {
+                        "\n\n## Liên quan\n\n"
+                    });
                     new.push_str(&line);
                     std::fs::write(sh.path(stem), new).map_err(|e| tool_err("IO", e.to_string()))
                 };
                 add(&from, &doc_from, "→", &to, &t_to)?;
                 add(&to, &doc_to, "←", &from, &t_from)?;
-                sh.edges.lock().unwrap().push((from.clone(), to.clone(), reason));
+                sh.edges
+                    .lock()
+                    .unwrap()
+                    .push((from.clone(), to.clone(), reason));
                 Ok(outcome(&ctx, format!("Linked {from} → {to}"), json!({})))
             }
             Kind::IndexCreate => {
@@ -562,7 +599,10 @@ impl HostTool for PlaylistTool {
                     .map(|v| v.2.as_str())
                     .collect();
                 if !missing.is_empty() {
-                    return Err(tool_err("MISSING_NOTES", format!("Chưa có note: {}", missing.join(", "))));
+                    return Err(tool_err(
+                        "MISSING_NOTES",
+                        format!("Chưa có note: {}", missing.join(", ")),
+                    ));
                 }
                 let mut doc = format!("# {topic}\n\n> Playlist: <{url}>\n\n## Các video\n\n");
                 for (_, title, stem) in &videos {
@@ -576,7 +616,11 @@ impl HostTool for PlaylistTool {
                 }
                 doc.push_str("\n## Bản đồ liên hệ\n\n```mermaid\nflowchart LR\n");
                 for (i, (_, title, _)) in videos.iter().enumerate() {
-                    doc.push_str(&format!("    N{}[\"{}\"]\n", i + 1, title.replace('"', "'")));
+                    doc.push_str(&format!(
+                        "    N{}[\"{}\"]\n",
+                        i + 1,
+                        title.replace('"', "'")
+                    ));
                 }
                 let pos = |s: &str| videos.iter().position(|v| v.2 == s).map(|i| i + 1);
                 for (a, b, reason) in &edges {
@@ -586,9 +630,14 @@ impl HostTool for PlaylistTool {
                     }
                 }
                 doc.push_str("```\n");
-                std::fs::write(sh.path("00-index"), &doc).map_err(|e| tool_err("IO", e.to_string()))?;
+                std::fs::write(sh.path("00-index"), &doc)
+                    .map_err(|e| tool_err("IO", e.to_string()))?;
                 *sh.topic.lock().unwrap() = Some((topic.to_string(), url.to_string()));
-                Ok(outcome(&ctx, "Created 00-index.md".into(), json!({"links": edges.len()})))
+                Ok(outcome(
+                    &ctx,
+                    "Created 00-index.md".into(),
+                    json!({"links": edges.len()}),
+                ))
             }
         }
     }
@@ -633,7 +682,10 @@ fn print_event(data: &Value, secret: &str) {
         "tool.started" => format!("[{tag}] ▶ {tool}"),
         "tool.progress" => format!("[{tag}] … {}", payload["message"].as_str().unwrap_or("")),
         "tool.completed" => format!("[{tag}] ✔ {tool}"),
-        "tool.failed" => format!("[{tag}] ✘ {tool} ({})", payload["error_code"].as_str().unwrap_or("")),
+        "tool.failed" => format!(
+            "[{tag}] ✘ {tool} ({})",
+            payload["error_code"].as_str().unwrap_or("")
+        ),
         _ => return,
     };
     println!("{}", line.replace(secret, "[redacted]"));
@@ -667,7 +719,11 @@ async fn run(o: &Orchestrator, url: &str, secret: &str, timeout: Duration) -> Re
     let sid = o.create_session(&caller, "coordinator").await?;
     let mut sub = o.subscribe(&caller, &sid).await?;
     let turn = o
-        .submit(&caller, &sid, format!("Build the notes folder for this playlist.\nURL: {url}"))
+        .submit(
+            &caller,
+            &sid,
+            format!("Build the notes folder for this playlist.\nURL: {url}"),
+        )
         .await?;
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
@@ -754,7 +810,9 @@ async fn main() -> Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--lang" | "--env-file" | "--output-dir" | "--limit" => {
-                let v = args.next().ok_or_else(|| io::Error::other("Thiếu giá trị option"))?;
+                let v = args
+                    .next()
+                    .ok_or_else(|| io::Error::other("Thiếu giá trị option"))?;
                 match arg.as_str() {
                     "--lang" => langs = v,
                     "--env-file" => env_file = v.into(),
@@ -827,7 +885,12 @@ async fn main() -> Result<()> {
         ],
         run_dir.join("store"),
     );
-    let tool = |kind| Arc::new(PlaylistTool { shared: shared.clone(), kind });
+    let tool = |kind| {
+        Arc::new(PlaylistTool {
+            shared: shared.clone(),
+            kind,
+        })
+    };
     let o = Orchestrator::builder(cfg)
         .register_tool(tool(Kind::ListPlaylist))
         .register_tool(tool(Kind::GetTranscript))
@@ -852,7 +915,11 @@ async fn main() -> Result<()> {
         .ok_or_else(|| io::Error::other("Agent chưa gọi index_create"))?;
     let mut folder = output.join(slugify(&topic, 60));
     if folder.exists() {
-        folder = output.join(format!("{}-{}", slugify(&topic, 50), &uuid::Uuid::new_v4().to_string()[..6]));
+        folder = output.join(format!(
+            "{}-{}",
+            slugify(&topic, 50),
+            &uuid::Uuid::new_v4().to_string()[..6]
+        ));
     }
     std::fs::rename(&shared.notes_dir, &folder)?;
     println!("[xong] thư mục chủ đề: {}", folder.display());
@@ -865,7 +932,10 @@ mod tests {
 
     #[test]
     fn slug_folds_vietnamese_and_is_safe() {
-        assert_eq!(slugify("Chiến lược DCA của Đạt", 60), "chien-luoc-dca-cua-dat");
+        assert_eq!(
+            slugify("Chiến lược DCA của Đạt", 60),
+            "chien-luoc-dca-cua-dat"
+        );
         assert_eq!(slugify("???", 10), "untitled");
     }
 
@@ -884,7 +954,9 @@ mod tests {
 
     #[test]
     fn mermaid_kind_is_validated() {
-        assert!(clean_mermaid("```mermaid\nflowchart TD\n A-->B\n```").unwrap().starts_with("flowchart"));
+        assert!(clean_mermaid("```mermaid\nflowchart TD\n A-->B\n```")
+            .unwrap()
+            .starts_with("flowchart"));
         assert!(clean_mermaid("pie\n a").is_none());
     }
 }

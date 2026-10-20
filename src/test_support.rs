@@ -14,8 +14,8 @@ use std::time::Duration;
 pub use crate::artifact::ArtifactFault;
 pub use crate::feed::FeedFault;
 pub use crate::gateway::{
-    GatewayError, LlmGateway, ModelMessage, ModelRequest, ModelResponse, ModelRole, ModelTool,
-    ModelToolCall, ModelUsage, StreamEvent, StreamSink,
+    ClientGateway, GatewayError, LlmGateway, ModelMessage, ModelRequest, ModelResponse, ModelRole,
+    ModelTool, ModelToolCall, ModelUsage, StreamEvent, StreamSink,
 };
 
 /// Fault hook: khi `true`, trigger ngay sau admission bị bỏ (claim đã commit nhưng chưa

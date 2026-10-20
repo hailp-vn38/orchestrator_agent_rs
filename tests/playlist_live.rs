@@ -776,5 +776,8 @@ fn long_transcript_is_clipped_and_slug_is_safe() {
         "i-coded-99-winrate-dca"
     );
     assert_eq!(slugify("???", 10), "untitled");
-    assert_eq!(slugify("Chiến lược DCA của Đạt", 60), "chien-luoc-dca-cua-dat");
+    assert_eq!(
+        slugify("Chiến lược DCA của Đạt", 60),
+        "chien-luoc-dca-cua-dat"
+    );
 }

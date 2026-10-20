@@ -414,7 +414,10 @@ async fn crash_window_claim_without_spawn_is_rescheduled_in_live_process() {
     let gw = ScriptedGateway::new();
     gw.push_text("rescued");
     let drop_triggers = Arc::new(AtomicBool::new(true));
-    let o = Orchestrator::builder(env.config())
+    // Sweep đủ dài để assertion "chưa có task" không đua với supervisor khi máy bận.
+    let mut cfg = env.config();
+    cfg.runtime.supervisor_sweep = Duration::from_secs(1);
+    let o = Orchestrator::builder(cfg)
         .with_gateway(gw.clone())
         .with_dropped_admission_triggers(drop_triggers.clone())
         .build()
