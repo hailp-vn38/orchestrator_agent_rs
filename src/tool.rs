@@ -1,14 +1,23 @@
 //! HostTool: external extension seam (docs/18 §18.6). M0 cung cấp contract đăng ký và
-//! validate; M2 thêm dispatch có scope/permissions (`executor`). Artifacts/checkpoint thuộc M7.
+//! validate; M2 thêm dispatch có scope/permissions (`executor`); M7 thêm scoped capabilities
+//! `artifacts().put/open` và `checkpoint().current/commit` (docs/17, docs/18 §18.6.2).
 
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use serde_json::json;
+
+use crate::artifact::{
+    ArtifactInput, ArtifactReader, ArtifactStore, ArtifactWriteScope, CODE_ARTIFACT_UNAVAILABLE,
+};
 use crate::error::{ConfigReason, OrchestratorError};
-use crate::feed::ProgressSink;
+use crate::feed::{event, Emitter, ProgressSink};
+use crate::store::SessionStore;
+use crate::types::ArtifactRef;
 
 /// Tên tool dành riêng cho built-in; host không được đăng ký trùng.
-pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &["subagent", "skill"];
+pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &["subagent", "skill", "artifact_read"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolEffect {
@@ -35,6 +44,7 @@ pub struct ToolScope {
     pub session_id: String,
     /// Root của session family (chính `session_id` nếu là Root); engine resolve từ ancestry.
     pub root_session_id: String,
+    pub turn_id: String,
     pub run_id: String,
     pub agent_id: String,
     /// Internal `tool_invocations.id`, khác provider `tool_call_id`.
@@ -50,11 +60,23 @@ pub struct ToolScope {
 const MAX_PROGRESS_BYTES: usize = 1024;
 
 /// Capability có phạm vi do runtime mint; host không tự dựng được ngoài test của crate.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolContext {
     scope: ToolScope,
     cancelled: Arc<AtomicBool>,
     progress: Option<ProgressSink>,
+    artifacts: Option<ArtifactStore>,
+    store: Option<SessionStore>,
+    emitter: Option<Emitter>,
+}
+
+impl fmt::Debug for ToolContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolContext")
+            .field("scope", &self.scope)
+            .field("cancelled", &self.cancelled.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 impl ToolContext {
@@ -62,11 +84,17 @@ impl ToolContext {
         scope: ToolScope,
         cancelled: Arc<AtomicBool>,
         progress: Option<ProgressSink>,
+        artifacts: Option<ArtifactStore>,
+        store: Option<SessionStore>,
+        emitter: Option<Emitter>,
     ) -> Self {
         Self {
             scope,
             cancelled,
             progress,
+            artifacts,
+            store,
+            emitter,
         }
     }
 
@@ -77,6 +105,18 @@ impl ToolContext {
     /// Hủy hợp tác; tool tự quyết định dừng.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Scoped capability để xuất bản và mở các artifact bất biến trong phạm vi cho phép
+    /// của invocation hiện tại (docs/18 §18.6.2).
+    pub fn artifacts(&self) -> ToolArtifacts<'_> {
+        ToolArtifacts { ctx: self }
+    }
+
+    /// Scoped capability để đọc và cập nhật compare-and-swap (CAS) durable manifest pointer
+    /// trên `tool_invocations.checkpoint_artifact_id` của đúng invocation hiện tại.
+    pub fn checkpoint(&self) -> ToolCheckpoint<'_> {
+        ToolCheckpoint { ctx: self }
     }
 
     /// Progress ephemeral, best-effort, không chặn và không ghi SQLite. Bị cắt ở
@@ -109,6 +149,115 @@ impl ToolContext {
     }
 }
 
+/// Handle thao tác artifact có phạm vi gắn với [`ToolContext`].
+#[derive(Debug, Clone, Copy)]
+pub struct ToolArtifacts<'a> {
+    ctx: &'a ToolContext,
+}
+
+impl ToolArtifacts<'_> {
+    /// Ghi bất biến một artifact mới qua `ArtifactStore` và trả về [`ArtifactRef`] đã xác minh.
+    pub async fn put(&self, input: ArtifactInput) -> Result<ArtifactRef, ToolError> {
+        let Some(store) = &self.ctx.artifacts else {
+            return Err(ToolError {
+                code: CODE_ARTIFACT_UNAVAILABLE.into(),
+                message: "artifact store is not available in this context".into(),
+            });
+        };
+        let write_scope = ArtifactWriteScope::from_tool_scope(&self.ctx.scope);
+        let reference = store.put(&write_scope, input).await?;
+        if let Some(emitter) = &self.ctx.emitter {
+            emitter
+                .committed_session(
+                    &self.ctx.scope.session_id,
+                    Some(&self.ctx.scope.run_id),
+                    event::SESSION_CHANGED,
+                    json!({
+                        "reason": "artifact_published",
+                        "artifact_id": reference.id,
+                        "invocation_id": self.ctx.scope.invocation_id,
+                    }),
+                )
+                .await;
+        }
+        Ok(reference)
+    }
+
+    /// Mở một committed artifact để đọc theo luồng có giới hạn. Chỉ cho phép khi `artifact_id`
+    /// thuộc cùng owner/workspace, cùng session family **và** nằm trong explicit invocation
+    /// input/checkpoint scope. Cùng workspace đơn thuần không tự cấp quyền đọc (AT-40).
+    pub async fn open(&self, artifact_id: &str) -> Result<ArtifactReader, ToolError> {
+        let Some(store) = &self.ctx.artifacts else {
+            return Err(ToolError {
+                code: CODE_ARTIFACT_UNAVAILABLE.into(),
+                message: "artifact store is not available in this context".into(),
+            });
+        };
+        store.open_for_tool(&self.ctx.scope, artifact_id).await
+    }
+}
+
+/// Handle đọc/ghi durable manifest pointer gắn với [`ToolContext`] (docs/17 §17.7, docs/18 §18.6.2).
+#[derive(Debug, Clone, Copy)]
+pub struct ToolCheckpoint<'a> {
+    ctx: &'a ToolContext,
+}
+
+impl ToolCheckpoint<'_> {
+    /// Đọc manifest ID đã commit cuối cùng của **đúng** internal `invocation_id` hiện tại
+    /// và xác minh tính toàn vẹn của artifact đó. Trả `Ok(None)` nếu invocation chưa commit
+    /// pointer nào (không tự kế thừa từ invocation trước trong cùng child session).
+    pub async fn current(&self) -> Result<Option<String>, ToolError> {
+        let (Some(store), Some(artifacts)) = (&self.ctx.store, &self.ctx.artifacts) else {
+            return Err(ToolError {
+                code: CODE_ARTIFACT_UNAVAILABLE.into(),
+                message: "checkpoint store is not available in this context".into(),
+            });
+        };
+        store.current_checkpoint(&self.ctx.scope, artifacts).await
+    }
+
+    /// Cập nhật compare-and-swap (CAS) `tool_invocations.checkpoint_artifact_id` của đúng
+    /// internal `invocation_id` hiện tại sau khi đã xác minh `manifest_id` là một artifact
+    /// đã commit và nguyên vẹn trong scope. Trả lỗi `CHECKPOINT_CONFLICT` nếu pointer hiện
+    /// tại không khớp `expected_previous_id`.
+    pub async fn commit(
+        &self,
+        manifest_id: &str,
+        expected_previous_id: Option<&str>,
+    ) -> Result<(), ToolError> {
+        let (Some(store), Some(artifacts)) = (&self.ctx.store, &self.ctx.artifacts) else {
+            return Err(ToolError {
+                code: CODE_ARTIFACT_UNAVAILABLE.into(),
+                message: "checkpoint store is not available in this context".into(),
+            });
+        };
+        store
+            .commit_checkpoint(
+                &self.ctx.scope,
+                artifacts,
+                manifest_id,
+                expected_previous_id,
+            )
+            .await?;
+        if let Some(emitter) = &self.ctx.emitter {
+            emitter
+                .committed_session(
+                    &self.ctx.scope.session_id,
+                    Some(&self.ctx.scope.run_id),
+                    event::SESSION_CHANGED,
+                    json!({
+                        "reason": "checkpoint_committed",
+                        "checkpoint_artifact_id": manifest_id,
+                        "invocation_id": self.ctx.scope.invocation_id,
+                    }),
+                )
+                .await;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolOutcome {
     pub call_id: String,
@@ -120,6 +269,18 @@ pub struct ToolOutcome {
 pub struct ToolError {
     pub code: String,
     pub message: String,
+}
+
+impl From<OrchestratorError> for ToolError {
+    fn from(err: OrchestratorError) -> Self {
+        let msg = err.message().to_owned();
+        let code = if msg.starts_with(crate::artifact::CODE_ARTIFACT_INTEGRITY) {
+            crate::artifact::CODE_ARTIFACT_INTEGRITY.to_owned()
+        } else {
+            err.code().as_str().to_owned()
+        };
+        Self { code, message: msg }
+    }
 }
 
 #[async_trait::async_trait]

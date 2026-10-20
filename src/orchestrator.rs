@@ -2,14 +2,18 @@
 //! Chỉ những gì đã hoạt động mới được expose. M5 thêm startup recovery, `cancel`,
 //! `resolve_interrupted_invocation` và shutdown nhiều pha. M6 thêm observation:
 //! `subscribe` (feed bounded, best-effort) và `snapshot` (canonical, một read transaction).
+//! M7 thêm `ArtifactStore`, `list_artifacts`, `open_artifact`, `backup_to`, và `AgentResult`
+//! artifact preview + cursor.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentDefinition, AgentMode, AgentRegistry};
+use crate::artifact::{ArtifactDownload, ArtifactLimits, ArtifactStore};
 use crate::config::{OrchestratorConfig, ProviderAuth, RuntimeConfig};
 use crate::error::{ConfigReason, ErrorCode, OrchestratorError};
 use crate::executor::{replay_safe_names, Settled, ToolExecutor, ToolLimits};
@@ -24,8 +28,8 @@ use crate::subagent::TaskManager;
 use crate::supervisor::{AdmissionSignal, Supervisor};
 use crate::tool::{validate_descriptor, HostTool, ToolDescriptor};
 use crate::types::{
-    AcceptedTurn, AgentResult, CallerContext, FamilySnapshot, MessageView, OperatorContext, Page,
-    PageRequest, RunStatus, SessionPolicy, VerifiedToolResolution,
+    AcceptedTurn, AgentResult, ArtifactRef, CallerContext, FamilySnapshot, MessageView,
+    OperatorContext, Page, PageRequest, RunStatus, SessionPolicy, VerifiedToolResolution,
 };
 
 const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 64 * 1024;
@@ -43,7 +47,9 @@ pub struct Orchestrator {
     registry: AgentRegistry,
     tools: BTreeMap<String, Arc<dyn HostTool>>,
     fingerprints: BTreeMap<String, String>,
+    store_dir: PathBuf,
     store: SessionStore,
+    artifacts: ArtifactStore,
     supervisor: Supervisor,
     runtime: RuntimeConfig,
     /// Tool replay-safe (xem `replay_safe_names`) cho policy recovery sau operator resolve.
@@ -60,6 +66,8 @@ pub struct OrchestratorBuilder {
     drop_admission_triggers: Arc<AtomicBool>,
     #[cfg(feature = "test-support")]
     feed_fault: Option<Arc<crate::feed::FeedFault>>,
+    #[cfg(feature = "test-support")]
+    artifact_fault: Option<Arc<crate::artifact::ArtifactFault>>,
 }
 
 impl Orchestrator {
@@ -71,6 +79,8 @@ impl Orchestrator {
             drop_admission_triggers: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "test-support")]
             feed_fault: None,
+            #[cfg(feature = "test-support")]
+            artifact_fault: None,
         }
     }
 
@@ -159,6 +169,8 @@ impl Orchestrator {
     }
 
     /// Projection của attempt mới nhất cho `(session_id, turn_id)`; đang chạy thì `output=None`.
+    /// Kèm trang đầu giới hạn `artifact_preview` (`<= artifact_preview_limit`) và
+    /// `artifacts_next_cursor` (docs/17 §17.6, docs/18 §18.7).
     pub async fn result(
         &self,
         caller: &CallerContext,
@@ -166,7 +178,66 @@ impl Orchestrator {
         turn_id: &str,
     ) -> Result<AgentResult, OrchestratorError> {
         self.ensure_open()?;
-        self.store.result(caller, session_id, turn_id).await
+        let mut res = self.store.result(caller, session_id, turn_id).await?;
+        let preview = self
+            .artifacts
+            .preview_for_turn(&caller.owner_id, &caller.workspace_id, session_id, turn_id)
+            .await?;
+        res.artifact_preview = preview.items;
+        res.artifacts_next_cursor = preview.next_cursor;
+        Ok(res)
+    }
+
+    /// Phân trang danh sách [`ArtifactRef`] đã commit của `(session_id, turn_id)` theo thứ tự
+    /// ổn định `(created_at, id)` và cursor opaque gắn với đúng `(session_id, turn_id)`.
+    pub async fn list_artifacts(
+        &self,
+        caller: &CallerContext,
+        session_id: &str,
+        turn_id: &str,
+        page: PageRequest,
+    ) -> Result<Page<ArtifactRef>, OrchestratorError> {
+        self.ensure_open()?;
+        self.artifacts
+            .list_for_turn(caller, session_id, turn_id, page)
+            .await
+    }
+
+    /// Mở một artifact đã commit để đọc/stream với giới hạn `download_max_bytes` và kiểm tra
+    /// toàn vẹn SHA-256 trên dòng dữ liệu đọc ra. Không bao giờ lộ filesystem path nội bộ.
+    pub async fn open_artifact(
+        &self,
+        caller: &CallerContext,
+        artifact_id: &str,
+    ) -> Result<ArtifactDownload, OrchestratorError> {
+        self.ensure_open()?;
+        self.artifacts.open_for_host(caller, artifact_id).await
+    }
+
+    /// Tạo bản sao lưu nhất quán (consistent recovery point) của cả SQLite execution store
+    /// (qua `VACUUM INTO`, an toàn khi WAL đang mở) và toàn bộ các file committed artifacts
+    /// có mặt trong snapshot đó sang `dest_dir` (docs/17 §17.4, docs/18 §18.7).
+    pub async fn backup_to(&self, dest_dir: impl AsRef<Path>) -> Result<(), OrchestratorError> {
+        self.ensure_open()?;
+        let dest = dest_dir.as_ref();
+        if dest.as_os_str().is_empty() || dest == self.store_dir {
+            return Err(OrchestratorError::new(
+                ErrorCode::InvalidInput,
+                "backup destination must be a distinct non-empty directory",
+            ));
+        }
+        let dest_db = dest.join(DB_FILE);
+        if tokio::fs::try_exists(&dest_db).await.unwrap_or(false) {
+            return Err(OrchestratorError::new(
+                ErrorCode::InvalidInput,
+                "backup destination already contains an orchestrator database",
+            ));
+        }
+        tokio::fs::create_dir_all(dest)
+            .await
+            .map_err(|e| OrchestratorError::storage("create backup dir", &e))?;
+        let keys = self.store.backup_sqlite_to(&dest_db).await?;
+        self.artifacts.backup_committed_to(dest, &keys).await
     }
 
     /// Lịch sử canonical của **một** session, phân trang theo cursor opaque gắn với session.
@@ -303,6 +374,36 @@ impl Orchestrator {
         }
         let (outcome_call_id, settled, evidence) = match decision {
             VerifiedToolResolution::ConfirmedCompleted { outcome, evidence } => {
+                if let Some(ids) = outcome.metadata.get("artifact_ids") {
+                    let Some(list) = ids.as_array() else {
+                        return Err(invalid("metadata.artifact_ids must be an array of strings"));
+                    };
+                    let root_sid = self
+                        .store
+                        .root_session_of(&operator.owner_id, &operator.workspace_id, session_id)
+                        .await?;
+                    for entry in list {
+                        let Some(aid) = entry.as_str().map(str::trim).filter(|s| !s.is_empty())
+                        else {
+                            return Err(invalid(
+                                "metadata.artifact_ids entries must be non-empty strings",
+                            ));
+                        };
+                        self.artifacts
+                            .verify_in_family(
+                                &operator.owner_id,
+                                &operator.workspace_id,
+                                &root_sid,
+                                aid,
+                            )
+                            .await
+                            .map_err(|_| {
+                                invalid(
+                                    "confirmed outcome references an uncommitted, unauthorized, or corrupt artifact",
+                                )
+                            })?;
+                    }
+                }
                 let call_id = outcome.call_id.clone();
                 let settled = self.limits.settle(Ok(outcome));
                 if settled.failed {
@@ -441,6 +542,13 @@ impl OrchestratorBuilder {
         self
     }
 
+    /// Test support nội bộ: fault hook cho staging/rename/checkpoint CAS của ArtifactStore.
+    #[cfg(feature = "test-support")]
+    pub fn with_artifact_fault(mut self, fault: Arc<crate::artifact::ArtifactFault>) -> Self {
+        self.artifact_fault = Some(fault);
+        self
+    }
+
     /// Validate cấu hình cục bộ, giữ owner lock của store, mở SQLite (migrate) và khởi
     /// động supervisor. Không tạo Tokio runtime, không gọi remote provider; chạy trong
     /// runtime hiện có của host.
@@ -537,6 +645,25 @@ impl OrchestratorBuilder {
             .map_err(|e| OrchestratorError::storage("create store dir", &e))?;
         let owner_lock = OwnerLock::acquire(&store_dir.join(OWNER_LOCK_FILE))?;
         let store = SessionStore::open(&store_dir.join(DB_FILE)).await?;
+        let artifact_limits = ArtifactLimits::from_runtime(&self.config.runtime);
+        #[cfg(feature = "test-support")]
+        let artifact_fault = self.artifact_fault;
+        #[cfg(not(feature = "test-support"))]
+        let artifact_fault = None;
+        let artifacts = ArtifactStore::open(
+            store.pool().clone(),
+            store_dir,
+            artifact_limits,
+            artifact_fault,
+        )
+        .await?;
+        let swept = artifacts.sweep_configured_orphans().await?;
+        if swept > 0 {
+            tracing::info!(
+                swept,
+                "swept orphan staging/unpublished artifact files under owner lock"
+            );
+        }
         // Dưới owner lock không còn process nào khác: mọi run `running` còn lại là của process
         // đã chết. Đánh dấu interrupted trước, rồi mới quyết định resume/block (không replay).
         let interrupted = store.mark_stale_runs_interrupted().await?;
@@ -608,8 +735,16 @@ impl OrchestratorBuilder {
             signal.clone(),
             emitter.clone(),
         );
-        let executor =
-            ToolExecutor::new(tools.clone(), Arc::new(skills), tasks, limits, feed.clone());
+        let executor = ToolExecutor::new(
+            tools.clone(),
+            Arc::new(skills),
+            tasks,
+            limits,
+            feed.clone(),
+            artifacts.clone(),
+            store.clone(),
+            emitter.clone(),
+        );
 
         let gateway: Arc<dyn LlmGateway> = match self.gateway {
             Some(g) => g,
@@ -644,7 +779,9 @@ impl OrchestratorBuilder {
             registry,
             tools,
             fingerprints,
+            store_dir: self.config.store_dir,
             store,
+            artifacts,
             supervisor,
             runtime: self.config.runtime,
             replay_safe,

@@ -391,6 +391,7 @@ mod tests {
             workspace_id: "w".into(),
             session_id: "parent".into(),
             root_session_id: "parent".into(),
+            turn_id: "t".into(),
             run_id: "run".into(),
             agent_id: "root".into(),
             invocation_id: "inv".into(),
@@ -413,6 +414,8 @@ mod tests {
                 code: c.into(),
                 message: "m".into(),
             }),
+            artifact_preview: Vec::new(),
+            artifacts_next_cursor: None,
         }
     }
 

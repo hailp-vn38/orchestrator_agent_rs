@@ -121,6 +121,43 @@ pub struct ResultError {
     pub message: String,
 }
 
+/// Vai trò hiển thị/liệt kê của artifact (docs/17 §17.2–17.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ArtifactRole {
+    Primary,
+    Intermediate,
+}
+
+impl ArtifactRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Intermediate => "intermediate",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "primary" => Self::Primary,
+            "intermediate" => Self::Intermediate,
+            _ => return None,
+        })
+    }
+}
+
+/// Tham chiếu bất biến, đã xác minh tới một artifact đã commit (docs/17 §17.2–17.3).
+/// Không bao giờ chứa payload byte hay đường dẫn filesystem nội bộ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactRef {
+    pub id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub role: ArtifactRole,
+}
+
 /// Read projection của attempt mới nhất cho `(session_id, turn_id)`. `Completed` chỉ là
 /// trạng thái thực thi, không khẳng định yêu cầu nghiệp vụ đã đạt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +173,10 @@ pub struct AgentResult {
     pub output: Option<String>,
     pub final_message_id: Option<String>,
     pub error: Option<ResultError>,
+    /// Trang đầu giới hạn các artifact đã commit của turn (docs/18 §18.7).
+    pub artifact_preview: Vec<ArtifactRef>,
+    /// Cursor opaque để đọc trang artifact tiếp theo qua `Orchestrator::list_artifacts`.
+    pub artifacts_next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -11,8 +11,12 @@
 //! (parent → active child), shutdown drain/quiesce/join.
 //! M6 (observation): `subscribe` (bounded broadcast, best-effort) + `snapshot` (family, một read
 //! transaction); committed event chỉ publish sau commit và chỉ invalidate canonical view.
+//! M7 (artifacts): local `ArtifactStore`, scoped `ToolContext` capabilities (`artifacts().put/open`,
+//! `checkpoint().current/commit`), `list_artifacts`, `open_artifact`, `backup_to` và `AgentResult`
+//! artifact preview/cursor.
 
 mod agent;
+mod artifact;
 mod compaction;
 mod config;
 mod error;
@@ -35,6 +39,7 @@ mod tool;
 mod types;
 
 pub use agent::{AgentDefinition, AgentMode, AgentRegistry};
+pub use artifact::{ArtifactDownload, ArtifactInput, ArtifactReader};
 pub use config::{
     LlmBackend, LlmConfig, LlmProviderConfig, OrchestratorConfig, ProviderAuth, RuntimeConfig,
 };
@@ -43,10 +48,12 @@ pub use feed::{ExecutionEvent, FeedItem, Subscription};
 pub use orchestrator::{Orchestrator, OrchestratorBuilder};
 pub use secret::SecretString;
 pub use tool::{
-    HostTool, ToolContext, ToolDescriptor, ToolEffect, ToolError, ToolOutcome, ToolScope,
+    HostTool, ToolArtifacts, ToolCheckpoint, ToolContext, ToolDescriptor, ToolEffect, ToolError,
+    ToolOutcome, ToolScope,
 };
 pub use types::{
-    AcceptedTurn, AgentResult, CallerContext, FamilySnapshot, InvocationSnapshot, InvocationStatus,
-    MessageRole, MessageToolCall, MessageView, OperatorContext, Page, PageRequest, ResultError,
-    RunSnapshot, RunStatus, SessionPolicy, SessionSnapshot, VerifiedToolResolution,
+    AcceptedTurn, AgentResult, ArtifactRef, ArtifactRole, CallerContext, FamilySnapshot,
+    InvocationSnapshot, InvocationStatus, MessageRole, MessageToolCall, MessageView,
+    OperatorContext, Page, PageRequest, ResultError, RunSnapshot, RunStatus, SessionPolicy,
+    SessionSnapshot, VerifiedToolResolution,
 };

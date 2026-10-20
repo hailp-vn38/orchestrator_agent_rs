@@ -49,6 +49,7 @@ pub(crate) struct RunRoute {
 pub(crate) struct RunRecord {
     pub run_id: String,
     pub session_id: String,
+    pub turn_id: String,
     pub agent_id: String,
     pub provider_id: String,
     pub model_id: String,
@@ -279,6 +280,10 @@ impl SessionStore {
 
     pub(crate) async fn close(&self) {
         self.pool.close().await;
+    }
+
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 
     #[cfg(test)]
@@ -534,7 +539,7 @@ impl SessionStore {
         run_id: &str,
     ) -> Result<Option<RunRecord>, OrchestratorError> {
         let row = sqlx::query(
-            "SELECT r.session_id, r.agent_id, r.provider_id, r.model_id, r.status, \
+            "SELECT r.session_id, r.turn_id, r.agent_id, r.provider_id, r.model_id, r.status, \
              s.owner_id, s.workspace_id, s.permissions_json, s.parent_session_id \
              FROM agent_runs r JOIN sessions s ON s.id = r.session_id WHERE r.id = ?1",
         )
@@ -549,6 +554,7 @@ impl SessionStore {
         Ok(Some(RunRecord {
             run_id: run_id.to_owned(),
             session_id: row.try_get("session_id").map_err(db("read run"))?,
+            turn_id: row.try_get("turn_id").map_err(db("read run turn"))?,
             agent_id: row.try_get("agent_id").map_err(db("read run"))?,
             provider_id: row.try_get("provider_id").map_err(db("read run"))?,
             model_id: row.try_get("model_id").map_err(db("read run"))?,
@@ -643,6 +649,77 @@ impl SessionStore {
                     .map(str::to_owned),
             })
         }))
+    }
+
+    /// Dựng danh sách tham chiếu bền vững (committed artifact IDs, manifest checkpoint IDs,
+    /// invocation metadata) của session để gắn nguyên văn vào compaction checkpoint, đảm bảo
+    /// model không bao giờ mất ID sau khi nén context (docs/17 §17.10).
+    pub(crate) async fn session_durable_ledger(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, OrchestratorError> {
+        let art_rows = sqlx::query(
+            "SELECT id, name, mime_type, role, size_bytes FROM artifacts \
+             WHERE session_id = ?1 ORDER BY created_at ASC, id ASC LIMIT 64",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db("list session artifacts for ledger"))?;
+
+        let cp_rows = sqlx::query(
+            "SELECT id, tool_name, checkpoint_artifact_id, result_json FROM tool_invocations \
+             WHERE session_id = ?1 \
+               AND (checkpoint_artifact_id IS NOT NULL OR result_json IS NOT NULL) \
+             ORDER BY rowid DESC LIMIT 32",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db("list invocation checkpoints for ledger"))?;
+
+        let mut lines = Vec::new();
+        for row in art_rows {
+            let id: String = row.try_get("id").unwrap_or_default();
+            let name: String = row.try_get("name").unwrap_or_default();
+            let mime: String = row.try_get("mime_type").unwrap_or_default();
+            let role: String = row.try_get("role").unwrap_or_default();
+            let size: i64 = row.try_get("size_bytes").unwrap_or(0);
+            lines.push(format!(
+                "- artifact id={id} name={name} role={role} mime={mime} bytes={size}"
+            ));
+        }
+        for row in cp_rows {
+            let inv_id: String = row.try_get("id").unwrap_or_default();
+            let tool: String = row.try_get("tool_name").unwrap_or_default();
+            let cp: Option<String> = row.try_get("checkpoint_artifact_id").unwrap_or(None);
+            let res_json: Option<String> = row.try_get("result_json").unwrap_or(None);
+            if let Some(cp_id) = cp {
+                lines.push(format!(
+                    "- invocation id={inv_id} tool={tool} checkpoint_manifest_id={cp_id}"
+                ));
+            }
+            if let Some(raw) = res_json {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(meta) = v.get("metadata").filter(|m| !m.is_null()) {
+                        let meta_str = meta.to_string();
+                        if meta_str != "{}" && meta_str.len() <= 512 {
+                            lines.push(format!(
+                                "- invocation id={inv_id} tool={tool} metadata={meta_str}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if lines.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(format!(
+                "<preserved_artifact_refs>\n{}\n</preserved_artifact_refs>",
+                lines.join("\n")
+            )))
+        }
     }
 
     /// Ghi checkpoint compaction của session mà run đang chạy (một transaction, một sequence).
@@ -1164,7 +1241,223 @@ impl SessionStore {
                 code,
                 message: error_message.unwrap_or_default(),
             }),
+            artifact_preview: Vec::new(),
+            artifacts_next_cursor: None,
         })
+    }
+
+    /// Đọc `checkpoint_artifact_id` đã commit của đúng `scope.invocation_id` và xác minh
+    /// tính toàn vẹn của artifact đó. Không bao giờ tự kế thừa pointer từ invocation trước.
+    pub(crate) async fn current_checkpoint(
+        &self,
+        scope: &crate::tool::ToolScope,
+        artifacts: &crate::artifact::ArtifactStore,
+    ) -> Result<Option<String>, crate::tool::ToolError> {
+        use crate::artifact::{CODE_ARTIFACT_PERMISSION_DENIED, CODE_ARTIFACT_UNAVAILABLE};
+        let row = sqlx::query(
+            "SELECT ti.checkpoint_artifact_id \
+             FROM tool_invocations ti \
+             JOIN sessions s ON s.id = ti.session_id \
+             WHERE ti.id = ?1 AND ti.session_id = ?2 AND ti.run_id = ?3 \
+               AND s.owner_id = ?4 AND s.workspace_id = ?5",
+        )
+        .bind(&scope.invocation_id)
+        .bind(&scope.session_id)
+        .bind(&scope.run_id)
+        .bind(&scope.owner_id)
+        .bind(&scope.workspace_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| crate::tool::ToolError {
+            code: CODE_ARTIFACT_UNAVAILABLE.into(),
+            message: "could not read invocation checkpoint pointer".into(),
+        })?
+        .ok_or_else(|| crate::tool::ToolError {
+            code: CODE_ARTIFACT_PERMISSION_DENIED.into(),
+            message: "invocation is outside the authorized scope".into(),
+        })?;
+
+        let current: Option<String> =
+            row.try_get("checkpoint_artifact_id")
+                .map_err(|_| crate::tool::ToolError {
+                    code: CODE_ARTIFACT_UNAVAILABLE.into(),
+                    message: "could not decode checkpoint pointer".into(),
+                })?;
+        if let Some(ref id) = current {
+            artifacts
+                .verify_in_family(
+                    &scope.owner_id,
+                    &scope.workspace_id,
+                    &scope.root_session_id,
+                    id,
+                )
+                .await?;
+        }
+        Ok(current)
+    }
+
+    /// Compare-and-swap (CAS) cập nhật `tool_invocations.checkpoint_artifact_id` cho đúng
+    /// `scope.invocation_id` sau khi đã xác minh `manifest_id` tồn tại, thuộc scope và nguyên vẹn.
+    pub(crate) async fn commit_checkpoint(
+        &self,
+        scope: &crate::tool::ToolScope,
+        artifacts: &crate::artifact::ArtifactStore,
+        manifest_id: &str,
+        expected_previous_id: Option<&str>,
+    ) -> Result<(), crate::tool::ToolError> {
+        use crate::artifact::{
+            CODE_ARTIFACT_PERMISSION_DENIED, CODE_ARTIFACT_UNAVAILABLE, CODE_CHECKPOINT_CONFLICT,
+        };
+        if artifacts.fault().should_fail_checkpoint_cas() {
+            return Err(crate::tool::ToolError {
+                code: CODE_ARTIFACT_UNAVAILABLE.into(),
+                message: "injected fault before checkpoint pointer CAS commit".into(),
+            });
+        }
+        artifacts
+            .verify_for_checkpoint_commit(scope, manifest_id)
+            .await?;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| crate::tool::ToolError {
+                code: CODE_ARTIFACT_UNAVAILABLE.into(),
+                message: "could not begin checkpoint CAS transaction".into(),
+            })?;
+
+        // Ghi no-op đầu tiên để lấy write lock ngay và đọc pointer hiện tại.
+        let row = sqlx::query(
+            "UPDATE tool_invocations SET status = status \
+             WHERE id = ?1 AND session_id = ?2 AND run_id = ?3 AND status = 'running' \
+               AND EXISTS ( \
+                 SELECT 1 FROM agent_runs r \
+                 JOIN sessions s ON s.id = r.session_id \
+                 WHERE r.id = ?3 AND r.session_id = ?2 AND r.status = 'running' \
+                   AND s.owner_id = ?4 AND s.workspace_id = ?5 \
+               ) \
+             RETURNING checkpoint_artifact_id",
+        )
+        .bind(&scope.invocation_id)
+        .bind(&scope.session_id)
+        .bind(&scope.run_id)
+        .bind(&scope.owner_id)
+        .bind(&scope.workspace_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| crate::tool::ToolError {
+            code: CODE_ARTIFACT_UNAVAILABLE.into(),
+            message: "could not lock invocation for checkpoint CAS".into(),
+        })?;
+        let Some(row) = row else {
+            let _ = tx.rollback().await;
+            return Err(crate::tool::ToolError {
+                code: CODE_ARTIFACT_PERMISSION_DENIED.into(),
+                message: "invocation is not active in the authorized scope".into(),
+            });
+        };
+        let current: Option<String> = row.try_get("checkpoint_artifact_id").unwrap_or(None);
+        if current.as_deref() != expected_previous_id {
+            let _ = tx.rollback().await;
+            return Err(crate::tool::ToolError {
+                code: CODE_CHECKPOINT_CONFLICT.into(),
+                message: "checkpoint pointer changed concurrently or expected_previous_id is stale"
+                    .into(),
+            });
+        }
+        sqlx::query("UPDATE tool_invocations SET checkpoint_artifact_id = ?2 WHERE id = ?1")
+            .bind(&scope.invocation_id)
+            .bind(manifest_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| crate::tool::ToolError {
+                code: CODE_ARTIFACT_UNAVAILABLE.into(),
+                message: "could not update checkpoint pointer".into(),
+            })?;
+        sqlx::query(
+            "UPDATE sessions SET state_revision = state_revision + 1, updated_at = unixepoch() \
+             WHERE id = ?1",
+        )
+        .bind(&scope.session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| crate::tool::ToolError {
+            code: CODE_ARTIFACT_UNAVAILABLE.into(),
+            message: "could not bump session revision for checkpoint".into(),
+        })?;
+        tx.commit().await.map_err(|_| crate::tool::ToolError {
+            code: CODE_ARTIFACT_UNAVAILABLE.into(),
+            message: "could not commit checkpoint pointer".into(),
+        })?;
+        Ok(())
+    }
+
+    /// Resolve `root_session_id` của một session thuộc `(owner_id, workspace_id)`.
+    pub(crate) async fn root_session_of(
+        &self,
+        owner_id: &str,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> Result<String, OrchestratorError> {
+        let row = sqlx::query(
+            "SELECT owner_id, workspace_id, COALESCE(parent_session_id, id) AS root_session_id \
+             FROM sessions WHERE id = ?1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db("load session root"))?
+        .ok_or_else(|| OrchestratorError::new(ErrorCode::NotFound, "session not found"))?;
+        let owner: String = row.try_get("owner_id").map_err(db("read owner"))?;
+        let workspace: String = row.try_get("workspace_id").map_err(db("read workspace"))?;
+        if owner != owner_id || workspace != workspace_id {
+            return Err(OrchestratorError::new(
+                ErrorCode::PermissionDenied,
+                "the session is outside the caller's scope",
+            ));
+        }
+        row.try_get("root_session_id")
+            .map_err(db("read root_session_id"))
+    }
+
+    /// Tạo bản sao SQLite nhất quán tại `dest_db_path` bằng `VACUUM INTO` (an toàn khi WAL đang
+    /// hoạt động) và trả về danh sách `(storage_key, size_bytes, sha256)` của toàn bộ committed
+    /// artifacts có mặt trong bản snapshot đó.
+    pub(crate) async fn backup_sqlite_to(
+        &self,
+        dest_db_path: &Path,
+    ) -> Result<Vec<(String, u64, String)>, OrchestratorError> {
+        let dest_str = dest_db_path.to_str().ok_or_else(|| {
+            OrchestratorError::new(ErrorCode::InvalidInput, "backup path must be valid UTF-8")
+        })?;
+        sqlx::query("VACUUM INTO ?1")
+            .bind(dest_str)
+            .execute(&self.pool)
+            .await
+            .map_err(db("vacuum into backup db"))?;
+
+        let opts = SqliteConnectOptions::new()
+            .filename(dest_db_path)
+            .read_only(true);
+        let backup_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .map_err(db("open backup db"))?;
+        let rows = sqlx::query("SELECT storage_key, size_bytes, sha256 FROM artifacts ORDER BY id")
+            .fetch_all(&backup_pool)
+            .await
+            .map_err(db("list backup artifacts"))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let key: String = row.try_get("storage_key").map_err(db("read storage_key"))?;
+            let size: i64 = row.try_get("size_bytes").map_err(db("read size_bytes"))?;
+            let sha256: String = row.try_get("sha256").map_err(db("read sha256"))?;
+            out.push((key, size.max(0) as u64, sha256));
+        }
+        backup_pool.close().await;
+        Ok(out)
     }
 }
 

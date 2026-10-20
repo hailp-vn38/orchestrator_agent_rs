@@ -467,8 +467,14 @@ impl AgentRuntime {
         if summary.is_empty() {
             return Err(GatewayError::Protocol);
         }
+        let summary_with_refs = match self.store.session_durable_ledger(&run.session_id).await {
+            Ok(Some(ledger)) if !summary.contains("<preserved_artifact_refs>") => {
+                format!("{summary}\n{ledger}")
+            }
+            _ => summary.to_owned(),
+        };
         let checkpoint = NewCheckpoint {
-            summary: summary.to_owned(),
+            summary: summary_with_refs,
             keep_from_sequence: plan.keep_from_sequence,
             objective: plan.objective,
             model_ref: format!("{}/{}", run.provider_id, run.model_id),
@@ -602,6 +608,7 @@ impl AgentRuntime {
             workspace_id: run.workspace_id.clone(),
             session_id: run.session_id.clone(),
             root_session_id: run.root_session_id().to_owned(),
+            turn_id: run.turn_id.clone(),
             run_id: run_id.to_owned(),
             agent_id: run.agent_id.clone(),
             invocation_id: inv.id.clone(),

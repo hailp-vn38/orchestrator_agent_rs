@@ -108,11 +108,25 @@ pub struct RuntimeConfig {
     /// terminal commit bị mất publication). Engine không tự refresh: đây là giá trị host đọc
     /// qua `Orchestrator::snapshot_refresh_interval`.
     pub snapshot_refresh: Duration,
+    /// Trần byte của một artifact đơn lẻ (`ArtifactStore::put`); vượt thì từ chối ghi.
+    pub artifact_max_bytes: u64,
+    /// Tổng quota byte tối đa của các artifact đã commit trong một `(owner_id, workspace_id)`.
+    pub owner_workspace_quota_bytes: u64,
+    /// Dung lượng đĩa trống tối thiểu phải còn lại trên filesystem chứa artifact store.
+    pub disk_reserve_bytes: u64,
+    /// Trần byte tối đa cho một lần mở/tải artifact (`Orchestrator::open_artifact`).
+    pub download_max_bytes: u64,
+    /// Số lượng `ArtifactRef` tối đa trả về trực tiếp trong `AgentResult::artifact_preview`
+    /// (`1..=page_size`).
+    pub artifact_preview_limit: u32,
+    /// Thời gian ân hạn trước khi orphan sweep xóa file staging/unpublished chưa có metadata.
+    pub artifact_staging_grace: Duration,
 }
 
 impl Default for RuntimeConfig {
     /// Giá trị theo profile G0 (estimated, chưa phải số đo).
     fn default() -> Self {
+        const MIB: u64 = 1024 * 1024;
         Self {
             supervisor_sweep: Duration::from_secs(30),
             page_size: 50,
@@ -130,6 +144,12 @@ impl Default for RuntimeConfig {
             event_delta_max_bytes: 4 * 1024,
             progress_min_interval: Duration::from_millis(200),
             snapshot_refresh: Duration::from_secs(30),
+            artifact_max_bytes: 128 * MIB,
+            owner_workspace_quota_bytes: 4 * 1024 * MIB,
+            disk_reserve_bytes: 1024 * MIB,
+            download_max_bytes: 256 * MIB,
+            artifact_preview_limit: 20,
+            artifact_staging_grace: Duration::from_secs(300),
         }
     }
 }
@@ -182,6 +202,20 @@ impl RuntimeConfig {
         }
         if self.snapshot_refresh.is_zero() {
             return bad("snapshot_refresh must be > 0");
+        }
+        if self.artifact_max_bytes == 0
+            || self.artifact_max_bytes > self.owner_workspace_quota_bytes
+        {
+            return bad("artifact_max_bytes must be in 1..=owner_workspace_quota_bytes");
+        }
+        if self.download_max_bytes < self.artifact_max_bytes {
+            return bad("download_max_bytes must be >= artifact_max_bytes");
+        }
+        if !(1..=500).contains(&self.artifact_preview_limit) {
+            return bad("artifact_preview_limit must be in 1..=500");
+        }
+        if self.artifact_staging_grace.is_zero() {
+            return bad("artifact_staging_grace must be > 0");
         }
         Ok(())
     }
@@ -415,6 +449,41 @@ mod tests {
             "http://host:12x",
         ] {
             assert_eq!(normalize_endpoint(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn runtime_config_validates_artifact_limits() {
+        let d = RuntimeConfig::default();
+        assert!(d.validate().is_ok());
+
+        for bad in [
+            RuntimeConfig {
+                artifact_max_bytes: 0,
+                ..d.clone()
+            },
+            RuntimeConfig {
+                artifact_max_bytes: d.owner_workspace_quota_bytes + 1,
+                ..d.clone()
+            },
+            RuntimeConfig {
+                download_max_bytes: d.artifact_max_bytes - 1,
+                ..d.clone()
+            },
+            RuntimeConfig {
+                artifact_preview_limit: 0,
+                ..d.clone()
+            },
+            RuntimeConfig {
+                artifact_preview_limit: 501,
+                ..d.clone()
+            },
+            RuntimeConfig {
+                artifact_staging_grace: Duration::ZERO,
+                ..d.clone()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
         }
     }
 }

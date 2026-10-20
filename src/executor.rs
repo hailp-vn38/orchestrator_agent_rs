@@ -15,9 +15,11 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::AgentDefinition;
-use crate::feed::{ExecutionFeed, ProgressSink};
+use crate::artifact::ArtifactStore;
+use crate::feed::{Emitter, ExecutionFeed, ProgressSink};
 use crate::gateway::ModelTool;
 use crate::skill::{render, SkillManager};
+use crate::store::SessionStore;
 use crate::subagent::{self, Delegation, SubagentInput, TaskManager, SUBAGENT_TOOL};
 use crate::tool::{
     HostTool, ToolContext, ToolDescriptor, ToolEffect, ToolError, ToolOutcome, ToolScope,
@@ -27,6 +29,8 @@ use crate::types::SessionPolicy;
 
 /// Tên built-in tool nạp skill theo nhu cầu.
 pub(crate) const SKILL_TOOL: &str = "skill";
+/// Tên built-in tool đọc đoạn văn bản UTF-8 có giới hạn của committed artifact.
+pub(crate) const ARTIFACT_READ_TOOL: &str = "artifact_read";
 /// Mã lỗi kỹ thuật ổn định gửi lại cho model.
 pub(crate) const CODE_NOT_ALLOWED: &str = "TOOL_NOT_ALLOWED";
 pub(crate) const CODE_UNAVAILABLE: &str = "TOOL_UNAVAILABLE";
@@ -109,6 +113,11 @@ pub(crate) enum Runnable {
     Skill {
         id: String,
     },
+    ArtifactRead {
+        artifact_id: String,
+        offset_bytes: u64,
+        max_bytes: Option<u64>,
+    },
     Host {
         tool: Arc<dyn HostTool>,
         effect: ToolEffect,
@@ -141,15 +150,22 @@ pub(crate) struct ToolExecutor {
     tasks: TaskManager,
     limits: ToolLimits,
     feed: ExecutionFeed,
+    artifacts: ArtifactStore,
+    store: SessionStore,
+    emitter: Emitter,
 }
 
 impl ToolExecutor {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         tools: BTreeMap<String, Arc<dyn HostTool>>,
         skills: Arc<SkillManager>,
         tasks: TaskManager,
         limits: ToolLimits,
         feed: ExecutionFeed,
+        artifacts: ArtifactStore,
+        store: SessionStore,
+        emitter: Emitter,
     ) -> Self {
         let descriptors = tools
             .iter()
@@ -162,6 +178,9 @@ impl ToolExecutor {
             tasks,
             limits,
             feed,
+            artifacts,
+            store,
+            emitter,
         }
     }
 
@@ -184,6 +203,9 @@ impl ToolExecutor {
             .collect();
         if eff.tools.contains(SKILL_TOOL) && !self.skills.available(&eff.skills).is_empty() {
             out.push(skill_tool());
+        }
+        if eff.tools.contains(ARTIFACT_READ_TOOL) {
+            out.push(artifact_read_tool());
         }
         if self.subagent_offered(eff) {
             out.push(self.tasks.tool_definition());
@@ -212,6 +234,39 @@ impl ToolExecutor {
                 Ok(()) => Prepared::Run(Runnable::Skill {
                     id: args["id"].as_str().unwrap_or_default().to_owned(),
                 }),
+                Err(e) => reject(CODE_INVALID_ARGS, format!("invalid arguments: {e}")),
+            };
+        }
+        if name == ARTIFACT_READ_TOOL {
+            return match validate_args(&artifact_read_tool().input_schema, &args) {
+                Ok(()) => {
+                    let Some(offset_bytes) =
+                        args.get("offset_bytes").map_or(Some(0), |v| v.as_u64())
+                    else {
+                        return reject(
+                            CODE_INVALID_ARGS,
+                            "invalid arguments: offset_bytes must be a non-negative integer".into(),
+                        );
+                    };
+                    let max_bytes = match args.get("max_bytes") {
+                        None => None,
+                        Some(v) => match v.as_u64() {
+                            Some(n) if n > 0 => Some(n),
+                            _ => {
+                                return reject(
+                                    CODE_INVALID_ARGS,
+                                    "invalid arguments: max_bytes must be a positive integer"
+                                        .into(),
+                                )
+                            }
+                        },
+                    };
+                    Prepared::Run(Runnable::ArtifactRead {
+                        artifact_id: args["artifact_id"].as_str().unwrap_or_default().to_owned(),
+                        offset_bytes,
+                        max_bytes,
+                    })
+                }
                 Err(e) => reject(CODE_INVALID_ARGS, format!("invalid arguments: {e}")),
             };
         }
@@ -275,6 +330,37 @@ impl ToolExecutor {
                 }
                 Err(e) => Settled::failure(e.code(), &e.message()),
             }),
+            Runnable::ArtifactRead {
+                artifact_id,
+                offset_bytes,
+                max_bytes,
+            } => {
+                let cap = max_bytes
+                    .and_then(|n| usize::try_from(n).ok())
+                    .map_or(self.limits.model_cap_bytes, |n| {
+                        n.clamp(1, self.limits.model_cap_bytes)
+                    });
+                let result = match self
+                    .artifacts
+                    .read_model_excerpt(&scope, &artifact_id, offset_bytes, cap)
+                    .await
+                {
+                    Ok((art, excerpt, has_more)) => Ok(ToolOutcome {
+                        call_id: scope.tool_call_id,
+                        content: excerpt,
+                        metadata: json!({
+                            "artifact_id": art.id,
+                            "name": art.name,
+                            "mime_type": art.mime_type,
+                            "size_bytes": art.size_bytes,
+                            "offset_bytes": offset_bytes,
+                            "truncated": has_more,
+                        }),
+                    }),
+                    Err(e) => Err(e),
+                };
+                Dispatch::Settled(self.settle(result))
+            }
             Runnable::Host { tool, effect, args } => {
                 self.run_host(tool, effect, args, scope, cancel).await
             }
@@ -299,7 +385,14 @@ impl ToolExecutor {
     ) -> Dispatch {
         let cancelled = Arc::new(AtomicBool::new(cancel.is_cancelled()));
         let progress = ProgressSink::new(&self.feed, &scope, self.limits.progress_interval);
-        let context = ToolContext::new(scope, Arc::clone(&cancelled), Some(progress));
+        let context = ToolContext::new(
+            scope.clone(),
+            Arc::clone(&cancelled),
+            Some(progress),
+            Some(self.artifacts.clone()),
+            Some(self.store.clone()),
+            Some(self.emitter.clone()),
+        );
         let guarded = AssertUnwindSafe(tool.execute(context, args)).catch_unwind();
         let watcher = async {
             cancel.cancelled().await;
@@ -313,10 +406,49 @@ impl ToolExecutor {
             }
         });
         match timed.await {
-            Ok(Ok(result)) => Dispatch::Settled(self.settle(result)),
+            Ok(Ok(Ok(outcome))) => {
+                if let Err(err) = self.verify_outcome_artifacts(&scope, &outcome).await {
+                    return Dispatch::Settled(self.settle(Err(err)));
+                }
+                Dispatch::Settled(self.settle(Ok(outcome)))
+            }
+            Ok(Ok(Err(err))) => Dispatch::Settled(self.settle(Err(err))),
             Err(_) => self.abnormal(effect, CODE_TIMEOUT, "the tool exceeded its time limit"),
             Ok(Err(_panic)) => self.abnormal(effect, CODE_PANICKED, "the tool panicked"),
         }
+    }
+
+    async fn verify_outcome_artifacts(
+        &self,
+        scope: &ToolScope,
+        outcome: &ToolOutcome,
+    ) -> Result<(), ToolError> {
+        let Some(ids) = outcome.metadata.get("artifact_ids") else {
+            return Ok(());
+        };
+        let Some(list) = ids.as_array() else {
+            return Err(ToolError {
+                code: crate::artifact::CODE_ARTIFACT_INVALID_INPUT.into(),
+                message: "metadata.artifact_ids must be an array of strings".into(),
+            });
+        };
+        for entry in list {
+            let Some(aid) = entry.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+                return Err(ToolError {
+                    code: crate::artifact::CODE_ARTIFACT_INVALID_INPUT.into(),
+                    message: "metadata.artifact_ids entries must be non-empty strings".into(),
+                });
+            };
+            self.artifacts
+                .verify_in_family(
+                    &scope.owner_id,
+                    &scope.workspace_id,
+                    &scope.root_session_id,
+                    aid,
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     /// Timeout/panic: tool ReadOnly có thể báo lỗi kỹ thuật; tool Mutating có outcome unknown.
@@ -342,6 +474,7 @@ pub(crate) fn replay_safe_names(tools: &BTreeMap<String, Arc<dyn HostTool>>) -> 
         .map(|(name, _)| name.clone())
         .collect();
     names.insert(SKILL_TOOL.to_owned());
+    names.insert(ARTIFACT_READ_TOOL.to_owned());
     names.insert(SUBAGENT_TOOL.to_owned());
     names
 }
@@ -397,6 +530,25 @@ fn skill_tool() -> ModelTool {
             "type": "object",
             "properties": { "id": { "type": "string" } },
             "required": ["id"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn artifact_read_tool() -> ModelTool {
+    ModelTool {
+        name: ARTIFACT_READ_TOOL.to_owned(),
+        description: "Read a bounded UTF-8 text excerpt from a committed artifact in the \
+                      current session family by artifact_id."
+            .to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "artifact_id": { "type": "string" },
+                "offset_bytes": { "type": "integer" },
+                "max_bytes": { "type": "integer" }
+            },
+            "required": ["artifact_id"],
             "additionalProperties": false
         }),
     }
