@@ -6,7 +6,7 @@ Use case kiểm thử qua API công khai của library: `Orchestrator::create_se
 
 - `fetch_youtube_transcript`: gọi **yt-dlp subprocess** (không qua shell), tải phụ đề tự có / tự động ở `vi`, `en`, `en-US` theo thứ tự ưu tiên, parse WebVTT thành plain text; xuất bản `youtube-transcript.txt` (intermediate artifact) và trả transcript trong tool result.
 - LLM đọc transcript rồi tóm tắt tiếng Việt thành nội dung Markdown.
-- `publish_youtube_markdown`: xuất bản `youtube-summary.md` (primary artifact). Root báo thành công sau khi tool publish xác nhận artifact ID.
+- `publish_youtube_markdown`: bắt buộc có `transcript_artifact_id` từ bước fetch, đọc xác minh artifact theo scoped capability trước khi xuất bản `youtube-summary.md` (primary). Root báo thành công sau khi tool publish xác nhận artifact ID.
 - Host đọc lại artifact qua API public (size/SHA-256 verification) rồi ghi file Markdown cục bộ; model không được cung cấp đường dẫn file cần ghi.
 
 ## Chạy integration test offline
