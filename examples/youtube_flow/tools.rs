@@ -298,7 +298,10 @@ impl HostTool for PublishYoutubeMarkdown {
             .ok_or_else(|| error("INVALID_INPUT", "transcript_artifact_id is required"))?;
         let reader = ctx.artifacts().open(transcript_id).await?;
         if reader.metadata().name != "youtube-transcript.txt" {
-            return Err(error("INVALID_INPUT", "expected a YouTube transcript artifact"));
+            return Err(error(
+                "INVALID_INPUT",
+                "expected a YouTube transcript artifact",
+            ));
         }
         if reader.read_to_string().await?.trim().is_empty() {
             return Err(error("NO_TRANSCRIPT", "transcript artifact is empty"));
