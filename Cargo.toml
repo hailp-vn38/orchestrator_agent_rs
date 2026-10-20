@@ -1,0 +1,21 @@
+[package]
+name = "orchestrator_agent_rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Embeddable multi-agent orchestrator library (v5.0 design)"
+publish = false
+
+# Spike G0 là package độc lập (có [workspace] riêng), không thuộc library.
+exclude = ["spikes/", "docs/"]
+
+[dependencies]
+async-trait = "0.1"
+serde_json = "1"
+sha2 = "0.10"
+# Không tạo runtime: chỉ dùng tokio::fs của runtime do host sở hữu (EMB-04).
+tokio = { version = "1", default-features = false, features = ["fs"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+tempfile = "3"
