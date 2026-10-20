@@ -129,4 +129,3 @@ impl LlmGateway for ClientGateway {
         }
     }
 }
-

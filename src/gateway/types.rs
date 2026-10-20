@@ -124,4 +124,3 @@ pub trait LlmGateway: Send + Sync {
         sink: StreamSink<'_>,
     ) -> Result<ModelResponse, GatewayError>;
 }
-

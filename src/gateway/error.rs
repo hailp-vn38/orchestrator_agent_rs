@@ -94,4 +94,3 @@ fn http_status(msg: &str) -> Option<u16> {
     let i = msg.find("status: ")? + 8;
     msg[i..].chars().take(3).collect::<String>().parse().ok()
 }
-

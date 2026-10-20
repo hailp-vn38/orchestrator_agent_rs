@@ -58,4 +58,3 @@ pub(crate) fn to_chat_messages(messages: &[ModelMessage]) -> Vec<ChatMessage> {
     }
     out
 }
-
