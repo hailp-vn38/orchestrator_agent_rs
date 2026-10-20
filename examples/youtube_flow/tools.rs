@@ -265,11 +265,14 @@ impl HostTool for PublishYoutubeMarkdown {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "publish_youtube_markdown".into(),
-            description: "Publish the completed video summary as a Markdown file artifact. Call only after reading the transcript. Argument markdown is the final report, including the source URL.".into(),
+            description: "Publish the completed video summary as Markdown. Requires the transcript_artifact_id returned by fetch_youtube_transcript and the full markdown report.".into(),
             input_schema: json!({
                 "type": "object",
-                "properties": {"markdown": {"type": "string"}},
-                "required": ["markdown"]
+                "properties": {
+                    "markdown": {"type": "string"},
+                    "transcript_artifact_id": {"type": "string"}
+                },
+                "required": ["markdown", "transcript_artifact_id"]
             }),
             effect: ToolEffect::Mutating,
         }
@@ -285,6 +288,20 @@ impl HostTool for PublishYoutubeMarkdown {
         }
         if ctx.is_cancelled() {
             return Err(error("CANCELLED", "Markdown publication was cancelled"));
+        }
+        // Verify provenance through the library's scoped artifact capability.
+        // An arbitrary ID from the model cannot authorize another session's data.
+        let transcript_id = args
+            .get("transcript_artifact_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| error("INVALID_INPUT", "transcript_artifact_id is required"))?;
+        let reader = ctx.artifacts().open(transcript_id).await?;
+        if reader.metadata().name != "youtube-transcript.txt" {
+            return Err(error("INVALID_INPUT", "expected a YouTube transcript artifact"));
+        }
+        if reader.read_to_string().await?.trim().is_empty() {
+            return Err(error("NO_TRANSCRIPT", "transcript artifact is empty"));
         }
         let artifact = ctx
             .artifacts()
