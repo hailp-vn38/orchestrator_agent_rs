@@ -3,7 +3,9 @@
 
 use sqlx::Row;
 
-use super::{db, message_from_row, SessionStore};
+use super::codec::db;
+use super::transcript::message_from_row;
+use super::SessionStore;
 use crate::error::{ErrorCode, OrchestratorError};
 use crate::types::{
     CallerContext, FamilySnapshot, InvocationSnapshot, InvocationStatus, ResultError, RunSnapshot,
@@ -117,7 +119,7 @@ impl SessionStore {
     ) -> Result<FamilySnapshot, OrchestratorError> {
         // Authorization và đọc cùng một transaction: không có cửa sổ giữa kiểm quyền và dữ liệu.
         let mut tx = self.pool.begin().await.map_err(db("begin snapshot"))?;
-        let scope = super::authorize_on(&mut tx, caller, root_id).await?;
+        let scope = super::session::authorize_on(&mut tx, caller, root_id).await?;
         if scope.is_child {
             return Err(OrchestratorError::new(
                 ErrorCode::InvalidInput,
