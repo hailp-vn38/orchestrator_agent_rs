@@ -1,6 +1,6 @@
 [package]
 name = "orchestrator-agent"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Embeddable Root/Subagent orchestrator for Tokio hosts: durable SQLite history, crash recovery, tools, skills and local artifacts"
