@@ -139,7 +139,7 @@ Mọi hàm async trả `Result<_, OrchestratorError>`. Sau `shutdown()` các hà
 | Field / hàm | Ý nghĩa |
 |---|---|
 | `OrchestratorConfig::new(llm, agents, store_dir)` | Tạo config với `RuntimeConfig::default()` |
-| `llm: LlmConfig` | Danh sách `LlmProviderConfig` |
+| `llm: LlmConfig` | Danh sách `LlmProviderConfig` (để trống khi dùng `with_provider_runtime`) |
 | `agents: Vec<AgentDefinition>` | Registry agent |
 | `store_dir` | Thư mục SQLite + owner lock + artifact. Dùng DB riêng, không dùng DB nghiệp vụ của host |
 | `runtime: RuntimeConfig` | Giới hạn vận hành (bên dưới) |
@@ -157,6 +157,17 @@ Mọi hàm async trả `Result<_, OrchestratorError>`. Sau `shutdown()` các hà
 | `request_timeout` | Timeout của *một* request LLM |
 
 `SecretString::new(..)` che giá trị khi `Debug`. Host tự resolve secret trước `build()`; library validate cục bộ, không gọi remote lúc build.
+
+#### Provider runtime của server (thay `LlmProviderConfig`)
+
+Khi host/server đã sở hữu việc gọi model (credential, client, routing), cắm bằng
+`Orchestrator::builder(cfg).with_provider_runtime(Arc<dyn ProviderRuntime>)` và để trống `llm.providers`
+(nếu không trống sẽ bị từ chối với `ConfigReason::ProviderRuntimeConflict`).
+
+| Mục | Ý nghĩa |
+|---|---|
+| `ProviderRuntime::providers()` | `Vec<RuntimeProvider { id, fingerprint }>`: alias mà agent tham chiếu qua `provider_id`, kèm fingerprint routing không chứa secret (đổi khi alias trỏ backend khác để recovery không resume nhầm) |
+| `ProviderRuntime::complete(&ModelRequest, &CancellationToken, StreamSink)` | Một lượt model hoàn chỉnh. Chỉ trả `Ok` khi response đã xong; lỗi/hủy/timeout trả `Err(GatewayError)` |
 
 #### `AgentDefinition`
 

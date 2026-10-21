@@ -75,6 +75,8 @@ pub enum ConfigReason {
     DuplicateSkill,
     UnknownSkill,
     ProjectInstructionsInvalid,
+    /// Host cắm `ProviderRuntime` nhưng `LlmConfig` vẫn khai báo provider (hai nguồn mâu thuẫn).
+    ProviderRuntimeConflict,
 }
 
 impl ConfigReason {
@@ -108,6 +110,7 @@ impl ConfigReason {
             Self::DuplicateSkill => "DUPLICATE_SKILL",
             Self::UnknownSkill => "UNKNOWN_SKILL",
             Self::ProjectInstructionsInvalid => "PROJECT_INSTRUCTIONS_INVALID",
+            Self::ProviderRuntimeConflict => "PROVIDER_RUNTIME_CONFLICT",
         }
     }
 }

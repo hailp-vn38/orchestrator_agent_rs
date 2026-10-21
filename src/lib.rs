@@ -45,7 +45,10 @@ pub use config::{
 };
 pub use error::{ConfigReason, ErrorCode, OrchestratorError};
 pub use feed::{ExecutionEvent, FeedItem, Subscription};
-pub use gateway::ModelParams;
+pub use gateway::{
+    GatewayError, ModelMessage, ModelParams, ModelRequest, ModelResponse, ModelRole, ModelTool,
+    ModelToolCall, ModelUsage, ProviderRuntime, RuntimeProvider, StreamEvent, StreamSink,
+};
 pub use orchestrator::{Orchestrator, OrchestratorBuilder};
 pub use secret::SecretString;
 pub use tool::{

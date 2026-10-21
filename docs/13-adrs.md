@@ -169,3 +169,15 @@ Mỗi quyết định dưới đây có trạng thái **Accepted** theo thảo l
 **Decision:** Shutdown releases store process-owner lock only after local write-capable tasks quiesce/join; an incomplete shutdown cannot report success. External uncertain mutations still require reconciliation. Best-effort SSE notifications are supplemented by periodic canonical snapshot refresh while active runs exist, even if connection stays open. No durable event-log.
 
 **Why:** Preserve single-owner execution and UI convergence without distributed scheduling or replay infrastructure.
+
+## ADR-018 — Server Provider Runtime Replaces Library-Owned LLM Clients
+
+**Status:** Accepted (2026-10-21); **supersedes only the "library creates provider clients" part of EMB-12 and the "host cannot inject gateway" rule in ADR-015 for model access**.
+
+**Decision:** Host/server may plug in `ProviderRuntime` via `OrchestratorBuilder::with_provider_runtime` instead of `LlmConfig`. The runtime declares `RuntimeProvider { id, fingerprint }` and performs each model turn; the library keeps owning prompts, tool loop, persistence and recovery. `llm.providers` must be empty when a runtime is used (`ConfigReason::ProviderRuntimeConflict`); the host-supplied fingerprint replaces `routing_fingerprint` (EMB-16). Runtime must return `Ok` only for a fully finished response.
+
+**Why:** A server host already owns credentials, clients and routing; configuring providers twice is error-prone and leaks secrets into a second place.
+
+**Alternatives rejected:** Mixing `LlmConfig` and runtime providers (ambiguous routing and fingerprint source), exposing the raw `LlmGateway` publicly (leaks internal seam and `llm` crate types).
+
+**Consequences:** Host is responsible for credential handling, timeouts and error sanitising (`GatewayError`); fingerprint must change when the alias targets a different backend or recovery may resume on the wrong one.

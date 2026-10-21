@@ -12,7 +12,7 @@ use crate::config::{OrchestratorConfig, ProviderAuth};
 use crate::error::{ConfigReason, OrchestratorError};
 use crate::executor::{replay_safe_names, ToolExecutor, ToolLimits};
 use crate::feed::{Emitter, ExecutionFeed};
-use crate::gateway::{ClientGateway, LlmGateway};
+use crate::gateway::{ClientGateway, LlmGateway, ProviderRuntime, RuntimeGateway, RuntimeProvider};
 use crate::owner_lock::OwnerLock;
 use crate::prompt::PromptBuilder;
 use crate::runtime::{AgentRuntime, ContextPolicy};
@@ -37,6 +37,7 @@ impl Orchestrator {
             config,
             tools: Vec::new(),
             gateway: None,
+            provider_runtime: None,
             drop_admission_triggers: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "test-support")]
             feed_fault: None,
@@ -49,6 +50,14 @@ impl Orchestrator {
 impl OrchestratorBuilder {
     pub fn register_tool(mut self, tool: Arc<dyn HostTool>) -> Self {
         self.tools.push(tool);
+        self
+    }
+
+    /// Tích hợp provider runtime của server/host: model được gọi qua `runtime` thay vì
+    /// `LlmProviderConfig`. Khi dùng, `config.llm.providers` phải để trống; provider alias và
+    /// routing fingerprint lấy từ [`ProviderRuntime::providers`].
+    pub fn with_provider_runtime(mut self, runtime: Arc<dyn ProviderRuntime>) -> Self {
+        self.provider_runtime = Some(runtime);
         self
     }
 
@@ -87,7 +96,27 @@ impl OrchestratorBuilder {
         let base_version = parse_base_version(BASE_INSTRUCTIONS)?;
 
         self.config.validate_local()?;
-        self.config.llm.validate()?;
+        // (provider_id -> fingerprint) từ runtime của server hoặc từ `LlmConfig`.
+        let fingerprints: BTreeMap<String, String> = match &self.provider_runtime {
+            Some(runtime) => {
+                if !self.config.llm.providers.is_empty() {
+                    return Err(OrchestratorError::config(
+                        ConfigReason::ProviderRuntimeConflict,
+                        "llm.providers must be empty when a provider runtime is used",
+                    ));
+                }
+                runtime_fingerprints(&runtime.providers())?
+            }
+            None => {
+                self.config.llm.validate()?;
+                self.config
+                    .llm
+                    .providers
+                    .iter()
+                    .map(|p| (p.id.trim().to_string(), p.routing_fingerprint()))
+                    .collect()
+            }
+        };
 
         let mut tools: BTreeMap<String, Arc<dyn HostTool>> = BTreeMap::new();
         for tool in self.tools {
@@ -109,7 +138,8 @@ impl OrchestratorBuilder {
         }
 
         let names: HashSet<String> = tools.keys().cloned().collect();
-        let registry = AgentRegistry::build(self.config.agents, &self.config.llm, &names).await?;
+        let provider_ids: HashSet<String> = fingerprints.keys().cloned().collect();
+        let registry = AgentRegistry::build(self.config.agents, &provider_ids, &names).await?;
 
         let skills = match &self.config.skills_dir {
             Some(dir) => SkillManager::discover(dir, self.config.runtime.skill_max_bytes).await?,
@@ -166,13 +196,6 @@ impl OrchestratorBuilder {
         );
         let agents: HashMap<String, AgentDefinition> =
             registry.list().map(|d| (d.id.clone(), d.clone())).collect();
-        let fingerprints: BTreeMap<String, String> = self
-            .config
-            .llm
-            .providers
-            .iter()
-            .map(|p| (p.id.trim().to_string(), p.routing_fingerprint()))
-            .collect();
 
         // Owner guard từ lúc mở execution store (không đợi M5). Lock nhả khi supervisor
         // và mọi task local đã dừng.
@@ -280,9 +303,13 @@ impl OrchestratorBuilder {
             },
         );
 
-        let gateway: Arc<dyn LlmGateway> = match self.gateway {
-            Some(g) => g,
-            None => Arc::new(ClientGateway::new(&self.config.llm.providers)),
+        let gateway: Arc<dyn LlmGateway> = match (self.gateway, self.provider_runtime) {
+            (Some(g), _) => g,
+            (None, Some(runtime)) => {
+                let providers = runtime.providers();
+                Arc::new(RuntimeGateway::new(runtime, &providers))
+            }
+            (None, None) => Arc::new(ClientGateway::new(&self.config.llm.providers)),
         };
         let shutdown = CancellationToken::new();
         let runtime = AgentRuntime::new(
@@ -325,6 +352,34 @@ impl OrchestratorBuilder {
             emitter,
         })
     }
+}
+
+fn runtime_fingerprints(
+    providers: &[RuntimeProvider],
+) -> Result<BTreeMap<String, String>, OrchestratorError> {
+    if providers.is_empty() {
+        return Err(OrchestratorError::config(
+            ConfigReason::NoProviders,
+            "the provider runtime must expose at least one provider",
+        ));
+    }
+    let mut out = BTreeMap::new();
+    for p in providers {
+        let id = p.id.trim();
+        if id.is_empty() || p.fingerprint.trim().is_empty() {
+            return Err(OrchestratorError::config(
+                ConfigReason::EmptyProviderId,
+                "provider runtime: provider id and fingerprint must not be empty",
+            ));
+        }
+        if out.insert(id.to_string(), p.fingerprint.clone()).is_some() {
+            return Err(OrchestratorError::config(
+                ConfigReason::DuplicateProviderId,
+                format!("duplicate provider id '{id}'"),
+            ));
+        }
+    }
+    Ok(out)
 }
 
 pub(super) fn parse_base_version(base: &str) -> Result<u32, OrchestratorError> {

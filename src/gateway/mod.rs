@@ -12,10 +12,13 @@ mod client;
 mod collect;
 mod convert;
 mod error;
+mod runtime;
 #[cfg(test)]
 mod tests;
 mod types;
 
 pub use client::ClientGateway;
 pub use error::GatewayError;
+pub(crate) use runtime::RuntimeGateway;
+pub use runtime::{ProviderRuntime, RuntimeProvider};
 pub use types::*;

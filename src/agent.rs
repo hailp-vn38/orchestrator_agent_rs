@@ -4,7 +4,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use crate::config::LlmConfig;
 use crate::error::{ConfigReason, OrchestratorError};
 use crate::gateway::ModelParams;
 use crate::tool::RESERVED_TOOL_NAMES;
@@ -145,7 +144,7 @@ impl AgentRegistry {
     /// built-in (`subagent`, `skill`) luôn hợp lệ trong `allowed_tools`.
     pub(crate) async fn build(
         definitions: Vec<AgentDefinition>,
-        llm: &LlmConfig,
+        provider_ids: &HashSet<String>,
         registered_tools: &HashSet<String>,
     ) -> Result<Self, OrchestratorError> {
         if definitions.is_empty() {
@@ -154,7 +153,7 @@ impl AgentRegistry {
                 "at least one agent definition is required",
             ));
         }
-        let providers: HashSet<&str> = llm.providers.iter().map(|p| p.id.trim()).collect();
+        let providers: HashSet<&str> = provider_ids.iter().map(String::as_str).collect();
         let mut map = HashMap::with_capacity(definitions.len());
         for def in definitions {
             validate_definition(&def, &providers, registered_tools).await?;

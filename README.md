@@ -158,6 +158,17 @@ Every async function returns `Result<_, OrchestratorError>`. After `shutdown()`,
 
 `SecretString::new(..)` masks the value in `Debug`. The host resolves secrets before `build()`; the library validates locally and makes no remote calls at build time.
 
+#### Server provider runtime (instead of `LlmProviderConfig`)
+
+When the host/server already owns model access (credentials, clients, routing), plug it in with
+`Orchestrator::builder(cfg).with_provider_runtime(Arc<dyn ProviderRuntime>)` and leave `llm.providers` empty
+(a non-empty list is rejected with `ConfigReason::ProviderRuntimeConflict`).
+
+| Item | Meaning |
+|---|---|
+| `ProviderRuntime::providers()` | `Vec<RuntimeProvider { id, fingerprint }>`: aliases agents reference via `provider_id`, plus a non-secret routing fingerprint (change it when the alias points to another backend, so recovery will not resume on the wrong one) |
+| `ProviderRuntime::complete(&ModelRequest, &CancellationToken, StreamSink)` | One complete model turn. Return `Ok` only for a fully finished response; errors/cancel/timeout return `Err(GatewayError)` |
+
 #### `AgentDefinition`
 
 `AgentDefinition::new(id, provider_id, model_id)`, then chain:

@@ -51,6 +51,7 @@ pub struct OrchestratorBuilder {
     config: OrchestratorConfig,
     tools: Vec<Arc<dyn HostTool>>,
     gateway: Option<Arc<dyn LlmGateway>>,
+    provider_runtime: Option<Arc<dyn crate::gateway::ProviderRuntime>>,
     drop_admission_triggers: Arc<AtomicBool>,
     #[cfg(feature = "test-support")]
     feed_fault: Option<Arc<crate::feed::FeedFault>>,
