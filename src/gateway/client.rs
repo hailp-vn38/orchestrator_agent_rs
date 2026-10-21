@@ -13,7 +13,7 @@ use crate::config::{LlmBackend, LlmProviderConfig, ProviderAuth};
 use super::collect::{collect, RawStream};
 use super::convert::to_chat_messages;
 use super::error::{map_error, GatewayError};
-use super::types::{LlmGateway, ModelRequest, ModelResponse, StreamSink};
+use super::types::{LlmGateway, ModelRequest, ModelResponse, ModelUsage, StreamSink};
 
 /// Trần output token mỗi request khi agent không đặt `ModelParams::max_output_tokens`.
 const MAX_OUTPUT_TOKENS: u32 = 4096;
@@ -140,11 +140,13 @@ impl LlmGateway for ClientGateway {
                 .map_err(|e| map_error(&e))?;
             collect(raw, sink).await
         };
-        tokio::select! {
-            () = cancel.cancelled() => Err(GatewayError::Cancelled),
+        let mut response = tokio::select! {
+            () = cancel.cancelled() => return Err(GatewayError::Cancelled),
             r = tokio::time::timeout(cfg.request_timeout, work) => {
-                r.unwrap_or(Err(GatewayError::Timeout))
+                r.unwrap_or(Err(GatewayError::Timeout))?
             }
-        }
+        };
+        response.usage = Some(ModelUsage::or_estimated(response.usage, request, &response));
+        Ok(response)
     }
 }

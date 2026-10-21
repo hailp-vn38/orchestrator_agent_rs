@@ -453,8 +453,14 @@ pub struct AgentResult {
     pub session_id: String,
     pub turn_id: String,
     pub run_id: String,        // latest attempt of this logical turn
+    pub attempt: u32,
     pub status: RunStatus,
+    pub steps: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
     pub output: Option<String>,
+    pub final_message_id: Option<String>,
+    pub error: Option<ResultError>,
     pub artifact_preview: Vec<ArtifactRef>, // bounded first page, e.g. <= 20
     pub artifacts_next_cursor: Option<String>,
 }

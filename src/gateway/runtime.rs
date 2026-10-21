@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use super::error::GatewayError;
-use super::types::{LlmGateway, ModelRequest, ModelResponse, StreamSink};
+use super::types::{LlmGateway, ModelRequest, ModelResponse, ModelUsage, StreamSink};
 
 /// Provider do runtime của server/host sở hữu (thay vì `LlmProviderConfig` để library tự gọi LLM).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +73,8 @@ impl LlmGateway for RuntimeGateway {
         if !self.known.contains_key(request.provider_id.trim()) {
             return Err(GatewayError::NotConfigured);
         }
-        self.runtime.complete(request, cancel, sink).await
+        let mut response = self.runtime.complete(request, cancel, sink).await?;
+        response.usage = Some(ModelUsage::or_estimated(response.usage, request, &response));
+        Ok(response)
     }
 }

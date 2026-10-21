@@ -45,6 +45,9 @@ fn result(status: RunStatus, output: Option<&str>, code: Option<&str>) -> AgentR
         run_id: "r".into(),
         attempt: 0,
         status,
+        steps: 1,
+        input_tokens: 0,
+        output_tokens: 0,
         output: output.map(str::to_owned),
         final_message_id: output.map(|_| "m".into()),
         error: code.map(|c| crate::types::ResultError {

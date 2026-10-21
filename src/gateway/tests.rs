@@ -8,7 +8,8 @@ use super::collect::{collect, RawStream};
 use super::convert::to_chat_messages;
 use super::error::{map_error, GatewayError};
 use super::types::{
-    ModelMessage, ModelParams, ModelResponse, ModelRole, ModelToolCall, StreamEvent,
+    ModelMessage, ModelParams, ModelRequest, ModelResponse, ModelRole, ModelToolCall, ModelUsage,
+    StreamEvent,
 };
 
 async fn collect_q(raw: RawStream) -> Result<ModelResponse, GatewayError> {
@@ -299,4 +300,41 @@ fn model_params_validation_and_cache_key() {
     }
     assert_ne!(ok.cache_key(), ModelParams::default().cache_key());
     assert_eq!(ok.cache_key(), ok.cache_key());
+}
+
+#[test]
+fn model_usage_estimates_missing_fields_and_preserves_measured_tokens() {
+    let req = ModelRequest {
+        provider_id: "p".into(),
+        model_id: "m".into(),
+        system: "abcd".repeat(10), // 40 bytes -> 10 tokens
+        messages: vec![ModelMessage::text(ModelRole::User, "efgh".repeat(5))], // 20 bytes -> 5 tokens
+        tools: Vec::new(),
+        params: ModelParams::default(),
+    };
+    let resp = ModelResponse {
+        text: "12345678".into(), // 8 bytes -> 2 tokens
+        finish_reason: "stop".into(),
+        tool_calls: Vec::new(),
+        usage: None,
+    };
+
+    let estimated = ModelUsage::or_estimated(None, &req, &resp);
+    assert_eq!(estimated, ModelUsage::new(15, 2));
+    assert_eq!(estimated.total_tokens(), 17);
+
+    let measured = ModelUsage::or_estimated(Some(ModelUsage::new(100, 42)), &req, &resp);
+    assert_eq!(measured, ModelUsage::new(100, 42));
+    assert_eq!(measured.total_tokens(), 142);
+
+    let partial = ModelUsage::or_estimated(
+        Some(ModelUsage {
+            input_tokens: Some(80),
+            output_tokens: None,
+        }),
+        &req,
+        &resp,
+    );
+    assert_eq!(partial, ModelUsage::new(80, 2));
+    assert_eq!(partial.total_tokens(), 82);
 }

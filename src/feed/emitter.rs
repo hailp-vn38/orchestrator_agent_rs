@@ -80,11 +80,25 @@ impl Emitter {
                 self.committed_run(run_id, event_type, payload).await;
             }
         }
+        let (steps, input_tokens, output_tokens) = self
+            .store
+            .run_usage_summary(run_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or((0, 0, 0));
         let event_type = event::run_terminal(status);
         self.committed_run(
             run_id,
             event_type,
-            json!({ "status": status.as_str(), "error_code": error_code }),
+            json!({
+                "status": status.as_str(),
+                "error_code": error_code,
+                "steps": steps,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens.saturating_add(output_tokens),
+            }),
         )
         .await;
     }

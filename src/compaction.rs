@@ -7,7 +7,7 @@
 //! giữ nguyên.
 
 use crate::executor::truncate_utf8;
-use crate::gateway::{ModelMessage, ModelRequest, ModelRole};
+use crate::gateway::{ModelMessage, ModelRequest, ModelResponse, ModelRole};
 use crate::store::{Checkpoint, Context, TranscriptEntry};
 
 /// Cắt từng đoạn đưa vào summarizer để chính bước summary không bị overflow.
@@ -198,6 +198,16 @@ pub(crate) fn estimate_tokens(request: &ModelRequest) -> usize {
         })
         .sum();
     (request.system.len() + tools + messages).div_ceil(BYTES_PER_TOKEN)
+}
+
+/// Ước lượng token (estimated, không phải số đo) của output model (text + tool calls).
+pub(crate) fn estimate_output_tokens(response: &ModelResponse) -> usize {
+    let calls: usize = response
+        .tool_calls
+        .iter()
+        .map(|c| c.name.len() + c.arguments.to_string().len())
+        .sum();
+    (response.text.len() + calls).div_ceil(BYTES_PER_TOKEN)
 }
 
 #[cfg(test)]

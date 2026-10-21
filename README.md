@@ -167,7 +167,7 @@ When the host/server already owns model access (credentials, clients, routing), 
 | Item | Meaning |
 |---|---|
 | `ProviderRuntime::providers()` | `Vec<RuntimeProvider { id, fingerprint }>`: aliases agents reference via `provider_id`, plus a non-secret routing fingerprint (change it when the alias points to another backend, so recovery will not resume on the wrong one) |
-| `ProviderRuntime::complete(&ModelRequest, &CancellationToken, StreamSink)` | One complete model turn. Return `Ok` only for a fully finished response; errors/cancel/timeout return `Err(GatewayError)` |
+| `ProviderRuntime::complete(&ModelRequest, &CancellationToken, StreamSink)` | One complete model turn. Return `Ok` only for a fully finished response; errors/cancel/timeout return `Err(GatewayError)`. Missing `ModelUsage` fields are filled with request/response token estimates |
 
 #### `AgentDefinition`
 
@@ -233,7 +233,7 @@ Common build errors: `INVALID_INPUT` with a `ConfigReason` (`err.reason()`), `ST
 | `create_session(&caller, agent_id) -> String` | Creates a Root session. `Subagent`-only agent → `PERMISSION_DENIED` |
 | `create_session_with_policy(&caller, agent_id, SessionPolicy)` | Narrows tool/skill permissions (intersect only, never widen); `child_allowed_*` sets a ceiling for children |
 | `submit(&caller, session_id, text) -> AcceptedTurn` | Commits input + run claim and returns immediately, without waiting for the LLM. `SESSION_BUSY`, `SESSION_ARCHIVED`, `INVALID_INPUT` (empty text) |
-| `result(&caller, session_id, turn_id) -> AgentResult` | Latest-attempt projection: `status`, `output`, `final_message_id`, `error`, `artifact_preview`, `artifacts_next_cursor` |
+| `result(&caller, session_id, turn_id) -> AgentResult` | Latest-attempt projection: `status`, `steps`, `input_tokens`, `output_tokens` (`total_tokens()`), `output`, `final_message_id`, `error`, `artifact_preview`, `artifacts_next_cursor` |
 | `history(&caller, session_id, PageRequest) -> Page<MessageView>` | Canonical history of one session |
 | `archive_session(&caller, session_id)` | Blocks new admission; history stays readable; idempotent |
 | `cancel(&caller, session_id)` | Cooperatively cancels the active run (and waiting children). The run ends `cancelled` and does not auto-resume |

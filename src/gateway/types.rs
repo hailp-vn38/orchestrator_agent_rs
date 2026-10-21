@@ -121,12 +121,52 @@ pub struct ModelRequest {
     pub params: ModelParams,
 }
 
-/// Usage do provider báo; `None` ở cấp response nghĩa là provider không trả số liệu
-/// (runtime không bịa số và không coi đó là lỗi).
+/// Usage do provider báo hoặc được gateway ước lượng khi stream không kèm usage.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ModelUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+}
+
+impl ModelUsage {
+    pub const fn new(input_tokens: u64, output_tokens: u64) -> Self {
+        Self {
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+        }
+    }
+
+    /// Ước lượng token đầu vào và đầu ra từ request/response (~4 byte/token) khi provider
+    /// không trả số liệu usage trực tiếp trong stream.
+    pub fn estimate(request: &ModelRequest, response: &ModelResponse) -> Self {
+        Self {
+            input_tokens: Some(crate::compaction::estimate_tokens(request) as u64),
+            output_tokens: Some(crate::compaction::estimate_output_tokens(response) as u64),
+        }
+    }
+
+    /// Giữ số đo của provider nếu có, phần thiếu điền bằng ước lượng từ request/response.
+    pub fn or_estimated(
+        usage: Option<Self>,
+        request: &ModelRequest,
+        response: &ModelResponse,
+    ) -> Self {
+        let est = Self::estimate(request, response);
+        match usage {
+            Some(u) => Self {
+                input_tokens: u.input_tokens.or(est.input_tokens),
+                output_tokens: u.output_tokens.or(est.output_tokens),
+            },
+            None => est,
+        }
+    }
+
+    /// Tổng token (`input_tokens + output_tokens`) đã ghi nhận.
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens
+            .unwrap_or_default()
+            .saturating_add(self.output_tokens.unwrap_or_default())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

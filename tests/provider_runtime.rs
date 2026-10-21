@@ -87,6 +87,30 @@ async fn runs_through_server_runtime_without_llm_config() {
     };
     assert_eq!(r.status, RunStatus::Completed);
     assert_eq!(r.output.as_deref(), Some("from server runtime"));
+    assert_eq!(r.steps, 1);
+    assert!(
+        r.input_tokens > 0,
+        "estimated input_tokens must be recorded"
+    );
+    assert!(
+        r.output_tokens > 0,
+        "estimated output_tokens must be recorded"
+    );
+    assert_eq!(r.total_tokens(), r.input_tokens + r.output_tokens);
+
+    let snap = o.snapshot(&who, &sid).await.unwrap();
+    let latest = snap.root.latest_run.expect("latest run");
+    assert_eq!(latest.steps, r.steps);
+    assert_eq!(latest.input_tokens, r.input_tokens);
+    assert_eq!(latest.output_tokens, r.output_tokens);
+    assert_eq!(latest.total_tokens(), r.total_tokens());
+
+    let run_summary = o.get_run(&who, &r.run_id).await.unwrap();
+    assert_eq!(run_summary.steps, r.steps);
+    assert_eq!(run_summary.input_tokens, r.input_tokens);
+    assert_eq!(run_summary.output_tokens, r.output_tokens);
+    assert_eq!(run_summary.total_tokens(), r.total_tokens());
+
     assert_eq!(
         rt.seen.lock().unwrap().as_slice(),
         [("server".to_string(), "srv-model".to_string())]

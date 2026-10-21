@@ -710,11 +710,20 @@ async fn usage_is_recorded_when_reported_and_missing_usage_is_not_an_error() {
 
     let r1 = run_turn(&o, &sid, "one").await;
     assert_eq!(r1.status, RunStatus::Completed);
+    assert_eq!(r1.steps, 1);
+    assert_eq!(r1.input_tokens, 120);
+    assert_eq!(r1.output_tokens, 30);
+    assert_eq!(r1.total_tokens(), 150);
     let r2 = run_turn(&o, &sid, "two").await;
     assert_eq!(
         r2.status,
         RunStatus::Completed,
         "missing usage is not an error"
+    );
+    assert_eq!(r2.steps, 1);
+    assert_eq!(
+        (r2.input_tokens, r2.output_tokens, r2.total_tokens()),
+        (0, 0, 0)
     );
 
     let mut c = env.sql().await;

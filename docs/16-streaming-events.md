@@ -48,8 +48,8 @@ Phân biệt **reconstructable** (state cuối có thể dựng lại từ SQLit
 | Event type | Ý nghĩa | Storage/reconstruction |
 |---|---|---|
 | `run.started` | User/child run admitted | `agent_runs.status='running'` + session revision |
-| `run.completed`, `run.failed`, `run.cancelled`, `run.interrupted` | Run terminal | `agent_runs` + revision |
-| `step.started`, `step.ended` | LLM model call lifecycle/usage UI | Ephemeral; `agent_runs.steps/tokens` là snapshot tổng |
+| `run.completed`, `run.failed`, `run.cancelled`, `run.interrupted` | Run terminal (`steps`, `input_tokens`, `output_tokens`, `total_tokens`) | `agent_runs` + revision |
+| `step.started`, `step.ended` | LLM model call lifecycle/usage UI (`usage: { input_tokens, output_tokens, total_tokens }`) | Ephemeral; `agent_runs.steps/tokens` là snapshot tổng |
 | `text.delta` | Partial assistant text của một step/message | **Ephemeral**, không lưu mỗi delta |
 | `message.committed` | Full assistant message đã ghi | `messages`, gồm `sequence`, revision |
 | `tool.started` | Tool invocation persisted trước side effect | `tool_invocations.requested/running` + revision |

@@ -156,6 +156,7 @@ impl AgentRuntime {
                 "usage": response.usage.map(|u| json!({
                     "input_tokens": u.input_tokens,
                     "output_tokens": u.output_tokens,
+                    "total_tokens": u.total_tokens(),
                 })),
             }),
             Err(e) => json!({ "step_id": step_id, "completed": false, "error_code": e.code() }),

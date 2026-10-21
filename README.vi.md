@@ -167,7 +167,7 @@ Khi host/server đã sở hữu việc gọi model (credential, client, routing)
 | Mục | Ý nghĩa |
 |---|---|
 | `ProviderRuntime::providers()` | `Vec<RuntimeProvider { id, fingerprint }>`: alias mà agent tham chiếu qua `provider_id`, kèm fingerprint routing không chứa secret (đổi khi alias trỏ backend khác để recovery không resume nhầm) |
-| `ProviderRuntime::complete(&ModelRequest, &CancellationToken, StreamSink)` | Một lượt model hoàn chỉnh. Chỉ trả `Ok` khi response đã xong; lỗi/hủy/timeout trả `Err(GatewayError)` |
+| `ProviderRuntime::complete(&ModelRequest, &CancellationToken, StreamSink)` | Một lượt model hoàn chỉnh. Chỉ trả `Ok` khi response đã xong; lỗi/hủy/timeout trả `Err(GatewayError)`. Nếu thiếu `ModelUsage` thì các trường thiếu được điền bằng ước lượng token từ request/response |
 
 #### `AgentDefinition`
 
@@ -233,7 +233,7 @@ Lỗi build phổ biến: `INVALID_INPUT` kèm `ConfigReason` (`err.reason()`), 
 | `create_session(&caller, agent_id) -> String` | Tạo Root session. Agent `Subagent`-only → `PERMISSION_DENIED` |
 | `create_session_with_policy(&caller, agent_id, SessionPolicy)` | Thu hẹp quyền tool/skill (chỉ giao, không mở rộng); `child_allowed_*` đặt trần cho child |
 | `submit(&caller, session_id, text) -> AcceptedTurn` | Commit input + run claim rồi trả ngay, không chờ LLM. `SESSION_BUSY`, `SESSION_ARCHIVED`, `INVALID_INPUT` (text rỗng) |
-| `result(&caller, session_id, turn_id) -> AgentResult` | Projection attempt mới nhất: `status`, `output`, `final_message_id`, `error`, `artifact_preview`, `artifacts_next_cursor` |
+| `result(&caller, session_id, turn_id) -> AgentResult` | Projection attempt mới nhất: `status`, `steps`, `input_tokens`, `output_tokens` (`total_tokens()`), `output`, `final_message_id`, `error`, `artifact_preview`, `artifacts_next_cursor` |
 | `history(&caller, session_id, PageRequest) -> Page<MessageView>` | Lịch sử canonical của một session |
 | `archive_session(&caller, session_id)` | Chặn admission mới; history vẫn đọc được; idempotent |
 | `cancel(&caller, session_id)` | Hủy hợp tác run active (và child đang chờ). Run kết thúc `cancelled`, không tự resume |

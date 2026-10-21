@@ -84,7 +84,7 @@ impl SessionStore {
         Ok(steps.unwrap_or(0).max(0) as u32)
     }
 
-    /// Cộng usage provider báo (chỉ số đo được, không ước lượng) vào run đang chạy.
+    /// Cộng usage provider báo hoặc gateway ước lượng vào run đang chạy.
     pub(crate) async fn add_usage(
         &self,
         run_id: &str,
@@ -102,6 +102,28 @@ impl SessionStore {
         .await
         .map_err(db("add usage"))?;
         Ok(())
+    }
+
+    /// Tổng `(steps, input_tokens, output_tokens)` đã ghi nhận của `run_id`.
+    pub(crate) async fn run_usage_summary(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<(u32, u64, u64)>, OrchestratorError> {
+        let row =
+            sqlx::query("SELECT steps, input_tokens, output_tokens FROM agent_runs WHERE id = ?1")
+                .bind(run_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db("read run usage summary"))?;
+        let Some(row) = row else { return Ok(None) };
+        let steps: i64 = row.try_get("steps").map_err(db("read steps"))?;
+        let input: i64 = row.try_get("input_tokens").map_err(db("read input"))?;
+        let output: i64 = row.try_get("output_tokens").map_err(db("read output"))?;
+        Ok(Some((
+            u32::try_from(steps).unwrap_or(u32::MAX),
+            u64::try_from(input).unwrap_or_default(),
+            u64::try_from(output).unwrap_or_default(),
+        )))
     }
 
     /// Final assistant message, `final_message_id` và terminal `completed` cùng transaction.
@@ -240,7 +262,8 @@ impl SessionStore {
         turn_id: &str,
     ) -> Result<AgentResult, OrchestratorError> {
         let row = sqlx::query(
-            "SELECT id, resume_attempt, status, final_message_id, error_code, error_message \
+            "SELECT id, resume_attempt, status, steps, input_tokens, output_tokens, \
+             final_message_id, error_code, error_message \
              FROM agent_runs WHERE session_id = ?1 AND turn_id = ?2 \
              ORDER BY resume_attempt DESC LIMIT 1",
         )
@@ -258,6 +281,9 @@ impl SessionStore {
         let run_id: String = row.try_get("id").map_err(db("read run id"))?;
         let attempt: i64 = row.try_get("resume_attempt").map_err(db("read attempt"))?;
         let status: String = row.try_get("status").map_err(db("read status"))?;
+        let steps: i64 = row.try_get("steps").map_err(db("read steps"))?;
+        let input_tokens: i64 = row.try_get("input_tokens").map_err(db("read input"))?;
+        let output_tokens: i64 = row.try_get("output_tokens").map_err(db("read output"))?;
         let final_message_id: Option<String> =
             row.try_get("final_message_id").map_err(db("read final"))?;
         let error_code: Option<String> = row.try_get("error_code").map_err(db("read error"))?;
@@ -287,6 +313,9 @@ impl SessionStore {
             attempt: attempt as u32,
             status: RunStatus::parse(&status)
                 .ok_or_else(|| OrchestratorError::new(ErrorCode::Internal, "unknown run status"))?,
+            steps: u32::try_from(steps).unwrap_or(u32::MAX),
+            input_tokens: u64::try_from(input_tokens).unwrap_or_default(),
+            output_tokens: u64::try_from(output_tokens).unwrap_or_default(),
             output,
             final_message_id,
             error: error_code.map(|code| ResultError {

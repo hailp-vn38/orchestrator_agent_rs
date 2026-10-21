@@ -168,6 +168,12 @@ pub struct AgentResult {
     /// `resume_attempt` của run mới nhất.
     pub attempt: u32,
     pub status: RunStatus,
+    /// Số LLM step đã commit của attempt này.
+    pub steps: u32,
+    /// Tổng input token đã dùng của attempt này.
+    pub input_tokens: u64,
+    /// Tổng output token đã dùng của attempt này.
+    pub output_tokens: u64,
     /// Chỉ có khi attempt mới nhất đã commit `final_message_id`; không lấy assistant
     /// text cuối của session hay của attempt trước.
     pub output: Option<String>,
@@ -177,6 +183,13 @@ pub struct AgentResult {
     pub artifact_preview: Vec<ArtifactRef>,
     /// Cursor opaque để đọc trang artifact tiếp theo qua `Orchestrator::list_artifacts`.
     pub artifacts_next_cursor: Option<String>,
+}
+
+impl AgentResult {
+    /// Tổng token (`input_tokens + output_tokens`) đã ghi nhận cho attempt này.
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,6 +370,13 @@ pub struct RunSnapshot {
     pub error: Option<ResultError>,
 }
 
+impl RunSnapshot {
+    /// Tổng token (`input_tokens + output_tokens`) đã ghi nhận cho attempt này.
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
 /// Tool invocation trong snapshot (không kèm arguments/kết quả: không rò dữ liệu nhạy cảm).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvocationSnapshot {
@@ -482,6 +502,13 @@ pub struct RunSummary {
     pub finished_at: Option<i64>,
     pub final_message_id: Option<String>,
     pub error: Option<ResultError>,
+}
+
+impl RunSummary {
+    /// Tổng token (`input_tokens + output_tokens`) đã ghi nhận cho attempt này.
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
 }
 
 /// Một lượt yêu cầu logic (`turn_id` ổn định qua các attempt) và kết quả mới nhất.
