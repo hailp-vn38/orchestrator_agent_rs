@@ -6,7 +6,7 @@ A Rust library you **embed into an existing server** to orchestrate multiple age
 host-provided LLMs, tools and skills. The core does not depend on any web framework: the host owns the Tokio
 runtime, transport, AuthN/AuthZ, and registers domain tools through the `HostTool` trait.
 
-- Crate: `orchestrator-agent` v0.1.0 (imported as `orchestrator_agent_rs`), edition 2021, Rust ≥ 1.89
+- Crate: `orchestrator-agent` v0.3.0 (imported as `orchestrator_agent_rs`), edition 2021, Rust ≥ 1.89
 - Architecture: Root/Subagent share one `AgentRuntime`, the [`llm`](https://crates.io/crates/llm) crate `=1.3.8`,
   SQLx/SQLite as the execution store, and an immutable local `ArtifactStore`
 - Detailed design: [docs/README.md](docs/README.md) · Public contract: [docs/18-embeddable-library.md](docs/18-embeddable-library.md)
@@ -36,7 +36,7 @@ runtime, transport, AuthN/AuthZ, and registers domain tools through the `HostToo
 
 ```toml
 [dependencies]
-orchestrator-agent = "0.1"
+orchestrator-agent = "0.3"
 async-trait = "0.1"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
