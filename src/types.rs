@@ -226,12 +226,14 @@ pub struct MessageView {
     pub tool_calls: Vec<MessageToolCall>,
 }
 
-/// Tool call đã persist trong một assistant message (không kèm arguments).
+/// Tool call đã persist trong một assistant message (kèm `arguments` JSON).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageToolCall {
     /// Provider call ID, chỉ duy nhất trong assistant message chứa nó.
     pub call_id: String,
     pub name: String,
+    /// Tham số JSON mà model truyền khi gọi tool.
+    pub arguments: serde_json::Value,
 }
 
 /// Thu hẹp quyền của **một** session so với `AgentDefinition`. `None` = kế thừa agent;
@@ -377,7 +379,7 @@ impl RunSnapshot {
     }
 }
 
-/// Tool invocation trong snapshot (không kèm arguments/kết quả: không rò dữ liệu nhạy cảm).
+/// Tool invocation trong snapshot (kèm `arguments` và `result` đã persist cho UI/observability).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvocationSnapshot {
     /// Internal invocation ID (dùng cho `resolve_interrupted_invocation`).
@@ -386,7 +388,11 @@ pub struct InvocationSnapshot {
     /// Provider call ID.
     pub tool_call_id: String,
     pub tool_name: String,
+    /// Tham số JSON đã persist của invocation.
+    pub arguments: serde_json::Value,
     pub status: InvocationStatus,
+    /// Kết quả JSON đã persist (`{"content", "metadata"}` hoặc `{"error"}`); `None` khi chưa settle.
+    pub result: Option<serde_json::Value>,
     /// Child session do invocation `subagent` tạo.
     pub child_session_id: Option<String>,
     pub error_code: Option<String>,

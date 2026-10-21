@@ -273,6 +273,12 @@ impl AgentRuntime {
                         "step_id": step_id,
                         "final": false,
                         "tool_call_count": pending.len(),
+                        "tool_calls": pending.iter().map(|inv| json!({
+                            "invocation_id": inv.id,
+                            "tool_call_id": inv.tool_call_id,
+                            "tool_name": inv.tool_name,
+                            "arguments": inv.arguments,
+                        })).collect::<Vec<_>>(),
                     }),
                 )
                 .await;
@@ -281,7 +287,7 @@ impl AgentRuntime {
                     .committed_run(
                         run_id,
                         event::TOOL_STARTED,
-                        tool_payload(&inv.id, &inv.tool_call_id, &inv.tool_name),
+                        tool_payload(&inv.id, &inv.tool_call_id, &inv.tool_name, &inv.arguments),
                     )
                     .await;
             }

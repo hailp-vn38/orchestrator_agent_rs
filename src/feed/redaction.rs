@@ -14,6 +14,29 @@ pub(super) fn redact_all(secrets: &[String], text: &str) -> String {
     out
 }
 
+/// Che secret đệ quy trên mọi chuỗi trong JSON payload trước khi publish.
+pub(super) fn redact_value(secrets: &[String], value: &mut serde_json::Value) {
+    if secrets.is_empty() {
+        return;
+    }
+    match value {
+        serde_json::Value::String(s) => {
+            *s = redact_all(secrets, s);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_value(secrets, item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                redact_value(secrets, v);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Che secret trong một stream text kể cả khi secret bị cắt qua nhiều fragment: giữ lại phần
 /// đuôi (độ dài secret dài nhất − 1 byte) cho tới khi fragment kế tiếp tới hoặc `flush`.
 pub(crate) struct DeltaFilter {

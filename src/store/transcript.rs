@@ -275,6 +275,7 @@ pub(super) fn message_from_row(
             .map(|c| MessageToolCall {
                 call_id: c.id,
                 name: c.name,
+                arguments: c.arguments,
             })
             .collect(),
     })

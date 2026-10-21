@@ -683,11 +683,23 @@ async fn at28_st03_progress_is_ephemeral_and_terminal_events_follow_the_commit()
     assert_eq!(progress[2].payload["message"], json!("step 2"));
     assert_eq!(progress[0].payload["tool_call_id"], json!("c1"));
     assert_eq!(seen[started].payload["tool_name"], json!("probe"));
+    assert_eq!(seen[started].payload["arguments"], probe_args());
+    assert_eq!(seen[completed].payload["arguments"], probe_args());
+    assert_eq!(seen[completed].payload["output"], json!("probe:done"));
+    assert_eq!(
+        seen[completed].payload["result"]["content"],
+        json!("probe:done")
+    );
     assert_eq!(seen[started].root_session_id, sid);
 
     // Progress có thể mất: snapshot (canonical) không cần nó để dựng lại state.
     let snap = o.snapshot(&alice(), &sid).await.unwrap();
     assert_eq!(snap.root.invocations[0].status, InvocationStatus::Completed);
+    assert_eq!(snap.root.invocations[0].arguments, probe_args());
+    assert_eq!(
+        snap.root.invocations[0].result.as_ref().unwrap()["content"],
+        json!("probe:done")
+    );
 }
 
 #[tokio::test]

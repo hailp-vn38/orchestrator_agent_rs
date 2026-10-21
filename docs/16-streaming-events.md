@@ -193,13 +193,13 @@ Ví dụ SSE (không đặt `id:`):
 
 ```text
 event: tool.started
-data: {"event_type":"tool.started","root_session_id":"ses_root","session_id":"ses_child","run_id":"run_7","state_revision":15,"timestamp_ms":1792480000000,"payload":{"tool_call_id":"call_12","tool_name":"run_tests"}}
+data: {"event_type":"tool.started","root_session_id":"ses_root","session_id":"ses_child","run_id":"run_7","state_revision":15,"timestamp_ms":1792480000000,"payload":{"tool_call_id":"call_12","invocation_id":"inv_1","tool_name":"run_tests","arguments":{"suite":"unit"}}}
 
 event: tool.progress
-data: {"event_type":"tool.progress","root_session_id":"ses_root","session_id":"ses_child","run_id":"run_7","state_revision":null,"timestamp_ms":1792480001000,"payload":{"tool_call_id":"call_12","message":"42 tests running"}}
+data: {"event_type":"tool.progress","root_session_id":"ses_root","session_id":"ses_child","run_id":"run_7","state_revision":null,"timestamp_ms":1792480001000,"payload":{"tool_call_id":"call_12","invocation_id":"inv_1","tool_name":"run_tests","message":"42 tests running"}}
 
 event: tool.completed
-data: {"event_type":"tool.completed","root_session_id":"ses_root","session_id":"ses_child","run_id":"run_7","state_revision":16,"timestamp_ms":1792480006000,"payload":{"tool_call_id":"call_12"}}
+data: {"event_type":"tool.completed","root_session_id":"ses_root","session_id":"ses_child","run_id":"run_7","state_revision":16,"timestamp_ms":1792480006000,"payload":{"tool_call_id":"call_12","invocation_id":"inv_1","tool_name":"run_tests","arguments":{"suite":"unit"},"output":"all passed","result":{"content":"all passed","metadata":null},"error_code":null}}
 ```
 
 ## 16.9. Backpressure & resource policy
@@ -242,7 +242,7 @@ MVP dùng **một concrete `tokio::sync::broadcast` channel** cho server process
 ## 16.11a. Quyết định triển khai M6
 
 - `subscribe`/`snapshot` nhận **Root** của family; child id (kể cả của chính owner) trả `INVALID_INPUT`, child được thấy qua snapshot theo ancestry trong SQLite. Authorization và đọc snapshot cùng một read transaction.
-- Snapshot/history trả text canonical nguyên văn; redaction secret chỉ áp cho text ephemeral (`text.delta`, `tool.progress`). Snapshot không chứa arguments/kết quả/progress của tool.
+- Snapshot/history trả text canonical nguyên văn; redaction secret áp đệ quy trên mọi `ExecutionEvent.payload` trước khi publish (bao gồm `text.delta`, `tool.progress`, `arguments`, `output`, `result`). `MessageToolCall` mang `arguments` và `InvocationSnapshot` mang cả `arguments` lẫn `result` đã persist (không lưu `tool.progress` vào SQLite/snapshot).
 - `tool.progress` có `percent` tùy chọn (0..=100); revision trên event được đọc sau commit nên hai event liên tiếp có thể cùng revision. Chi tiết: [evidence M6](evidence/m6.md).
 
 ## 16.12. OpenCode reference & differences

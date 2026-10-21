@@ -1,12 +1,18 @@
 //! Envelope sự kiện và phần tử của subscription.
 use serde_json::{json, Value};
 
-/// Payload chung của event tool (không bao giờ có arguments/kết quả).
-pub(crate) fn tool_payload(invocation_id: &str, tool_call_id: &str, tool_name: &str) -> Value {
+/// Payload chung của event tool (kèm `arguments` JSON mà LLM truyền cho tool).
+pub(crate) fn tool_payload(
+    invocation_id: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments: &Value,
+) -> Value {
     json!({
         "tool_call_id": tool_call_id,
         "invocation_id": invocation_id,
         "tool_name": tool_name,
+        "arguments": arguments,
     })
 }
 

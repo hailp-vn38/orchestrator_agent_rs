@@ -94,7 +94,11 @@ impl AgentRuntime {
         {
             Ok(true) => {
                 // Chỉ sau khi tool-result + terminal state đã commit.
-                let mut payload = tool_payload(&inv.id, &inv.tool_call_id, &inv.tool_name);
+                let mut payload =
+                    tool_payload(&inv.id, &inv.tool_call_id, &inv.tool_name, &inv.arguments);
+                payload["output"] = json!(settled.model_text);
+                payload["result"] = serde_json::from_str(&settled.result_json)
+                    .unwrap_or_else(|_| json!({ "content": settled.model_text }));
                 payload["error_code"] = json!(settled.error_code);
                 self.emitter
                     .committed_run(

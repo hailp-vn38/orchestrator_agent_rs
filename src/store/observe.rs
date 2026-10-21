@@ -32,6 +32,7 @@ pub(crate) struct ClosedInvocation {
     pub id: String,
     pub tool_call_id: String,
     pub tool_name: String,
+    pub arguments: serde_json::Value,
     pub status: InvocationStatus,
     pub error_code: Option<String>,
 }
@@ -83,7 +84,8 @@ impl SessionStore {
         run_id: &str,
     ) -> Result<Vec<ClosedInvocation>, OrchestratorError> {
         let rows = sqlx::query(
-            "SELECT id, tool_call_id, tool_name, status, error_code FROM tool_invocations \
+            "SELECT id, tool_call_id, tool_name, arguments_json, status, error_code \
+             FROM tool_invocations \
              WHERE run_id = ?1 AND status IN ('interrupted', 'cancelled') ORDER BY rowid",
         )
         .bind(run_id)
@@ -92,10 +94,12 @@ impl SessionStore {
         .map_err(db("load closed invocations"))?;
         rows.iter()
             .map(|r| {
+                let args: String = r.try_get("arguments_json").map_err(db("read invocation"))?;
                 Ok(ClosedInvocation {
                     id: r.try_get("id").map_err(db("read invocation"))?,
                     tool_call_id: r.try_get("tool_call_id").map_err(db("read invocation"))?,
                     tool_name: r.try_get("tool_name").map_err(db("read invocation"))?,
+                    arguments: serde_json::from_str(&args).unwrap_or(serde_json::json!({})),
                     status: {
                         let status: String = r.try_get("status").map_err(db("read invocation"))?;
                         InvocationStatus::parse(&status).ok_or_else(|| {
@@ -244,7 +248,8 @@ async fn recent_invocations(
     limit: u32,
 ) -> Result<Vec<InvocationSnapshot>, OrchestratorError> {
     let rows = sqlx::query(
-        "SELECT id, run_id, tool_call_id, tool_name, status, child_session_id, error_code \
+        "SELECT id, run_id, tool_call_id, tool_name, arguments_json, status, result_json, \
+         child_session_id, error_code \
          FROM tool_invocations WHERE session_id = ?1 ORDER BY rowid DESC LIMIT ?2",
     )
     .bind(session_id)
@@ -256,14 +261,18 @@ async fn recent_invocations(
         .iter()
         .map(|r| {
             let status: String = r.try_get("status").map_err(db("read invocation"))?;
+            let args: String = r.try_get("arguments_json").map_err(db("read invocation"))?;
+            let res: Option<String> = r.try_get("result_json").map_err(db("read invocation"))?;
             Ok(InvocationSnapshot {
                 invocation_id: r.try_get("id").map_err(db("read invocation"))?,
                 run_id: r.try_get("run_id").map_err(db("read invocation"))?,
                 tool_call_id: r.try_get("tool_call_id").map_err(db("read invocation"))?,
                 tool_name: r.try_get("tool_name").map_err(db("read invocation"))?,
+                arguments: serde_json::from_str(&args).unwrap_or(serde_json::json!({})),
                 status: InvocationStatus::parse(&status).ok_or_else(|| {
                     OrchestratorError::new(ErrorCode::Internal, "unknown invocation status")
                 })?,
+                result: res.and_then(|s| serde_json::from_str(&s).ok()),
                 child_session_id: r
                     .try_get("child_session_id")
                     .map_err(db("read invocation"))?,

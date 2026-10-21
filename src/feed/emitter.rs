@@ -69,7 +69,8 @@ impl Emitter {
     ) {
         if let Ok(closed) = self.store.closed_invocations(run_id).await {
             for inv in closed {
-                let mut payload = tool_payload(&inv.id, &inv.tool_call_id, &inv.tool_name);
+                let mut payload =
+                    tool_payload(&inv.id, &inv.tool_call_id, &inv.tool_name, &inv.arguments);
                 let event_type = if inv.status == InvocationStatus::Cancelled {
                     payload["status"] = json!("cancelled");
                     event::TOOL_FAILED

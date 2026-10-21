@@ -1,5 +1,5 @@
 //! Fan-out best-effort qua bounded Tokio broadcast.
-use super::redaction::{redact_all, MIN_SECRET_LEN};
+use super::redaction::{redact_all, redact_value, MIN_SECRET_LEN};
 #[cfg(feature = "test-support")]
 use super::FeedFault;
 use super::{now_ms, DeltaFilter, ExecutionEvent, Subscription};
@@ -87,7 +87,8 @@ impl ExecutionFeed {
     }
 
     /// Không bao giờ chờ subscriber; không có receiver thì event bị bỏ (không queue bền vững).
-    pub(crate) fn publish(&self, event: ExecutionEvent) {
+    pub(crate) fn publish(&self, mut event: ExecutionEvent) {
+        redact_value(&self.inner.secrets, &mut event.payload);
         #[cfg(feature = "test-support")]
         if let Some(fault) = &self.inner.fault {
             for e in fault.intercept(event) {

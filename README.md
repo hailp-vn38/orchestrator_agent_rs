@@ -276,6 +276,11 @@ Event types: `run.started|completed|failed|cancelled|interrupted`, `step.started
 `message.committed`, `tool.started|progress|completed|failed|interrupted`, `session.changed`,
 `compaction.started|completed`.
 
+- `tool.started` payload: `{ "tool_call_id", "invocation_id", "tool_name", "arguments" }`.
+- `tool.completed` / `tool.failed` payload: `{ "tool_call_id", "invocation_id", "tool_name", "arguments", "output", "result", "error_code" }` (`result` is `{ "content", "metadata" }` on success or `{ "error": { "code", "message" } }` on failure).
+- `MessageToolCall` (inside `MessageView::tool_calls`) includes `{ call_id, name, arguments }`.
+- `InvocationSnapshot` (inside `SessionSnapshot::invocations`) includes `{ invocation_id, run_id, tool_call_id, tool_name, arguments, status, result, child_session_id, error_code }`.
+
 An event with `state_revision = Some(..)` is a *committed invalidation* (emitted after DB commit, signalling a stale view);
 an event with `None` is ephemeral (`text.delta`, `tool.progress`). The feed is best-effort, bounded, and never blocks the publisher.
 
@@ -372,8 +377,7 @@ Agents must opt in via `allowed_tools`.
 ## Security model
 
 - Every API checks `owner_id`/`workspace_id`; tool scope is minted by the runtime, never taken from the LLM.
-- Secrets live only in `SecretString`, never in logs/events/errors.
-- Events never contain tool arguments or results.
+- Secrets live only in `SecretString`, never in logs/events/errors (configured API keys are recursively redacted from all `ExecutionEvent` payloads).
 - Artifacts never expose filesystem paths; SHA-256 integrity is verified on read.
 - Project instructions and skill content are untrusted; they do not replace base instructions or execution permissions.
 - Details: [docs/10-security-operations.md](docs/10-security-operations.md).

@@ -7,8 +7,9 @@
 //! - Một `tokio::sync::broadcast` bounded cho cả process: publisher không bao giờ chờ subscriber;
 //!   subscriber chậm nhận `Lagged` → [`FeedItem::ResyncRequired`] rồi bị đóng riêng.
 //! - Không có event log/replay: không `Last-Event-ID`, revision không phải resume cursor.
-//! - Payload không chứa arguments/kết quả tool, secret hay reasoning ẩn: gateway chỉ chuyển text
-//!   đã hiển thị, và giá trị API key đã cấu hình bị che trong mọi text ephemeral.
+//! - Payload của tool event chứa `arguments` (và `output`/`result` khi settle) phục vụ UI/server;
+//!   mọi giá trị API key đã cấu hình đều bị che đệ quy trong `ExecutionEvent.payload` trước khi
+//!   publish, và reasoning ẩn không bao giờ đi vào feed.
 
 use std::sync::Mutex;
 
