@@ -6,7 +6,7 @@ Thư viện Rust **nhúng vào server hiện có** để điều phối nhiều 
 tool và skill do host cung cấp. Core không phụ thuộc web framework: host sở hữu Tokio runtime,
 transport, AuthN/AuthZ và đăng ký domain tool qua trait `HostTool`.
 
-- Crate: `orchestrator-agent` v0.4.0 (import là `orchestrator_agent_rs`), edition 2021, Rust ≥ 1.89
+- Crate: `orchestrator-agent` v0.4.1 (import là `orchestrator_agent_rs`), edition 2021, Rust ≥ 1.89
 - Kiến trúc: Root/Subagent dùng chung `AgentRuntime`, crate [`llm`](https://crates.io/crates/llm) `=1.3.8`,
   SQLx/SQLite làm execution store, `ArtifactStore` cục bộ bất biến
 - Thiết kế chi tiết: [docs/README.md](docs/README.md) · Hợp đồng public: [docs/18-embeddable-library.md](docs/18-embeddable-library.md)
