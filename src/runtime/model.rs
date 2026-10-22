@@ -146,7 +146,14 @@ impl AgentRuntime {
                 emit_text(&safe);
             }
         };
-        let result = self.gateway.complete(request, cancel, &sink).await;
+        let result = self
+            .gateway
+            .complete(request, cancel, &sink)
+            .await
+            .map(|mut response| {
+                response.text = crate::gateway::strip_thinking_blocks(&response.text);
+                response
+            });
         let tail = filter.lock().unwrap_or_else(|p| p.into_inner()).flush();
         emit_text(&tail);
         let ended = match &result {

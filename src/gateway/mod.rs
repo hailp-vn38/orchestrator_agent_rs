@@ -18,6 +18,7 @@ mod tests;
 mod types;
 
 pub use client::ClientGateway;
+pub use collect::strip_thinking_blocks;
 pub use error::GatewayError;
 pub(crate) use runtime::RuntimeGateway;
 pub use runtime::{ProviderRuntime, RuntimeProvider};

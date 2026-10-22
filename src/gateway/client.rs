@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use llm::builder::{LLMBackend as LlmCrateBackend, LLMBuilder};
-use llm::chat::{FunctionTool, Tool};
+use llm::chat::{FunctionTool, ReasoningEffort as LlmReasoningEffort, Tool};
 use llm::LLMProvider;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -13,10 +13,14 @@ use crate::config::{LlmBackend, LlmProviderConfig, ProviderAuth};
 use super::collect::{collect, RawStream};
 use super::convert::to_chat_messages;
 use super::error::{map_error, GatewayError};
-use super::types::{LlmGateway, ModelRequest, ModelResponse, ModelUsage, StreamSink};
+use super::types::{
+    LlmGateway, ModelRequest, ModelResponse, ModelUsage, ReasoningEffort, StreamSink,
+};
 
 /// Trần output token mỗi request khi agent không đặt `ModelParams::max_output_tokens`.
-const MAX_OUTPUT_TOKENS: u32 = 4096;
+/// Đặt ở mức 16_384 để các model có thinking/reasoning không bị cạn ngân sách token trước khi
+/// sinh `output_text` hoặc `function_call`.
+const MAX_OUTPUT_TOKENS: u32 = 16_384;
 
 /// Gateway thật: dựng client `llm` lười theo `(provider, model, system)` và tái sử dụng.
 pub struct ClientGateway {
@@ -90,6 +94,17 @@ fn build_client(
     }
     if let Some(k) = request.params.top_k {
         builder = builder.top_k(k);
+    }
+    if let Some(effort) = request.params.reasoning_effort {
+        let mapped = match effort {
+            ReasoningEffort::Low => LlmReasoningEffort::Low,
+            ReasoningEffort::Medium => LlmReasoningEffort::Medium,
+            ReasoningEffort::High => LlmReasoningEffort::High,
+        };
+        builder = builder.reasoning(true).reasoning_effort(mapped);
+    }
+    if let Some(budget) = request.params.reasoning_budget_tokens {
+        builder = builder.reasoning(true).reasoning_budget_tokens(budget);
     }
     if let ProviderAuth::ApiKey(key) = &cfg.auth {
         builder = builder.api_key(key.expose());

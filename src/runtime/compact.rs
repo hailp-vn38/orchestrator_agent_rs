@@ -40,14 +40,19 @@ impl AgentRuntime {
             system: SUMMARY_SYSTEM.to_owned(),
             messages: vec![ModelMessage::text(ModelRole::User, plan.input)],
             tools: Vec::new(),
-            params: Default::default(),
+            params: self
+                .agents
+                .get(&run.agent_id)
+                .map(|a| a.llm)
+                .unwrap_or_default(),
         };
         let response = self
             .gateway
             .complete(&request, cancel, &|_: StreamEvent| {})
             .await?;
         self.record_usage(&run.run_id, &response).await;
-        let summary = response.text.trim();
+        let clean_text = crate::gateway::strip_thinking_blocks(&response.text);
+        let summary = clean_text.trim();
         if summary.is_empty() {
             return Err(GatewayError::Protocol);
         }

@@ -194,6 +194,9 @@ impl AgentRuntime {
             };
 
             if capped || response.tool_calls.is_empty() {
+                if !capped && run.parent_session_id.is_none() && response.text.trim().is_empty() {
+                    return self.fail(run_id, GatewayError::Protocol).await;
+                }
                 // Tool call (nếu có) bị bỏ khi đã hết steps: chưa persist, không execute.
                 let text = if capped && response.text.trim().is_empty() {
                     STEP_LIMIT_FALLBACK

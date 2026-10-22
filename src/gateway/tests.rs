@@ -4,12 +4,12 @@ use llm::chat::StreamChunk;
 use llm::error::LLMError;
 use llm::{FunctionCall, ToolCall};
 
-use super::collect::{collect, RawStream};
+use super::collect::{collect, strip_thinking_blocks, RawStream};
 use super::convert::to_chat_messages;
 use super::error::{map_error, GatewayError};
 use super::types::{
     ModelMessage, ModelParams, ModelRequest, ModelResponse, ModelRole, ModelToolCall, ModelUsage,
-    StreamEvent,
+    ReasoningEffort, StreamEvent,
 };
 
 async fn collect_q(raw: RawStream) -> Result<ModelResponse, GatewayError> {
@@ -264,6 +264,8 @@ fn model_params_validation_and_cache_key() {
         temperature: Some(0.0),
         top_p: Some(1.0),
         top_k: Some(40),
+        reasoning_effort: Some(ReasoningEffort::Medium),
+        reasoning_budget_tokens: Some(2048),
     };
     assert!(ok.validate().is_ok());
     for bad in [
@@ -292,6 +294,10 @@ fn model_params_validation_and_cache_key() {
             ..Default::default()
         },
         ModelParams {
+            reasoning_budget_tokens: Some(0),
+            ..Default::default()
+        },
+        ModelParams {
             temperature: Some(f32::NAN),
             ..Default::default()
         },
@@ -300,6 +306,62 @@ fn model_params_validation_and_cache_key() {
     }
     assert_ne!(ok.cache_key(), ModelParams::default().cache_key());
     assert_eq!(ok.cache_key(), ok.cache_key());
+}
+
+#[tokio::test]
+async fn collect_strips_thinking_blocks_from_stream_and_final_text() {
+    let (r, events) = collect_events(stream(vec![
+        Ok(StreamChunk::Text("<thi".into())),
+        Ok(StreamChunk::Text("nk>internal reasoning...".into())),
+        Ok(StreamChunk::Text(" still thinking</th".into())),
+        Ok(StreamChunk::Text("ink>\n\nFinal ".into())),
+        Ok(StreamChunk::Text("answer.".into())),
+        Ok(StreamChunk::Done {
+            stop_reason: "end_turn".into(),
+        }),
+    ]))
+    .await;
+    let resp = r.unwrap();
+    assert_eq!(resp.text, "Final answer.");
+    let streamed: String = events
+        .into_iter()
+        .map(|e| match e {
+            StreamEvent::TextDelta(t) => t,
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(streamed, "Final answer.");
+}
+
+#[tokio::test]
+async fn collect_rejects_empty_or_thinking_only_completion_without_tools() {
+    let empty = collect_q(stream(vec![Ok(StreamChunk::Done {
+        stop_reason: "end_turn".into(),
+    })]))
+    .await;
+    assert_eq!(empty, Err(GatewayError::Protocol));
+
+    let only_think = collect_q(stream(vec![
+        Ok(StreamChunk::Text("<think>exhausted token budget".into())),
+        Ok(StreamChunk::Done {
+            stop_reason: "length".into(),
+        }),
+    ]))
+    .await;
+    assert_eq!(only_think, Err(GatewayError::Protocol));
+}
+
+#[test]
+fn strip_thinking_handles_prefilled_and_multiple_blocks() {
+    assert_eq!(
+        strip_thinking_blocks("prefilled reasoning\n</think>\n\nVisible output"),
+        "Visible output"
+    );
+    assert_eq!(
+        strip_thinking_blocks("Part 1 <think>hidden</think> Part 2"),
+        "Part 1 Part 2"
+    );
+    assert_eq!(strip_thinking_blocks("<think>unclosed"), "");
 }
 
 #[test]

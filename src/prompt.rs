@@ -91,7 +91,10 @@ pub(crate) fn model_messages(entries: Vec<TranscriptEntry>) -> Vec<ModelMessage>
             // Result mồ côi (assistant call của nó đã bị loại): không bao giờ gửi riêng lẻ.
             TranscriptEntry::Tool { .. } => {}
             TranscriptEntry::Assistant { text, calls } if calls.is_empty() => {
-                out.push(ModelMessage::text(ModelRole::Assistant, text));
+                out.push(ModelMessage::text(
+                    ModelRole::Assistant,
+                    crate::gateway::strip_thinking_blocks(text),
+                ));
             }
             TranscriptEntry::Assistant { text, calls } => {
                 let mut end = i + 1;
@@ -117,7 +120,7 @@ pub(crate) fn model_messages(entries: Vec<TranscriptEntry>) -> Vec<ModelMessage>
                 match paired {
                     Some(tool_msgs) => {
                         out.push(ModelMessage::assistant_with_calls(
-                            text,
+                            crate::gateway::strip_thinking_blocks(text),
                             calls
                                 .iter()
                                 .map(|c| ModelToolCall {

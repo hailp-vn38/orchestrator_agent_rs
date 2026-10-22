@@ -145,8 +145,9 @@ fn render(out: &mut String, entry: &TranscriptEntry) {
     match entry {
         TranscriptEntry::User(t) => out.push_str(&format!("[user] {}\n", clip(t))),
         TranscriptEntry::Assistant { text, calls } => {
-            if !text.trim().is_empty() {
-                out.push_str(&format!("[assistant] {}\n", clip(text)));
+            let clean = crate::gateway::strip_thinking_blocks(text);
+            if !clean.trim().is_empty() {
+                out.push_str(&format!("[assistant] {}\n", clip(&clean)));
             }
             for c in calls {
                 out.push_str(&format!(

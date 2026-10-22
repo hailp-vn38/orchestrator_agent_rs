@@ -70,6 +70,14 @@ pub struct ModelTool {
     pub input_schema: serde_json::Value,
 }
 
+/// Mức độ suy luận (reasoning effort) yêu cầu cho các model có hỗ trợ thinking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
 /// Tham số sinh của model; `None` = không gửi (provider tự chọn), riêng `max_output_tokens`
 /// `None` = trần mặc định của gateway.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -78,6 +86,8 @@ pub struct ModelParams {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub top_k: Option<u32>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_budget_tokens: Option<u32>,
 }
 
 impl ModelParams {
@@ -94,17 +104,22 @@ impl ModelParams {
         if self.top_k == Some(0) {
             return Err("top_k must be > 0 when set");
         }
+        if self.reasoning_budget_tokens == Some(0) {
+            return Err("reasoning_budget_tokens must be > 0 when set");
+        }
         Ok(())
     }
 
     /// Khoá ổn định để tái sử dụng client theo tham số.
     pub(crate) fn cache_key(&self) -> String {
         format!(
-            "{:?}|{:?}|{:?}|{:?}",
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
             self.max_output_tokens,
             self.temperature.map(f32::to_bits),
             self.top_p.map(f32::to_bits),
-            self.top_k
+            self.top_k,
+            self.reasoning_effort,
+            self.reasoning_budget_tokens
         )
     }
 }

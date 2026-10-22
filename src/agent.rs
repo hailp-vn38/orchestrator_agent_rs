@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::error::{ConfigReason, OrchestratorError};
-use crate::gateway::ModelParams;
+use crate::gateway::{ModelParams, ReasoningEffort};
 use crate::tool::RESERVED_TOOL_NAMES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +145,18 @@ impl AgentDefinition {
     /// `top_k` (`> 0`); không phải backend nào cũng hỗ trợ.
     pub fn with_top_k(mut self, top_k: u32) -> Self {
         self.llm.top_k = Some(top_k);
+        self
+    }
+
+    /// Mức độ suy luận (`Low`, `Medium`, `High`) cho các model hỗ trợ reasoning/thinking.
+    pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.llm.reasoning_effort = Some(effort);
+        self
+    }
+
+    /// Ngân sách token suy luận (`> 0`) cho các backend hỗ trợ `reasoning_budget_tokens`.
+    pub fn with_reasoning_budget_tokens(mut self, tokens: u32) -> Self {
+        self.llm.reasoning_budget_tokens = Some(tokens);
         self
     }
 }
