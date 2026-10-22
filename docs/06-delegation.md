@@ -86,7 +86,7 @@ Nếu child hoàn thành nhưng không có text, dùng `"Subagent completed with
 
 | Error code | Nguyên nhân | Hành vi |
 |---|---|---|
-| `AGENT_NOT_FOUND` / `MODE_DENIED` | Target agent invalid | ToolError, không tạo child. |
+| `AGENT_NOT_FOUND` / `MODE_DENIED` | Target agent invalid hoặc không nằm trong `allowed_subagents` của caller | ToolError, không tạo child. |
 | `PERMISSION_DENIED` / `DEPTH_LIMIT` | Policy chặn | ToolError, không tạo child. |
 | `SESSION_NOT_CHILD` / `SESSION_BUSY` | Resume sai parent/child đang chạy | ToolError. |
 | `MODEL_UNAVAILABLE` | Lỗi model/credential | ToolError được sanitize. |

@@ -97,6 +97,8 @@ impl AgentDefinition {
         self
     }
 
+    /// Giới hạn danh sách subagent (`mode != AgentMode::Primary`) mà agent này được phép
+    /// thấy và ủy quyền qua tool `subagent`.
     pub fn with_allowed_subagents<I, S>(mut self, subagents: I) -> Self
     where
         I: IntoIterator<Item = S>,

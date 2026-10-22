@@ -6,7 +6,7 @@ Thư viện Rust **nhúng vào server hiện có** để điều phối nhiều 
 tool và skill do host cung cấp. Core không phụ thuộc web framework: host sở hữu Tokio runtime,
 transport, AuthN/AuthZ và đăng ký domain tool qua trait `HostTool`.
 
-- Crate: `orchestrator-agent` v0.3.0 (import là `orchestrator_agent_rs`), edition 2021, Rust ≥ 1.89
+- Crate: `orchestrator-agent` v0.4.0 (import là `orchestrator_agent_rs`), edition 2021, Rust ≥ 1.89
 - Kiến trúc: Root/Subagent dùng chung `AgentRuntime`, crate [`llm`](https://crates.io/crates/llm) `=1.3.8`,
   SQLx/SQLite làm execution store, `ArtifactStore` cục bộ bất biến
 - Thiết kế chi tiết: [docs/README.md](docs/README.md) · Hợp đồng public: [docs/18-embeddable-library.md](docs/18-embeddable-library.md)
@@ -36,7 +36,7 @@ transport, AuthN/AuthZ và đăng ký domain tool qua trait `HostTool`.
 
 ```toml
 [dependencies]
-orchestrator-agent = "0.3"
+orchestrator-agent = "0.4"
 async-trait = "0.1"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
@@ -180,6 +180,7 @@ Khi host/server đã sở hữu việc gọi model (credential, client, routing)
 | `.with_prompt_path(path)` | Prompt agent (bắt buộc, file phải tồn tại) |
 | `.with_allowed_tools(iter)` | Tool được phép: tên `HostTool` hoặc built-in `subagent`, `skill`, `artifact_read` |
 | `.with_allowed_skills(iter)` | Skill được phép |
+| `.with_allowed_subagents(iter)` | Giới hạn danh sách subagent (`mode != Primary`) mà agent này được thấy và ủy quyền qua tool `subagent` (mặc định `None` = mọi agent không phải `Primary`) |
 | `.with_steps(n)` | Trần số bước (mặc định không giới hạn; `n > 0`) |
 | `.with_context_limit_tokens(n)` | Context window riêng, mặc định `RuntimeConfig::context_limit_tokens` |
 | `.with_max_output_tokens(n)` | Trần output token mỗi request LLM (`n > 0`); mặc định gateway 4096 |
@@ -276,6 +277,11 @@ Loại event: `run.started|completed|failed|cancelled|interrupted`, `step.starte
 `message.committed`, `tool.started|progress|completed|failed|interrupted`, `session.changed`,
 `compaction.started|completed`.
 
+- Payload `tool.started`: `{ "tool_call_id", "invocation_id", "tool_name", "arguments" }`.
+- Payload `tool.completed` / `tool.failed`: `{ "tool_call_id", "invocation_id", "tool_name", "arguments", "output", "result", "error_code" }` (`result` là `{ "content", "metadata" }` khi thành công hoặc `{ "error": { "code", "message" } }` khi thất bại).
+- `MessageToolCall` (trong `MessageView::tool_calls`) gồm `{ call_id, name, arguments }`.
+- `InvocationSnapshot` (trong `SessionSnapshot::invocations`) gồm `{ invocation_id, run_id, tool_call_id, tool_name, arguments, status, result, child_session_id, error_code }`.
+
 Event có `state_revision = Some(..)` là *committed invalidation* (phát sau commit DB, chỉ báo view cũ);
 event `None` là ephemeral (`text.delta`, `tool.progress`). Feed là best-effort, bounded, không bao giờ chặn publisher.
 
@@ -343,7 +349,7 @@ pub trait HostTool: Send + Sync {
 
 | Tên | Công dụng |
 |---|---|
-| `subagent` | Giao việc cho subagent (tạo/ tái sử dụng child session) |
+| `subagent` | Giao việc cho subagent (tạo/tái sử dụng child session; danh sách ứng viên có thể giới hạn theo từng caller qua `with_allowed_subagents`) |
 | `skill` | Nạp nội dung skill theo id |
 | `artifact_read` | Đọc artifact UTF-8 (cap `tool_output_cap_bytes`, kiểm SHA-256) |
 
@@ -372,8 +378,7 @@ Agent phải opt-in qua `allowed_tools`.
 ## Mô hình bảo mật
 
 - Mọi API kiểm tra `owner_id`/`workspace_id`; scope tool do runtime mint, không lấy từ LLM.
-- Secret chỉ nằm trong `SecretString`, không vào log/event/lỗi.
-- Event không chứa arguments hay kết quả tool.
+- Secret chỉ nằm trong `SecretString`, không vào log/event/lỗi (các API key đã cấu hình được che đệ quy trên mọi payload của `ExecutionEvent`).
 - Artifact không lộ filesystem path; kiểm toàn vẹn SHA-256 khi đọc.
 - Project instructions và nội dung skill là untrusted, không thay thế base instructions hay quyền thực thi.
 - Chi tiết: [docs/10-security-operations.md](docs/10-security-operations.md).
@@ -392,7 +397,7 @@ src/
   gateway/       adapter crate `llm`
   agent.rs config.rs tool.rs skill.rs prompt.rs types.rs error.rs ...
 migrations/      SQL migration (0001–0004)
-examples/        host, live_flow, load_skills, video_summary
+examples/        host, live_flow, load_skills, playlist_notes, url_summary, video_summary
 tests/           m0–m7 (fake + live) và read_api
 docs/            thiết kế, ADR, evidence, spec
 spikes/g0/       spike độc lập (không thuộc library)

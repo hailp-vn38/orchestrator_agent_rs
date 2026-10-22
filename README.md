@@ -6,7 +6,7 @@ A Rust library you **embed into an existing server** to orchestrate multiple age
 host-provided LLMs, tools and skills. The core does not depend on any web framework: the host owns the Tokio
 runtime, transport, AuthN/AuthZ, and registers domain tools through the `HostTool` trait.
 
-- Crate: `orchestrator-agent` v0.3.0 (imported as `orchestrator_agent_rs`), edition 2021, Rust ≥ 1.89
+- Crate: `orchestrator-agent` v0.4.0 (imported as `orchestrator_agent_rs`), edition 2021, Rust ≥ 1.89
 - Architecture: Root/Subagent share one `AgentRuntime`, the [`llm`](https://crates.io/crates/llm) crate `=1.3.8`,
   SQLx/SQLite as the execution store, and an immutable local `ArtifactStore`
 - Detailed design: [docs/README.md](docs/README.md) · Public contract: [docs/18-embeddable-library.md](docs/18-embeddable-library.md)
@@ -36,7 +36,7 @@ runtime, transport, AuthN/AuthZ, and registers domain tools through the `HostToo
 
 ```toml
 [dependencies]
-orchestrator-agent = "0.3"
+orchestrator-agent = "0.4"
 async-trait = "0.1"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
@@ -180,6 +180,7 @@ When the host/server already owns model access (credentials, clients, routing), 
 | `.with_prompt_path(path)` | Agent prompt (required, the file must exist) |
 | `.with_allowed_tools(iter)` | Allowed tools: `HostTool` names or built-ins `subagent`, `skill`, `artifact_read` |
 | `.with_allowed_skills(iter)` | Allowed skills |
+| `.with_allowed_subagents(iter)` | Restricts which subagents (`mode != Primary`) this agent can see and delegate to via `subagent` (`None` by default = all non-primary agents) |
 | `.with_steps(n)` | Step cap (unlimited by default; `n > 0`) |
 | `.with_context_limit_tokens(n)` | Per-agent context window, defaults to `RuntimeConfig::context_limit_tokens` |
 | `.with_max_output_tokens(n)` | Output-token cap per LLM request (`n > 0`); gateway default 4096 |
@@ -348,7 +349,7 @@ pub trait HostTool: Send + Sync {
 
 | Name | Purpose |
 |---|---|
-| `subagent` | Delegates work to a subagent (creates / reuses a child session) |
+| `subagent` | Delegates work to a subagent (creates / reuses a child session; candidate list can be scoped per caller via `with_allowed_subagents`) |
 | `skill` | Loads skill content by id |
 | `artifact_read` | Reads a UTF-8 artifact (cap `tool_output_cap_bytes`, SHA-256 verified) |
 
@@ -396,7 +397,7 @@ src/
   gateway/       adapter for the `llm` crate
   agent.rs config.rs tool.rs skill.rs prompt.rs types.rs error.rs ...
 migrations/      SQL migrations (0001–0004)
-examples/        host, live_flow, load_skills, video_summary
+examples/        host, live_flow, load_skills, playlist_notes, url_summary, video_summary
 tests/           m0–m7 (fake + live) and read_api
 docs/            design, ADRs, evidence, specs
 spikes/g0/       standalone spike (not part of the library)

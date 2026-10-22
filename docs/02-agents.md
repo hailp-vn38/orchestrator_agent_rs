@@ -22,6 +22,7 @@ pub struct AgentDefinition {
     pub model_id: String,
     pub allowed_tools: Vec<String>,
     pub allowed_skills: Vec<String>,
+    pub allowed_subagents: Option<Vec<String>>, // None = all non-Primary agents; Some(list) = allowlist
     pub steps: Option<u32>, // None = no cap; Some(n>0) = text-only stop at limit
 }
 ```
@@ -49,7 +50,7 @@ MVP dùng concrete typed `AgentRegistry` nhận `Vec<AgentDefinition>` từ host
 
 - Host truyền typed definitions lúc build; validate unique IDs, prompt path tồn tại và model reference hợp lệ ở mức cú pháp.
 - Với `docs/examples/agents.yaml`: map `agents.<key>` → `id`, `prompt/provider/model/tools/skills` → `prompt_path/provider_id/model_id/allowed_tools/allowed_skills`. Validate provider aliases và modes; không deserialize YAML example trực tiếp vào AgentDefinition.
-- Root phải có mode `Primary|All`, child phải có mode `Subagent|All`.
+- Root phải có mode `Primary|All`, child phải có mode `Subagent|All`. Nếu một agent cấu hình `allowed_subagents`, mọi ID trong danh sách phải tồn tại trong registry và có `mode != AgentMode::Primary` (vi phạm trả `ConfigReason::InvalidRuntimeConfig` lúc build).
 - Cấu hình được load tại startup; thay đổi file cần restart. Mỗi run dùng snapshot definition đã resolve, không hot reload trong MVP.
 - MVP mỗi AgentDefinition cấu hình `(provider_id, model_id)` tường minh; child dùng model riêng, không hỗ trợ model override qua tool. Model inheritance/override theo OpenCode chỉ bổ sung khi có use case và đã kiểm chứng adapter.
 
