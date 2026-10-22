@@ -8,7 +8,7 @@ use crate::store::{ChildAdmission, ChildTarget, RunRoute, SessionStore};
 use crate::supervisor::AdmissionSignal;
 use crate::tool::{ToolError, ToolScope};
 use crate::types::RunStatus;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -53,12 +53,14 @@ impl TaskManager {
     }
 
     /// Không có agent nào làm child được thì không quảng bá và không chạy `subagent`.
-    pub(crate) fn has_candidates(&self) -> bool {
-        !self.delegable.is_empty()
+    pub(crate) fn has_candidates(&self, allowed: Option<&BTreeSet<String>>) -> bool {
+        self.delegable
+            .keys()
+            .any(|id| allowed.is_none_or(|set| set.contains(id)))
     }
 
     /// Định nghĩa tool gửi cho model (chỉ gọi khi [`Self::has_candidates`]).
-    pub(crate) fn tool_definition(&self) -> ModelTool {
+    pub(crate) fn tool_definition(&self, allowed: Option<&BTreeSet<String>>) -> ModelTool {
         let mut description = String::from(
             "Delegate a self-contained task to a specialist subagent and wait for its final \
              text. The reply carries a session_id; pass it back as session_id with the same \
@@ -66,7 +68,11 @@ impl TaskManager {
              subagent being completed does not mean the task is done correctly. Available \
              agents:",
         );
-        for a in self.delegable.values() {
+        for a in self
+            .delegable
+            .values()
+            .filter(|a| allowed.is_none_or(|set| set.contains(&a.id)))
+        {
             description.push_str(&format!("\n- {}: {}", a.id, a.description.trim()));
         }
         ModelTool {
@@ -82,6 +88,7 @@ impl TaskManager {
         &self,
         scope: &ToolScope,
         input: SubagentInput,
+        allowed: Option<&BTreeSet<String>>,
         cancel: &CancellationToken,
     ) -> Delegation {
         if cancel.is_cancelled() {
@@ -103,6 +110,12 @@ impl TaskManager {
             return fail(
                 "MODE_DENIED",
                 "the requested agent cannot be used as a subagent".into(),
+            );
+        }
+        if allowed.is_some_and(|set| !set.contains(&input.agent)) {
+            return fail(
+                "MODE_DENIED",
+                "the requested agent is not allowed as a subagent for this caller".into(),
             );
         }
         if input.prompt.trim().is_empty() {

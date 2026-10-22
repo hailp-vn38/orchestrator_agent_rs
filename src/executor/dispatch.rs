@@ -80,7 +80,11 @@ impl ToolExecutor {
             // Không áp `tool_timeout` lên cả child (không deadline tổng); timeout theo từng
             // request/tool diễn ra bên trong run của child.
             Runnable::Subagent { input } => {
-                match self.tasks.delegate(&scope, input, cancel).await {
+                match self
+                    .tasks
+                    .delegate(&scope, input, eff.subagents.as_ref(), cancel)
+                    .await
+                {
                     Delegation::Done(result) => Dispatch::Settled(self.settle(result)),
                     Delegation::Cancelled => Dispatch::Cancelled,
                 }

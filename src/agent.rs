@@ -25,6 +25,10 @@ pub struct AgentDefinition {
     pub model_id: String,
     pub allowed_tools: Vec<String>,
     pub allowed_skills: Vec<String>,
+    /// Danh sách subagent được phép ủy quyền qua tool `subagent`.
+    /// `None` = cho phép mọi agent có `mode != AgentMode::Primary` (mặc định);
+    /// `Some(list)` = chỉ quảng bá và cho phép gọi các subagent nằm trong danh sách này.
+    pub allowed_subagents: Option<Vec<String>>,
     /// `None` = không giới hạn; `Some(n)` yêu cầu `n > 0`.
     pub steps: Option<u32>,
     /// Context window (token ước lượng) của model agent này, dùng cho compaction. `None` =
@@ -53,6 +57,7 @@ impl AgentDefinition {
             model_id: model_id.into(),
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
+            allowed_subagents: None,
             steps: None,
             context_limit_tokens: None,
             llm: ModelParams::default(),
@@ -89,6 +94,15 @@ impl AgentDefinition {
         S: Into<String>,
     {
         self.allowed_skills = skills.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_allowed_subagents<I, S>(mut self, subagents: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_subagents = Some(subagents.into_iter().map(Into::into).collect());
         self
     }
 
@@ -164,6 +178,30 @@ impl AgentRegistry {
                 ));
             }
             map.insert(def.id.clone(), def);
+        }
+        for def in map.values() {
+            if let Some(ref allowed) = def.allowed_subagents {
+                for sub_id in allowed {
+                    match map.get(sub_id) {
+                        None => {
+                            return Err(OrchestratorError::config(
+                                ConfigReason::InvalidRuntimeConfig,
+                                format!("agent '{}' allows unknown subagent '{sub_id}'", def.id),
+                            ));
+                        }
+                        Some(target) if target.mode == AgentMode::Primary => {
+                            return Err(OrchestratorError::config(
+                                ConfigReason::InvalidRuntimeConfig,
+                                format!(
+                                    "agent '{}' cannot allow primary agent '{sub_id}' as subagent",
+                                    def.id
+                                ),
+                            ));
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
         }
         Ok(Self { definitions: map })
     }

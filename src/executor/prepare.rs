@@ -31,7 +31,7 @@ impl ToolExecutor {
             out.push(artifact_read_tool());
         }
         if self.subagent_offered(eff) {
-            out.push(self.tasks.tool_definition());
+            out.push(self.tasks.tool_definition(eff.subagents.as_ref()));
         }
         out
     }
@@ -39,7 +39,9 @@ impl ToolExecutor {
     /// `subagent` chỉ được quảng bá khi session được phép, không phải child và có agent
     /// làm child được.
     fn subagent_offered(&self, eff: &Effective) -> bool {
-        eff.tools.contains(SUBAGENT_TOOL) && !eff.child && self.tasks.has_candidates()
+        eff.tools.contains(SUBAGENT_TOOL)
+            && !eff.child
+            && self.tasks.has_candidates(eff.subagents.as_ref())
     }
 
     /// Resolve + kiểm quyền + validate schema. Chưa có side effect nào.
@@ -97,7 +99,7 @@ impl ToolExecutor {
             if eff.child {
                 return reject(CODE_DEPTH_LIMIT, "subagents cannot delegate further".into());
             }
-            if !self.tasks.has_candidates() {
+            if !self.tasks.has_candidates(eff.subagents.as_ref()) {
                 return reject(CODE_UNAVAILABLE, format!("tool '{shown}' is not available"));
             }
             return match validate_args(&subagent::input_schema(), &args) {

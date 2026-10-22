@@ -44,10 +44,15 @@ fn truncation_is_marked_and_respects_char_boundaries() {
 fn effective_permissions_only_narrow() {
     let agent = AgentDefinition::new("a", "p", "m")
         .with_allowed_tools(["skill", "read"])
-        .with_allowed_skills(["x", "y"]);
+        .with_allowed_skills(["x", "y"])
+        .with_allowed_subagents(["sub1", "sub2"]);
     let all = Effective::resolve(&agent, &SessionPolicy::default());
     assert_eq!(all.tools.len(), 2);
     assert_eq!(all.skills.len(), 2);
+    assert_eq!(
+        all.subagents,
+        Some(BTreeSet::from(["sub1".to_string(), "sub2".to_string()]))
+    );
     // Policy đòi thêm quyền ngoài agent → bị bỏ; chỉ phần giao còn lại.
     let narrowed = Effective::resolve(
         &agent,

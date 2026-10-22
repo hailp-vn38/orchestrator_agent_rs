@@ -12,6 +12,7 @@ use std::sync::Arc;
 pub(crate) struct Effective {
     pub tools: BTreeSet<String>,
     pub skills: BTreeSet<String>,
+    pub subagents: Option<BTreeSet<String>>,
     /// Session là child (depth 1): `subagent` không được quảng bá và bị chặn.
     pub child: bool,
 }
@@ -27,6 +28,10 @@ impl Effective {
         Self {
             tools: narrow(&agent.allowed_tools, &policy.allowed_tools),
             skills: narrow(&agent.allowed_skills, &policy.allowed_skills),
+            subagents: agent
+                .allowed_subagents
+                .as_ref()
+                .map(|list| list.iter().cloned().collect()),
             child: false,
         }
     }
