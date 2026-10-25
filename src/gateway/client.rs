@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use llm::builder::{LLMBackend as LlmCrateBackend, LLMBuilder};
@@ -24,19 +24,33 @@ const MAX_OUTPUT_TOKENS: u32 = 16_384;
 
 /// Gateway thật: dựng client `llm` lười theo `(provider, model, system)` và tái sử dụng.
 pub struct ClientGateway {
-    providers: HashMap<String, LlmProviderConfig>,
+    providers: RwLock<HashMap<String, LlmProviderConfig>>,
     clients: Mutex<HashMap<String, Arc<dyn LLMProvider>>>,
 }
 
 impl ClientGateway {
     pub fn new(providers: &[LlmProviderConfig]) -> Self {
         Self {
-            providers: providers
-                .iter()
-                .map(|p| (p.id.trim().to_string(), p.clone()))
-                .collect(),
+            providers: RwLock::new(
+                providers
+                    .iter()
+                    .map(|p| (p.id.trim().to_string(), p.clone()))
+                    .collect(),
+            ),
             clients: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn replace_providers(&self, providers: &[LlmProviderConfig]) {
+        let next: HashMap<String, LlmProviderConfig> = providers
+            .iter()
+            .map(|p| (p.id.trim().to_string(), p.clone()))
+            .collect();
+        *self.providers.write().unwrap_or_else(|p| p.into_inner()) = next;
+        self.clients
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
     }
 
     fn client(
@@ -125,12 +139,15 @@ impl LlmGateway for ClientGateway {
     ) -> Result<ModelResponse, GatewayError> {
         let cfg = self
             .providers
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
             .get(request.provider_id.trim())
+            .cloned()
             .ok_or(GatewayError::NotConfigured)?;
         if request.model_id.trim().is_empty() {
             return Err(GatewayError::NotConfigured);
         }
-        let client = self.client(cfg, request)?;
+        let client = self.client(&cfg, request)?;
         let messages = to_chat_messages(&request.messages);
         let tools: Vec<Tool> = request
             .tools

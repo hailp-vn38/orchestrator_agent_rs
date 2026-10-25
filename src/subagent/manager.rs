@@ -9,6 +9,7 @@ use crate::supervisor::AdmissionSignal;
 use crate::tool::{ToolError, ToolScope};
 use crate::types::RunStatus;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -18,12 +19,36 @@ const FALLBACK_POLL: Duration = Duration::from_secs(2);
 /// Số lần đọc store lỗi liên tiếp trước khi bỏ cuộc đợi (child vẫn chạy và vẫn đọc được sau).
 const MAX_POLL_ERRORS: u32 = 5;
 
-pub(crate) struct TaskManager {
-    store: SessionStore,
+struct TaskCatalog {
     /// Chỉ agent có thể làm child (mode `Subagent|All`), theo id.
     delegable: BTreeMap<String, AgentDefinition>,
     modes: HashMap<String, AgentMode>,
     routes: HashMap<String, RunRoute>,
+}
+
+impl TaskCatalog {
+    fn from_agents(
+        agents: &HashMap<String, AgentDefinition>,
+        routes: HashMap<String, RunRoute>,
+    ) -> Self {
+        let delegable = agents
+            .values()
+            .filter(|a| a.mode != AgentMode::Primary)
+            .map(|a| (a.id.clone(), a.clone()))
+            .collect();
+        let modes = agents.values().map(|a| (a.id.clone(), a.mode)).collect();
+        Self {
+            delegable,
+            modes,
+            routes,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct TaskManager {
+    store: SessionStore,
+    catalog: Arc<RwLock<TaskCatalog>>,
     signal: AdmissionSignal,
     emitter: Emitter,
 }
@@ -36,25 +61,29 @@ impl TaskManager {
         signal: AdmissionSignal,
         emitter: Emitter,
     ) -> Self {
-        let delegable = agents
-            .values()
-            .filter(|a| a.mode != AgentMode::Primary)
-            .map(|a| (a.id.clone(), a.clone()))
-            .collect();
-        let modes = agents.values().map(|a| (a.id.clone(), a.mode)).collect();
         Self {
             store,
-            delegable,
-            modes,
-            routes,
+            catalog: Arc::new(RwLock::new(TaskCatalog::from_agents(agents, routes))),
             signal,
             emitter,
         }
     }
 
+    pub(crate) fn replace(
+        &self,
+        agents: &HashMap<String, AgentDefinition>,
+        routes: HashMap<String, RunRoute>,
+    ) {
+        *self.catalog.write().unwrap_or_else(|p| p.into_inner()) =
+            TaskCatalog::from_agents(agents, routes);
+    }
+
     /// Không có agent nào làm child được thì không quảng bá và không chạy `subagent`.
     pub(crate) fn has_candidates(&self, allowed: Option<&BTreeSet<String>>) -> bool {
-        self.delegable
+        self.catalog
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .delegable
             .keys()
             .any(|id| allowed.is_none_or(|set| set.contains(id)))
     }
@@ -68,7 +97,8 @@ impl TaskManager {
              subagent being completed does not mean the task is done correctly. Available \
              agents:",
         );
-        for a in self
+        let guard = self.catalog.read().unwrap_or_else(|p| p.into_inner());
+        for a in guard
             .delegable
             .values()
             .filter(|a| allowed.is_none_or(|set| set.contains(&a.id)))
@@ -100,13 +130,17 @@ impl TaskManager {
                 message,
             }))
         };
-        let Some(mode) = self.modes.get(&input.agent) else {
+        let (mode, routes_snapshot) = {
+            let guard = self.catalog.read().unwrap_or_else(|p| p.into_inner());
+            (guard.modes.get(&input.agent).copied(), guard.routes.clone())
+        };
+        let Some(mode) = mode else {
             return fail(
                 "AGENT_NOT_FOUND",
                 "the requested agent does not exist".into(),
             );
         };
-        if *mode == AgentMode::Primary {
+        if mode == AgentMode::Primary {
             return fail(
                 "MODE_DENIED",
                 "the requested agent cannot be used as a subagent".into(),
@@ -134,7 +168,7 @@ impl TaskManager {
         let admitted = self
             .store
             .admit_child_turn(&scope.invocation_id, target, &input.prompt, |agent_id| {
-                self.routes.get(agent_id).cloned()
+                routes_snapshot.get(agent_id).cloned()
             })
             .await;
         let admission = match admitted {

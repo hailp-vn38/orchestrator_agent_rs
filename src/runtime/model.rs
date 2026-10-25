@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::compaction::estimate_tokens;
+use crate::agent::AgentDefinition;
 use crate::executor::Effective;
 use crate::feed::{chunks, event};
 use crate::gateway::{
@@ -23,22 +24,18 @@ impl AgentRuntime {
     pub(super) async fn build_request(
         &self,
         run: &RunRecord,
+        agent: &AgentDefinition,
         eff: &Effective,
+        system_prompt: &str,
     ) -> Option<ModelRequest> {
         let history = self.store.conversation(&run.session_id).await.ok()?;
-        let catalog = self.executor.skills().available(&eff.skills);
-        let system = self.prompt.system(&run.agent_id, &catalog)?;
         Some(ModelRequest {
             provider_id: run.provider_id.clone(),
             model_id: run.model_id.clone(),
-            system,
+            system: system_prompt.to_owned(),
             messages: context_messages(history),
             tools: self.executor.definitions(eff),
-            params: self
-                .agents
-                .get(&run.agent_id)
-                .map(|a| a.llm)
-                .unwrap_or_default(),
+            params: agent.llm,
         })
     }
 
@@ -48,25 +45,24 @@ impl AgentRuntime {
     pub(super) async fn model_step(
         &self,
         run: &RunRecord,
+        agent: &AgentDefinition,
         eff: &Effective,
+        system_prompt: &str,
         capped: bool,
         cancel: &CancellationToken,
     ) -> Result<(ModelResponse, String), Settlement> {
         let run_id = run.run_id.as_str();
         let mut request = self
-            .step_request(run, eff, capped)
+            .step_request(run, agent, eff, system_prompt, capped)
             .await
             .ok_or(Settlement::Unsettled)?;
-        let agent_limit = self
-            .agents
-            .get(&run.agent_id)
-            .and_then(|a| a.context_limit_tokens);
+        let agent_limit = agent.context_limit_tokens;
         if estimate_tokens(&request) >= self.context.threshold(agent_limit) {
             // Lỗi compact chủ động không chặn run: request vẫn có thể vừa; overflow thật sẽ
             // đi qua nhánh retry bên dưới.
-            if let Ok(true) = self.compact(run, cancel).await {
+            if let Ok(true) = self.compact(run, agent.llm, cancel).await {
                 request = self
-                    .step_request(run, eff, capped)
+                    .step_request(run, agent, eff, system_prompt, capped)
                     .await
                     .ok_or(Settlement::Unsettled)?;
             }
@@ -81,10 +77,10 @@ impl AgentRuntime {
                 }
                 Err(GatewayError::ContextOverflow) if !retried => {
                     retried = true;
-                    match self.compact(run, cancel).await {
+                    match self.compact(run, agent.llm, cancel).await {
                         Ok(true) => {
                             request = self
-                                .step_request(run, eff, capped)
+                                .step_request(run, agent, eff, system_prompt, capped)
                                 .await
                                 .ok_or(Settlement::Unsettled)?;
                         }
@@ -176,10 +172,12 @@ impl AgentRuntime {
     pub(super) async fn step_request(
         &self,
         run: &RunRecord,
+        agent: &AgentDefinition,
         eff: &Effective,
+        system_prompt: &str,
         capped: bool,
     ) -> Option<ModelRequest> {
-        let mut request = self.build_request(run, eff).await?;
+        let mut request = self.build_request(run, agent, eff, system_prompt).await?;
         if capped {
             request.tools.clear();
             request

@@ -5,18 +5,21 @@
 //! M7 thêm `ArtifactStore`, `list_artifacts`, `open_artifact`, `backup_to`, và `AgentResult`
 //! artifact preview + cursor.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::agent::{AgentDefinition, AgentRegistry};
 use crate::artifact::ArtifactStore;
 use crate::config::{OrchestratorConfig, RuntimeConfig};
 use crate::executor::ToolLimits;
 use crate::feed::{Emitter, ExecutionFeed};
-use crate::gateway::LlmGateway;
+use crate::gateway::{ClientGateway, LlmGateway};
+use crate::prompt::PromptBuilder;
+use crate::skill::SkillManager;
 use crate::store::{RunRoute, SessionStore};
+use crate::subagent::TaskManager;
 use crate::supervisor::Supervisor;
 use crate::tool::HostTool;
 
@@ -33,6 +36,14 @@ mod tests;
 pub struct Orchestrator {
     base_version: u32,
     registry: AgentRegistry,
+    live_agents: Arc<RwLock<HashMap<String, AgentDefinition>>>,
+    live_fingerprints: Arc<RwLock<BTreeMap<String, String>>>,
+    prompt: PromptBuilder,
+    tasks: TaskManager,
+    skills: Arc<SkillManager>,
+    has_skills_dir: bool,
+    has_provider_runtime: bool,
+    client_gateway: Option<Arc<ClientGateway>>,
     tools: BTreeMap<String, Arc<dyn HostTool>>,
     fingerprints: BTreeMap<String, String>,
     store_dir: PathBuf,

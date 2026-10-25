@@ -727,3 +727,89 @@ async fn build_creates_store_with_owner_lock_and_clean_install_schema() {
     assert_eq!(idx, 1);
     o.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn live_reconfigure_updates_provider_model_steps_and_prompt() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    gw.push_text("reply-1");
+    gw.push_text("reply-2");
+    let o = env.build(&gw).await;
+
+    let defs_before = o.agent_definitions();
+    assert_eq!(defs_before.len(), 2);
+
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+    let t1 = o.submit(&alice(), &sid, "hello".into()).await.unwrap();
+    let r1 = wait_terminal(&o, &alice(), &sid, &t1.turn_id).await;
+    assert_eq!(r1.status, RunStatus::Completed);
+    assert_eq!(r1.output.as_deref(), Some("reply-1"));
+
+    std::fs::write(
+        env.dir.path().join("root.md"),
+        "Updated custom root system prompt.",
+    )
+    .unwrap();
+    o.reconfigure(
+        vec![
+            LlmProviderConfig {
+                id: "fake".into(),
+                backend: LlmBackend::OpenAi,
+                endpoint: None,
+                auth: ProviderAuth::ApiKey(SecretString::new("sk-test-not-real")),
+                request_timeout: Duration::from_secs(30),
+            },
+            LlmProviderConfig {
+                id: "fake-v2".into(),
+                backend: LlmBackend::OpenAi,
+                endpoint: Some("https://api.example.com/v1".into()),
+                auth: ProviderAuth::ApiKey(SecretString::new("sk-test-v2")),
+                request_timeout: Duration::from_secs(45),
+            },
+        ],
+        vec![
+            AgentDefinition::new("root", "fake-v2", "model-v2")
+                .with_mode(AgentMode::Primary)
+                .with_steps(4)
+                .with_max_output_tokens(2048)
+                .with_prompt_path(env.dir.path().join("root.md")),
+            AgentDefinition::new("sub", "fake-v2", "model-sub-v2")
+                .with_mode(AgentMode::Subagent)
+                .with_description("Updated subagent description")
+                .with_prompt_path(env.dir.path().join("sub.md")),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let defs_after = o.agent_definitions();
+    let root_after = defs_after.iter().find(|d| d.id == "root").unwrap();
+    assert_eq!(root_after.provider_id, "fake-v2");
+    assert_eq!(root_after.model_id, "model-v2");
+    assert_eq!(root_after.steps, Some(4));
+    assert_eq!(root_after.llm.max_output_tokens, Some(2048));
+
+    let t2 = o
+        .submit(&alice(), &sid, "after reconfigure".into())
+        .await
+        .unwrap();
+    let r2 = wait_terminal(&o, &alice(), &sid, &t2.turn_id).await;
+    assert_eq!(r2.status, RunStatus::Completed);
+    assert_eq!(r2.output.as_deref(), Some("reply-2"));
+
+    let requests = gw.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].provider_id, "fake");
+    assert_eq!(requests[0].model_id, "model-x");
+    assert!(requests[0].system.contains(AGENT_PROMPT));
+
+    assert_eq!(requests[1].provider_id, "fake-v2");
+    assert_eq!(requests[1].model_id, "model-v2");
+    assert_eq!(requests[1].params.max_output_tokens, Some(2048));
+    assert!(requests[1]
+        .system
+        .contains("Updated custom root system prompt."));
+
+    o.shutdown().await.unwrap();
+}
+

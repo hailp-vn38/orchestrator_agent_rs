@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use tokio_util::sync::CancellationToken;
 
@@ -141,11 +141,12 @@ impl OrchestratorBuilder {
         let provider_ids: HashSet<String> = fingerprints.keys().cloned().collect();
         let registry = AgentRegistry::build(self.config.agents, &provider_ids, &names).await?;
 
+        let has_skills_dir = self.config.skills_dir.is_some();
         let skills = match &self.config.skills_dir {
             Some(dir) => SkillManager::discover(dir, self.config.runtime.skill_max_bytes).await?,
             None => SkillManager::empty(self.config.runtime.skill_max_bytes),
         };
-        if self.config.skills_dir.is_some() {
+        if has_skills_dir {
             for def in registry.list() {
                 if let Some(missing) = def.allowed_skills.iter().find(|s| !skills.contains(s)) {
                     return Err(OrchestratorError::config(
@@ -155,6 +156,7 @@ impl OrchestratorBuilder {
                 }
             }
         }
+        let skills = Arc::new(skills);
 
         let project = match &self.config.project_instructions {
             Some(path) => {
@@ -292,8 +294,8 @@ impl OrchestratorBuilder {
         );
         let executor = ToolExecutor::new(
             tools.clone(),
-            Arc::new(skills),
-            tasks,
+            Arc::clone(&skills),
+            tasks.clone(),
             limits,
             feed.clone(),
             ToolServices {
@@ -303,21 +305,28 @@ impl OrchestratorBuilder {
             },
         );
 
-        let gateway: Arc<dyn LlmGateway> = match (self.gateway, self.provider_runtime) {
-            (Some(g), _) => g,
-            (None, Some(runtime)) => {
-                let providers = runtime.providers();
-                Arc::new(RuntimeGateway::new(runtime, &providers))
-            }
-            (None, None) => Arc::new(ClientGateway::new(&self.config.llm.providers)),
-        };
+        let has_provider_runtime = self.provider_runtime.is_some();
+        let (gateway, client_gateway): (Arc<dyn LlmGateway>, Option<Arc<ClientGateway>>) =
+            match (self.gateway, self.provider_runtime) {
+                (Some(g), _) => (g, None),
+                (None, Some(runtime)) => {
+                    let providers = runtime.providers();
+                    (Arc::new(RuntimeGateway::new(runtime, &providers)), None)
+                }
+                (None, None) => {
+                    let gw = Arc::new(ClientGateway::new(&self.config.llm.providers));
+                    (gw.clone(), Some(gw))
+                }
+            };
+        let live_agents = Arc::new(RwLock::new(agents));
+        let live_fingerprints = Arc::new(RwLock::new(fingerprints.clone()));
         let shutdown = CancellationToken::new();
         let runtime = AgentRuntime::new(
             store.clone(),
             gateway,
-            prompt_builder,
+            prompt_builder.clone(),
             executor,
-            agents,
+            Arc::clone(&live_agents),
             ContextPolicy {
                 limit_tokens: self.config.runtime.context_limit_tokens,
                 threshold_percent: self.config.runtime.compaction_threshold_percent,
@@ -339,6 +348,14 @@ impl OrchestratorBuilder {
         Ok(Orchestrator {
             base_version,
             registry,
+            live_agents,
+            live_fingerprints,
+            prompt: prompt_builder,
+            tasks,
+            skills,
+            has_skills_dir,
+            has_provider_runtime,
+            client_gateway,
             tools,
             fingerprints,
             store_dir: self.config.store_dir,

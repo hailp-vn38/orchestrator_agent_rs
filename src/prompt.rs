@@ -6,6 +6,7 @@
 //! skill là untrusted context: chúng chỉ là văn bản, quyền thực thi nằm ở Rust.
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use tracing::warn;
 
@@ -19,9 +20,16 @@ pub(crate) fn build_system(base: &str, agent_prompt: &str) -> String {
     format!("{}\n\n{}", base.trim_end(), agent_prompt.trim())
 }
 
-pub(crate) struct PromptBuilder {
-    /// agent_id → base + agent prompt (+ project instructions), snapshot lúc build.
+struct PromptInner {
+    base: String,
+    project_instructions: Option<String>,
+    /// agent_id → base + agent prompt (+ project instructions).
     systems: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PromptBuilder {
+    inner: Arc<RwLock<PromptInner>>,
 }
 
 impl PromptBuilder {
@@ -30,25 +38,36 @@ impl PromptBuilder {
         project_instructions: Option<&str>,
         agent_prompts: impl Iterator<Item = (&'a str, &'a str)>,
     ) -> Self {
-        let systems = agent_prompts
-            .map(|(id, prompt)| {
-                let mut system = build_system(base, prompt);
-                if let Some(project) = project_instructions {
-                    system.push_str(&format!(
-                        "\n\n<project_instructions>\n{}\n</project_instructions>",
-                        project.trim()
-                    ));
-                }
-                (id.to_owned(), system)
-            })
-            .collect();
-        Self { systems }
+        let systems = build_systems_map(base, project_instructions, agent_prompts);
+        Self {
+            inner: Arc::new(RwLock::new(PromptInner {
+                base: base.to_owned(),
+                project_instructions: project_instructions.map(str::to_owned),
+                systems,
+            })),
+        }
+    }
+
+    pub(crate) fn replace<'a>(&self, agent_prompts: impl Iterator<Item = (&'a str, &'a str)>) {
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let systems = build_systems_map(
+            &guard.base,
+            guard.project_instructions.as_deref(),
+            agent_prompts,
+        );
+        guard.systems = systems;
     }
 
     /// System prompt của một request: phần tĩnh + catalog skill **đã lọc theo quyền** của
     /// session (skill bị từ chối không lộ metadata). `None` nếu agent không còn cấu hình.
     pub(crate) fn system(&self, agent_id: &str, catalog: &[SkillSummary]) -> Option<String> {
-        let mut system = self.systems.get(agent_id)?.clone();
+        let mut system = self
+            .inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .systems
+            .get(agent_id)?
+            .clone();
         if !catalog.is_empty() {
             system.push_str("\n\n<available_skills>\n");
             for s in catalog {
@@ -64,6 +83,25 @@ impl PromptBuilder {
         }
         Some(system)
     }
+}
+
+fn build_systems_map<'a>(
+    base: &str,
+    project_instructions: Option<&str>,
+    agent_prompts: impl Iterator<Item = (&'a str, &'a str)>,
+) -> HashMap<String, String> {
+    agent_prompts
+        .map(|(id, prompt)| {
+            let mut system = build_system(base, prompt);
+            if let Some(project) = project_instructions {
+                system.push_str(&format!(
+                    "\n\n<project_instructions>\n{}\n</project_instructions>",
+                    project.trim()
+                ));
+            }
+            (id.to_owned(), system)
+        })
+        .collect()
 }
 
 /// Context của session → model messages: summary của checkpoint (nếu có) rồi các exchange

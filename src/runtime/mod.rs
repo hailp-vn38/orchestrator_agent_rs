@@ -19,7 +19,7 @@
 //! `cancel` của host (`cancelled`/`CANCELLED`, terminal).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use serde_json::json;
 
@@ -71,8 +71,8 @@ pub(crate) struct AgentRuntime {
     gateway: Arc<dyn LlmGateway>,
     prompt: PromptBuilder,
     executor: ToolExecutor,
-    /// Snapshot definition lúc build (không hot reload).
-    agents: HashMap<String, AgentDefinition>,
+    /// Bảng định nghĩa agent live (chia sẻ với Orchestrator để hỗ trợ reconfigure).
+    agents: Arc<RwLock<HashMap<String, AgentDefinition>>>,
     context: ContextPolicy,
     /// Token shutdown của engine: phân biệt hủy do shutdown với `cancel` của host.
     shutdown: CancellationToken,
@@ -105,7 +105,7 @@ impl AgentRuntime {
         gateway: Arc<dyn LlmGateway>,
         prompt: PromptBuilder,
         executor: ToolExecutor,
-        agents: HashMap<String, AgentDefinition>,
+        agents: Arc<RwLock<HashMap<String, AgentDefinition>>>,
         context: ContextPolicy,
         shutdown: CancellationToken,
         emitter: Emitter,
@@ -148,11 +148,21 @@ impl AgentRuntime {
                 json!({ "agent_id": run.agent_id }),
             )
             .await;
-        let Some(agent) = self.agents.get(&run.agent_id) else {
+        let agent = self
+            .agents
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&run.agent_id)
+            .cloned();
+        let Some(agent) = agent else {
             return self.fail(run_id, GatewayError::NotConfigured).await;
         };
         let eff =
-            Effective::resolve(agent, &run.policy).for_session(run.parent_session_id.is_some());
+            Effective::resolve(&agent, &run.policy).for_session(run.parent_session_id.is_some());
+        let catalog = self.executor.skills().available(&eff.skills);
+        let Some(system_prompt) = self.prompt.system(&run.agent_id, &catalog) else {
+            return self.fail(run_id, GatewayError::NotConfigured).await;
+        };
 
         // Run được sweep lại sau khi worker trước kết thúc mà chưa terminal. Invocation đã
         // `running` mà chưa có result nghĩa là outcome không xác định → chặn, không replay.
@@ -188,7 +198,10 @@ impl AgentRuntime {
                 (_, Err(_)) => return Settlement::Unsettled,
                 _ => false,
             };
-            let (response, step_id) = match self.model_step(&run, &eff, capped, cancel).await {
+            let (response, step_id) = match self
+                .model_step(&run, &agent, &eff, &system_prompt, capped, cancel)
+                .await
+            {
                 Ok(r) => r,
                 Err(done) => return done,
             };

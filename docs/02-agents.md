@@ -51,7 +51,7 @@ MVP dùng concrete typed `AgentRegistry` nhận `Vec<AgentDefinition>` từ host
 - Host truyền typed definitions lúc build; validate unique IDs, prompt path tồn tại và model reference hợp lệ ở mức cú pháp.
 - Với `docs/examples/agents.yaml`: map `agents.<key>` → `id`, `prompt/provider/model/tools/skills` → `prompt_path/provider_id/model_id/allowed_tools/allowed_skills`. Validate provider aliases và modes; không deserialize YAML example trực tiếp vào AgentDefinition.
 - Root phải có mode `Primary|All`, child phải có mode `Subagent|All`. Nếu một agent cấu hình `allowed_subagents`, mọi ID trong danh sách phải tồn tại trong registry và có `mode != AgentMode::Primary` (vi phạm trả `ConfigReason::InvalidRuntimeConfig` lúc build).
-- Cấu hình được load tại startup; thay đổi file cần restart. Mỗi run dùng snapshot definition đã resolve, không hot reload trong MVP.
+- Cấu hình được load tại startup và có thể cập nhật nóng qua `Orchestrator::reconfigure`. Mỗi run lấy snapshot definition + system prompt đã resolve lúc bắt đầu run nên các run đang chạy dở giữ nguyên cấu hình cũ, còn turn/subagent mới dùng ngay cấu hình mới.
 - MVP mỗi AgentDefinition cấu hình `(provider_id, model_id)` tường minh; child dùng model riêng, không hỗ trợ model override qua tool. Model inheritance/override theo OpenCode chỉ bổ sung khi có use case và đã kiểm chứng adapter.
 
 ## 2.4. Run lifecycle và stop semantics

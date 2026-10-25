@@ -126,7 +126,7 @@ impl Orchestrator {
                 }),
             )
             .await;
-        let route = |agent_id: &str| route_of(self.registry.get(agent_id)?, &self.fingerprints);
+        let route = |agent_id: &str| self.route(agent_id);
         let replay_safe = |tool: &str| self.replay_safe.contains(tool);
         let policy = RecoveryPolicy {
             max_resume_attempt: self.runtime.max_resume_attempts,
@@ -170,6 +170,12 @@ impl Orchestrator {
     }
 
     pub(super) fn route(&self, agent_id: &str) -> Option<RunRoute> {
-        route_of(self.registry.get(agent_id)?, &self.fingerprints)
+        let agents = self.live_agents.read().unwrap_or_else(|p| p.into_inner());
+        let def = agents.get(agent_id)?;
+        let fingerprints = self
+            .live_fingerprints
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        route_of(def, &fingerprints)
     }
 }

@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::compaction::{plan, SUMMARY_SYSTEM};
 use crate::feed::event;
-use crate::gateway::{GatewayError, ModelMessage, ModelRequest, ModelRole, StreamEvent};
+use crate::gateway::{GatewayError, ModelMessage, ModelParams, ModelRequest, ModelRole, StreamEvent};
 use crate::store::{NewCheckpoint, RunRecord};
 
 use super::AgentRuntime;
@@ -17,6 +17,7 @@ impl AgentRuntime {
     pub(super) async fn compact(
         &self,
         run: &RunRecord,
+        params: ModelParams,
         cancel: &CancellationToken,
     ) -> Result<bool, GatewayError> {
         let context = self
@@ -40,11 +41,7 @@ impl AgentRuntime {
             system: SUMMARY_SYSTEM.to_owned(),
             messages: vec![ModelMessage::text(ModelRole::User, plan.input)],
             tools: Vec::new(),
-            params: self
-                .agents
-                .get(&run.agent_id)
-                .map(|a| a.llm)
-                .unwrap_or_default(),
+            params,
         };
         let response = self
             .gateway
