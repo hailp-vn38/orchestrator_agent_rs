@@ -1557,6 +1557,75 @@ async fn at27_st02_tool_runs_only_after_the_response_finished_and_calls_are_pers
 }
 
 #[tokio::test]
+async fn message_committed_includes_message_id_and_redacted_text_for_tool_call_and_final_steps() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    gw.push_tool_calls(
+        &format!("I will call probe now with {API_KEY}"),
+        vec![("c1", "probe", probe_args())],
+    );
+    gw.push_text(&format!("Completed probe with {API_KEY}"));
+    let (probe, _) = Probe::new("probe", ToolEffect::ReadOnly, Behavior::Echo);
+    let (o, sid) = single(&env, &gw, Some(probe)).await;
+    let col = collect(o.subscribe(&alice(), &sid).await.unwrap());
+
+    assert_eq!(run_turn(&o, &sid, "go").await, RunStatus::Completed);
+    col.wait_for("run.completed", |e| {
+        e.iter().any(|x| x.event_type == "run.completed")
+    })
+    .await;
+
+    let committed = col.of("message.committed");
+    assert_eq!(committed.len(), 2);
+
+    let first = &committed[0];
+    assert_eq!(first.payload["role"], json!("assistant"));
+    assert_eq!(first.payload["final"], json!(false));
+    assert!(
+        first.payload["message_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "tool-call message.committed must include message_id"
+    );
+    assert_eq!(
+        first.payload["text"],
+        json!("I will call probe now with [redacted]")
+    );
+    assert_eq!(first.payload["tool_call_count"], json!(1));
+
+    let second = &committed[1];
+    assert_eq!(second.payload["role"], json!("assistant"));
+    assert_eq!(second.payload["final"], json!(true));
+    assert!(
+        second.payload["message_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "final message.committed must include message_id"
+    );
+    assert_eq!(
+        second.payload["text"],
+        json!("Completed probe with [redacted]")
+    );
+
+    let snap = o.snapshot(&alice(), &sid).await.unwrap();
+    let assistant_msgs: Vec<_> = snap
+        .root
+        .recent_messages
+        .iter()
+        .filter(|m| m.role == MessageRole::Assistant)
+        .collect();
+    assert_eq!(assistant_msgs.len(), 2);
+    assert_eq!(
+        first.payload["message_id"].as_str(),
+        Some(assistant_msgs[0].id.as_str())
+    );
+    assert_eq!(
+        second.payload["message_id"].as_str(),
+        Some(assistant_msgs[1].id.as_str())
+    );
+}
+
+#[tokio::test]
 async fn progress_percent_is_optional_and_clamped() {
     let env = Env::new();
     let gw = ScriptedGateway::new();

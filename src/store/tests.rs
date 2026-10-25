@@ -148,6 +148,7 @@ async fn next_subagent_call(s: &SessionStore, run_id: &str, call_id: &str) -> St
         .await
         .unwrap()
         .unwrap()
+        .1
         .remove(0)
         .id;
     assert!(s.begin_invocation(run_id, &inv).await.unwrap());
@@ -556,7 +557,7 @@ async fn concurrent_resumes_of_one_child_admit_exactly_one() {
             arguments: serde_json::json!({}),
         })
         .collect();
-    let pending = s
+    let (_msg_id, pending) = s
         .commit_tool_calls(&run, "", &calls)
         .await
         .unwrap()

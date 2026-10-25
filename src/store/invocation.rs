@@ -17,7 +17,7 @@ impl SessionStore {
         run_id: &str,
         text: &str,
         calls: &[StoredToolCall],
-    ) -> Result<Option<Vec<PendingInvocation>>, OrchestratorError> {
+    ) -> Result<Option<(String, Vec<PendingInvocation>)>, OrchestratorError> {
         let mut tx = self.pool.begin().await.map_err(db("begin tool calls"))?;
         let Some((session_id, seq)) = claim_sequence(&mut tx, run_id).await? else {
             let _ = tx.rollback().await;
@@ -85,7 +85,7 @@ impl SessionStore {
             return Ok(None);
         }
         tx.commit().await.map_err(db("commit tool calls"))?;
-        Ok(Some(pending))
+        Ok(Some((message_id, pending)))
     }
 
     /// `requested` → `running`, commit **trước** khi gọi tool: nếu process chết sau điểm này

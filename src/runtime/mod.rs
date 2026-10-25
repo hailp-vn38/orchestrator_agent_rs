@@ -233,6 +233,7 @@ impl AgentRuntime {
                                         "role": "assistant",
                                         "step_id": step_id,
                                         "final": true,
+                                        "text": text,
                                     }),
                                 )
                                 .await;
@@ -274,7 +275,8 @@ impl AgentRuntime {
                     arguments: c.arguments.clone(),
                 })
                 .collect();
-            pending = match self
+            let message_id;
+            (message_id, pending) = match self
                 .store
                 .commit_tool_calls(run_id, &response.text, &calls)
                 .await
@@ -289,9 +291,11 @@ impl AgentRuntime {
                     run_id,
                     event::MESSAGE_COMMITTED,
                     json!({
+                        "message_id": message_id,
                         "role": "assistant",
                         "step_id": step_id,
                         "final": false,
+                        "text": response.text,
                         "tool_call_count": pending.len(),
                         "tool_calls": pending.iter().map(|inv| json!({
                             "invocation_id": inv.id,
