@@ -141,3 +141,10 @@ pub(crate) struct PendingInvocation {
     pub arguments: serde_json::Value,
     pub started: bool,
 }
+
+/// Kết quả commit của một assistant message có đính kèm tool calls.
+#[derive(Debug, Clone)]
+pub(crate) struct CommittedToolCalls {
+    pub message_id: String,
+    pub invocations: Vec<PendingInvocation>,
+}

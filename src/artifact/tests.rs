@@ -51,7 +51,7 @@ async fn setup() -> (
         .await
         .unwrap()
         .unwrap()
-        .1
+        .invocations
         .remove(0);
     assert!(store.begin_invocation(&run_id, &inv.id).await.unwrap());
     let scope = ArtifactWriteScope {

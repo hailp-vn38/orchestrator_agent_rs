@@ -2,7 +2,7 @@
 
 use super::codec::{db, new_id};
 use super::transcript::claim_sequence;
-use super::types::{PendingInvocation, StoredToolCall};
+use super::types::{CommittedToolCalls, PendingInvocation, StoredToolCall};
 use super::SessionStore;
 use crate::error::OrchestratorError;
 use crate::executor::Settled;
@@ -17,7 +17,7 @@ impl SessionStore {
         run_id: &str,
         text: &str,
         calls: &[StoredToolCall],
-    ) -> Result<Option<(String, Vec<PendingInvocation>)>, OrchestratorError> {
+    ) -> Result<Option<CommittedToolCalls>, OrchestratorError> {
         let mut tx = self.pool.begin().await.map_err(db("begin tool calls"))?;
         let Some((session_id, seq)) = claim_sequence(&mut tx, run_id).await? else {
             let _ = tx.rollback().await;
@@ -85,7 +85,10 @@ impl SessionStore {
             return Ok(None);
         }
         tx.commit().await.map_err(db("commit tool calls"))?;
-        Ok(Some((message_id, pending)))
+        Ok(Some(CommittedToolCalls {
+            message_id,
+            invocations: pending,
+        }))
     }
 
     /// `requested` → `running`, commit **trước** khi gọi tool: nếu process chết sau điểm này

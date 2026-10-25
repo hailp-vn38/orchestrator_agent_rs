@@ -275,17 +275,18 @@ impl AgentRuntime {
                     arguments: c.arguments.clone(),
                 })
                 .collect();
-            let message_id;
-            (message_id, pending) = match self
+            let committed = match self
                 .store
                 .commit_tool_calls(run_id, &response.text, &calls)
                 .await
             {
-                Ok(Some(p)) => p,
+                Ok(Some(c)) => c,
                 Ok(None) => return Settlement::Terminal, // run đã terminal ở nơi khác
                 // Chưa có invocation nào → thử lại (có backoff) sẽ gọi lại LLM, an toàn.
                 Err(_) => return Settlement::Unsettled,
             };
+            let message_id = committed.message_id;
+            pending = committed.invocations;
             self.emitter
                 .committed_run(
                     run_id,
