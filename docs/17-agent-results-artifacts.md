@@ -267,3 +267,10 @@ Canonical roadmap/tests are in [12](12-mvp-test-plan.md) (M7, AT-40/42/47). Thes
 ### Scoped artifact inputs (v5.0)
 
 HostTool có thể đọc committed audio/document/manifest artifact của tool trước bằng `ToolContext.artifacts().open(id)` **chỉ khi** input ref thuộc explicit invocation scope/allowed ancestry. Cùng workspace không tự cấp quyền đọc. Reader có byte cap, streaming backpressure và integrity errors, không lộ private path. Cross-invocation continuation phải carry verified manifest ID tường minh và CAS thành initial pointer của invocation mới. Xem canonical HostTool interface ở [18](18-embeddable-library.md).
+
+### Session-family artifact listing & download (`FamilyArtifact`)
+
+Bên cạnh `list_artifacts(&caller, session_id, turn_id, page)` (phân trang theo từng turn), `Orchestrator` cung cấp thêm hai hàm mức session family để các thư viện điều phối cấp cao (như `orchestrator_flow_rs` / `TaskManager`) tổng hợp toàn bộ Artifact đa định dạng (Markdown report, ảnh PNG/SVG, âm thanh TTS WAV, dữ liệu JSON) xuyên suốt nhiều turn và nhiều Subagent con của một Task:
+
+- `Orchestrator::list_family_artifacts(&caller, root_session_id) -> Result<Vec<FamilyArtifact>, OrchestratorError>`: trả về toàn bộ các `FamilyArtifact` đã commit thuộc `root_session_id` và mọi Child session trực thuộc, kèm đầy đủ thông tin nguồn gốc (`producer_session_id`, `producer_agent_id`, `turn_id`, `producer_invocation_id`, `producer_tool_name`, `created_at`).
+- `Orchestrator::open_family_artifact(&caller, root_session_id, artifact_id) -> Result<ArtifactDownload, OrchestratorError>`: mở `ArtifactDownload` kèm xác minh chặt chẽ rằng `artifact_id` thuộc đúng `root_session_id` (trả `ErrorCode::NotFound` nếu artifact thuộc session family khác trong cùng workspace) và kiểm tra toàn vẹn SHA-256 trên dòng dữ liệu đọc ra.

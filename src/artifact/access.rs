@@ -50,6 +50,48 @@ impl ArtifactStore {
         })
     }
 
+    /// Mở artifact cho host kèm kiểm tra chặt chẽ `stored.root_session_id == root_session_id`.
+    pub(crate) async fn open_for_family(
+        &self,
+        caller: &CallerContext,
+        root_session_id: &str,
+        artifact_id: &str,
+    ) -> Result<ArtifactDownload, OrchestratorError> {
+        let stored = self
+            .load_stored(artifact_id)
+            .await?
+            .ok_or_else(|| OrchestratorError::new(ErrorCode::NotFound, "artifact not found"))?;
+        if stored.owner_id != caller.owner_id || stored.workspace_id != caller.workspace_id {
+            return Err(OrchestratorError::new(
+                ErrorCode::PermissionDenied,
+                "the artifact is outside the caller's scope",
+            ));
+        }
+        if stored.root_session_id != root_session_id {
+            return Err(OrchestratorError::new(
+                ErrorCode::NotFound,
+                "artifact does not belong to the requested session family",
+            ));
+        }
+        if stored.artifact.size_bytes > self.limits.download_max_bytes {
+            return Err(OrchestratorError::new(
+                ErrorCode::InvalidInput,
+                "artifact exceeds download_max_bytes",
+            ));
+        }
+        let reader = self
+            .open_verified_reader(
+                stored.artifact.clone(),
+                &stored.storage_key,
+                self.limits.download_max_bytes,
+            )
+            .await?;
+        Ok(ArtifactDownload {
+            artifact: stored.artifact,
+            reader,
+        })
+    }
+
     /// Mở artifact cho `HostTool` (`ToolContext::artifacts().open`):
     /// Enforce:
     /// 1) Cùng `owner_id` và `workspace_id`.

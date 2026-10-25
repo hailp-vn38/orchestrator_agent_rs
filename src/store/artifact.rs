@@ -4,7 +4,7 @@
 
 use super::SessionStore;
 use crate::error::{ErrorCode, OrchestratorError};
-use crate::types::{ArtifactRef, ArtifactRole};
+use crate::types::{ArtifactRef, ArtifactRole, FamilyArtifact};
 use sqlx::Row;
 
 /// Metadata đầy đủ của một artifact đã commit, kèm root session để kiểm tra session family.
@@ -305,6 +305,71 @@ impl SessionStore {
                     .try_get("created_at")
                     .map_err(|e| OrchestratorError::storage("read created_at", &e))?;
                 Ok((created_at, ref_from_row(row)?))
+            })
+            .collect()
+    }
+
+    /// Toàn bộ các artifact đã commit trong phạm vi một session family (`root_session_id`),
+    /// gồm cả Root và các Child session trực thuộc, sắp xếp theo `(created_at ASC, id ASC)`.
+    pub(crate) async fn artifact_family_rows(
+        &self,
+        owner_id: &str,
+        workspace_id: &str,
+        root_session_id: &str,
+        fetch_limit: i64,
+    ) -> Result<Vec<FamilyArtifact>, OrchestratorError> {
+        let rows = sqlx::query(
+            "SELECT a.id, a.session_id, a.turn_id, a.producer_invocation_id, a.role, \
+                    a.name, a.mime_type, a.size_bytes, a.sha256, a.created_at, \
+                    s.agent_id AS producer_agent_id, \
+                    ti.tool_name AS producer_tool_name \
+             FROM artifacts a \
+             JOIN sessions s ON s.id = a.session_id \
+             LEFT JOIN tool_invocations ti ON ti.id = a.producer_invocation_id \
+             WHERE a.owner_id = ?1 AND a.workspace_id = ?2 \
+               AND (s.id = ?3 OR s.parent_session_id = ?3) \
+             ORDER BY a.created_at ASC, a.id ASC \
+             LIMIT ?4",
+        )
+        .bind(owner_id)
+        .bind(workspace_id)
+        .bind(root_session_id)
+        .bind(fetch_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| OrchestratorError::storage("list family artifacts", &e))?;
+
+        rows.iter()
+            .map(|row| {
+                let artifact = ref_from_row(row)?;
+                let producer_session_id: String = row
+                    .try_get("session_id")
+                    .map_err(|e| OrchestratorError::storage("read artifact session_id", &e))?;
+                let producer_agent_id: String = row
+                    .try_get("producer_agent_id")
+                    .map_err(|e| OrchestratorError::storage("read producer_agent_id", &e))?;
+                let turn_id: String = row
+                    .try_get("turn_id")
+                    .map_err(|e| OrchestratorError::storage("read artifact turn_id", &e))?;
+                let producer_invocation_id: Option<String> = row
+                    .try_get("producer_invocation_id")
+                    .map_err(|e| OrchestratorError::storage("read producer_invocation_id", &e))?;
+                let producer_tool_name: Option<String> = row
+                    .try_get("producer_tool_name")
+                    .map_err(|e| OrchestratorError::storage("read producer_tool_name", &e))?;
+                let created_at: i64 = row
+                    .try_get("created_at")
+                    .map_err(|e| OrchestratorError::storage("read created_at", &e))?;
+                Ok(FamilyArtifact {
+                    artifact,
+                    root_session_id: root_session_id.to_owned(),
+                    producer_session_id,
+                    producer_agent_id,
+                    turn_id,
+                    producer_invocation_id,
+                    producer_tool_name,
+                    created_at,
+                })
             })
             .collect()
     }

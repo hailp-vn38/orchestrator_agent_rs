@@ -158,6 +158,21 @@ pub struct ArtifactRef {
     pub role: ArtifactRole,
 }
 
+/// Metadata đầy đủ của một artifact đã commit trong phạm vi một session family (Root + Child),
+/// kèm thông tin phiên/agent/tool đã xuất bản artifact đó.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FamilyArtifact {
+    pub artifact: ArtifactRef,
+    pub root_session_id: String,
+    pub producer_session_id: String,
+    pub producer_agent_id: String,
+    pub turn_id: String,
+    pub producer_invocation_id: Option<String>,
+    pub producer_tool_name: Option<String>,
+    /// Thời điểm tạo (unix epoch seconds).
+    pub created_at: i64,
+}
+
 /// Read projection của attempt mới nhất cho `(session_id, turn_id)`. `Completed` chỉ là
 /// trạng thái thực thi, không khẳng định yêu cầu nghiệp vụ đã đạt.
 #[derive(Debug, Clone, PartialEq, Eq)]

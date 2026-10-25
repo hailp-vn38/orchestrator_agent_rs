@@ -5,11 +5,24 @@ use std::path::Path;
 use crate::artifact::ArtifactDownload;
 use crate::error::{ErrorCode, OrchestratorError};
 use crate::store::DB_FILE;
-use crate::types::{ArtifactRef, CallerContext, Page, PageRequest};
+use crate::types::{ArtifactRef, CallerContext, FamilyArtifact, Page, PageRequest};
 
 use super::Orchestrator;
 
 impl Orchestrator {
+    /// Toàn bộ danh sách [`FamilyArtifact`] đã commit của một session family (`root_session_id`),
+    /// gồm cả Root và các Child session trực thuộc, sắp xếp theo thứ tự tạo `(created_at, id)`.
+    pub async fn list_family_artifacts(
+        &self,
+        caller: &CallerContext,
+        root_session_id: &str,
+    ) -> Result<Vec<FamilyArtifact>, OrchestratorError> {
+        self.ensure_open()?;
+        self.artifacts
+            .list_for_family(caller, root_session_id)
+            .await
+    }
+
     /// Phân trang danh sách [`ArtifactRef`] đã commit của `(session_id, turn_id)` theo thứ tự
     /// ổn định `(created_at, id)` và cursor opaque gắn với đúng `(session_id, turn_id)`.
     pub async fn list_artifacts(
@@ -34,6 +47,20 @@ impl Orchestrator {
     ) -> Result<ArtifactDownload, OrchestratorError> {
         self.ensure_open()?;
         self.artifacts.open_for_host(caller, artifact_id).await
+    }
+
+    /// Mở một artifact đã commit thuộc đúng session family (`root_session_id`) để đọc/stream
+    /// kèm kiểm tra toàn vẹn SHA-256. Trả `NotFound` nếu artifact thuộc session family khác.
+    pub async fn open_family_artifact(
+        &self,
+        caller: &CallerContext,
+        root_session_id: &str,
+        artifact_id: &str,
+    ) -> Result<ArtifactDownload, OrchestratorError> {
+        self.ensure_open()?;
+        self.artifacts
+            .open_for_family(caller, root_session_id, artifact_id)
+            .await
     }
 
     /// Tạo bản sao lưu nhất quán (consistent recovery point) của cả SQLite execution store

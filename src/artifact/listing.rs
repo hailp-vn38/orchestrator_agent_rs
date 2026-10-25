@@ -3,9 +3,35 @@
 use super::cursor::{decode_artifact_cursor, encode_artifact_cursor};
 use super::store::ArtifactStore;
 use crate::error::{ErrorCode, OrchestratorError};
-use crate::types::{ArtifactRef, CallerContext, Page, PageRequest};
+use crate::types::{ArtifactRef, CallerContext, FamilyArtifact, Page, PageRequest};
+
+const MAX_FAMILY_ARTIFACTS: i64 = 500;
 
 impl ArtifactStore {
+    /// Toàn bộ danh sách [`FamilyArtifact`] đã commit của một session family (`root_session_id`),
+    /// gồm cả Root và các Child session trực thuộc.
+    pub(crate) async fn list_for_family(
+        &self,
+        caller: &CallerContext,
+        root_session_id: &str,
+    ) -> Result<Vec<FamilyArtifact>, OrchestratorError> {
+        let (owner, workspace) = self.db.artifact_session_scope(root_session_id).await?;
+        if owner != caller.owner_id || workspace != caller.workspace_id {
+            return Err(OrchestratorError::new(
+                ErrorCode::PermissionDenied,
+                "the session is outside the caller's scope",
+            ));
+        }
+        self.db
+            .artifact_family_rows(
+                &caller.owner_id,
+                &caller.workspace_id,
+                root_session_id,
+                MAX_FAMILY_ARTIFACTS,
+            )
+            .await
+    }
+
     /// Phân trang danh sách `ArtifactRef` của một `(session_id, turn_id)` (bao gồm cả các artifact
     /// của child turn được ủy quyền trực tiếp bởi turn đó nếu `session_id` là Root).
     pub(crate) async fn list_for_turn(
