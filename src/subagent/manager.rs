@@ -12,9 +12,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-/// Poll `child_turn_id` đã persist: bắt đầu nhanh rồi giãn tới trần (đọc SQLite rẻ, ngắn).
-const POLL_START: Duration = Duration::from_millis(10);
-const POLL_MAX: Duration = Duration::from_millis(250);
+/// Chu kỳ đối chiếu dự phòng từ SQLite khi chờ child turn; đường chính nhận tín hiệu tức thì
+/// từ `ExecutionFeed` ngay khi child commit trạng thái terminal.
+const FALLBACK_POLL: Duration = Duration::from_secs(2);
 /// Số lần đọc store lỗi liên tiếp trước khi bỏ cuộc đợi (child vẫn chạy và vẫn đọc được sau).
 const MAX_POLL_ERRORS: u32 = 5;
 
@@ -174,7 +174,8 @@ impl TaskManager {
         admission: &ChildAdmission,
         cancel: &CancellationToken,
     ) -> Delegation {
-        let mut delay = POLL_START;
+        let mut rx = self.emitter.feed().subscribe_raw();
+        let mut rx_open = true;
         let mut errors = 0;
         let result = loop {
             if cancel.is_cancelled() {
@@ -201,12 +202,34 @@ impl TaskManager {
                     }
                 }
             }
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => return Delegation::Cancelled,
-                () = tokio::time::sleep(delay) => {}
+            let wait = if errors > 0 || !rx_open {
+                Duration::from_millis(50)
+            } else {
+                FALLBACK_POLL
+            };
+            let sleep = tokio::time::sleep(wait);
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Delegation::Cancelled,
+                    item = rx.recv(), if rx_open => match item {
+                        Ok(ev)
+                            if ev.session_id == admission.session_id
+                                && ev.state_revision.is_some() =>
+                        {
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            rx_open = false;
+                            break;
+                        }
+                    },
+                    () = &mut sleep => break,
+                }
             }
-            delay = (delay * 2).min(POLL_MAX);
         };
         if cancel.is_cancelled() && result.status != RunStatus::Completed {
             // Child dừng vì shutdown chung: parent cũng bị interrupted, không ghi result giả.

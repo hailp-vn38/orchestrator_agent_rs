@@ -69,6 +69,10 @@ impl ExecutionFeed {
         )
     }
 
+    pub(crate) fn subscribe_raw(&self) -> broadcast::Receiver<ExecutionEvent> {
+        self.inner.tx.subscribe()
+    }
+
     /// Kết thúc mọi subscription (shutdown). Event đã xếp hàng vẫn được trả hết trước.
     pub(crate) fn close(&self) {
         self.inner.closed.cancel();
