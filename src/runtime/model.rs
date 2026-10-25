@@ -8,34 +8,37 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::compaction::estimate_tokens;
 use crate::agent::AgentDefinition;
-use crate::executor::Effective;
+use crate::compaction::estimate_tokens;
 use crate::feed::{chunks, event};
 use crate::gateway::{
-    GatewayError, ModelMessage, ModelRequest, ModelResponse, ModelRole, StreamEvent,
+    GatewayError, ModelMessage, ModelRequest, ModelResponse, ModelRole, ModelTool, StreamEvent,
 };
 use crate::prompt::context_messages;
 use crate::store::{new_id, RunRecord};
 
 use super::{AgentRuntime, Settlement, STEP_LIMIT_GUIDANCE};
 
+pub(super) struct RunSnapshot {
+    pub agent: AgentDefinition,
+    pub system_prompt: String,
+    pub tools: Vec<ModelTool>,
+}
+
 impl AgentRuntime {
     pub(super) async fn build_request(
         &self,
         run: &RunRecord,
-        agent: &AgentDefinition,
-        eff: &Effective,
-        system_prompt: &str,
+        snapshot: &RunSnapshot,
     ) -> Option<ModelRequest> {
         let history = self.store.conversation(&run.session_id).await.ok()?;
         Some(ModelRequest {
             provider_id: run.provider_id.clone(),
             model_id: run.model_id.clone(),
-            system: system_prompt.to_owned(),
+            system: snapshot.system_prompt.clone(),
             messages: context_messages(history),
-            tools: self.executor.definitions(eff),
-            params: agent.llm,
+            tools: snapshot.tools.clone(),
+            params: snapshot.agent.llm,
         })
     }
 
@@ -45,24 +48,22 @@ impl AgentRuntime {
     pub(super) async fn model_step(
         &self,
         run: &RunRecord,
-        agent: &AgentDefinition,
-        eff: &Effective,
-        system_prompt: &str,
+        snapshot: &RunSnapshot,
         capped: bool,
         cancel: &CancellationToken,
     ) -> Result<(ModelResponse, String), Settlement> {
         let run_id = run.run_id.as_str();
         let mut request = self
-            .step_request(run, agent, eff, system_prompt, capped)
+            .step_request(run, snapshot, capped)
             .await
             .ok_or(Settlement::Unsettled)?;
-        let agent_limit = agent.context_limit_tokens;
+        let agent_limit = snapshot.agent.context_limit_tokens;
         if estimate_tokens(&request) >= self.context.threshold(agent_limit) {
             // Lỗi compact chủ động không chặn run: request vẫn có thể vừa; overflow thật sẽ
             // đi qua nhánh retry bên dưới.
-            if let Ok(true) = self.compact(run, agent.llm, cancel).await {
+            if let Ok(true) = self.compact(run, snapshot.agent.llm, cancel).await {
                 request = self
-                    .step_request(run, agent, eff, system_prompt, capped)
+                    .step_request(run, snapshot, capped)
                     .await
                     .ok_or(Settlement::Unsettled)?;
             }
@@ -77,10 +78,10 @@ impl AgentRuntime {
                 }
                 Err(GatewayError::ContextOverflow) if !retried => {
                     retried = true;
-                    match self.compact(run, agent.llm, cancel).await {
+                    match self.compact(run, snapshot.agent.llm, cancel).await {
                         Ok(true) => {
                             request = self
-                                .step_request(run, agent, eff, system_prompt, capped)
+                                .step_request(run, snapshot, capped)
                                 .await
                                 .ok_or(Settlement::Unsettled)?;
                         }
@@ -172,12 +173,10 @@ impl AgentRuntime {
     pub(super) async fn step_request(
         &self,
         run: &RunRecord,
-        agent: &AgentDefinition,
-        eff: &Effective,
-        system_prompt: &str,
+        snapshot: &RunSnapshot,
         capped: bool,
     ) -> Option<ModelRequest> {
-        let mut request = self.build_request(run, agent, eff, system_prompt).await?;
+        let mut request = self.build_request(run, snapshot).await?;
         if capped {
             request.tools.clear();
             request

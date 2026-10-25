@@ -6,7 +6,7 @@ use crate::feed::event;
 use crate::store::{RecoveryPolicy, Resolution, RunRoute, CODE_NO_EFFECT};
 use crate::types::{OperatorContext, VerifiedToolResolution};
 
-use super::{route_of, Orchestrator};
+use super::{route_of_live, Orchestrator};
 
 /// Trần độ dài evidence/operator id trong audit (ký tự).
 const EVIDENCE_MAX_CHARS: usize = 2000;
@@ -170,12 +170,8 @@ impl Orchestrator {
     }
 
     pub(super) fn route(&self, agent_id: &str) -> Option<RunRoute> {
-        let agents = self.live_agents.read().unwrap_or_else(|p| p.into_inner());
-        let def = agents.get(agent_id)?;
-        let fingerprints = self
-            .live_fingerprints
-            .read()
-            .unwrap_or_else(|p| p.into_inner());
-        route_of(def, &fingerprints)
+        let guard = self.catalog.read().unwrap_or_else(|p| p.into_inner());
+        let def = guard.get_agent(agent_id)?;
+        route_of_live(def, &guard.fingerprints)
     }
 }

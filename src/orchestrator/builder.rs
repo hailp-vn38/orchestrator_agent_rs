@@ -22,7 +22,64 @@ use crate::subagent::TaskManager;
 use crate::supervisor::{AdmissionSignal, Supervisor};
 use crate::tool::{validate_descriptor, HostTool, ToolServices};
 
-use super::{route_of, Orchestrator, OrchestratorBuilder};
+use super::{route_of, LiveAgentCatalog, Orchestrator, OrchestratorBuilder};
+
+pub(super) struct ValidatedAgents {
+    pub agents: HashMap<String, AgentDefinition>,
+    pub routes: HashMap<String, RunRoute>,
+    pub prompts: Vec<(String, String)>,
+}
+
+pub(super) async fn validate_and_load_agents(
+    agents: Vec<AgentDefinition>,
+    fingerprints: &BTreeMap<String, String>,
+    registered_tools: &HashSet<String>,
+    skills: &SkillManager,
+    has_skills_dir: bool,
+) -> Result<ValidatedAgents, OrchestratorError> {
+    let provider_ids: HashSet<String> = fingerprints.keys().cloned().collect();
+    let registry = AgentRegistry::build(agents, &provider_ids, registered_tools).await?;
+
+    if has_skills_dir {
+        for def in registry.list() {
+            if let Some(missing) = def.allowed_skills.iter().find(|s| !skills.contains(s)) {
+                return Err(OrchestratorError::config(
+                    ConfigReason::UnknownSkill,
+                    format!("agent '{}': unknown skill '{}'", def.id, missing),
+                ));
+            }
+        }
+    }
+
+    let mut prompts: Vec<(String, String)> = Vec::new();
+    for def in registry.list() {
+        let prompt = tokio::fs::read_to_string(&def.prompt_path)
+            .await
+            .map_err(|_| {
+                OrchestratorError::config(
+                    ConfigReason::PromptPathInvalid,
+                    format!(
+                        "agent '{}': prompt_path must be a readable UTF-8 file",
+                        def.id
+                    ),
+                )
+            })?;
+        prompts.push((def.id.clone(), prompt));
+    }
+
+    let agents_map: HashMap<String, AgentDefinition> =
+        registry.list().map(|d| (d.id.clone(), d.clone())).collect();
+    let routes: HashMap<String, RunRoute> = registry
+        .list()
+        .filter_map(|d| route_of(d, fingerprints).map(|r| (d.id.clone(), r)))
+        .collect();
+
+    Ok(ValidatedAgents {
+        agents: agents_map,
+        routes,
+        prompts,
+    })
+}
 
 const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 64 * 1024;
 
@@ -138,24 +195,23 @@ impl OrchestratorBuilder {
         }
 
         let names: HashSet<String> = tools.keys().cloned().collect();
-        let provider_ids: HashSet<String> = fingerprints.keys().cloned().collect();
-        let registry = AgentRegistry::build(self.config.agents, &provider_ids, &names).await?;
-
         let has_skills_dir = self.config.skills_dir.is_some();
         let skills = match &self.config.skills_dir {
             Some(dir) => SkillManager::discover(dir, self.config.runtime.skill_max_bytes).await?,
             None => SkillManager::empty(self.config.runtime.skill_max_bytes),
         };
-        if has_skills_dir {
-            for def in registry.list() {
-                if let Some(missing) = def.allowed_skills.iter().find(|s| !skills.contains(s)) {
-                    return Err(OrchestratorError::config(
-                        ConfigReason::UnknownSkill,
-                        format!("agent '{}': unknown skill '{}'", def.id, missing),
-                    ));
-                }
-            }
-        }
+        let ValidatedAgents {
+            agents,
+            routes,
+            prompts,
+        } = validate_and_load_agents(
+            self.config.agents,
+            &fingerprints,
+            &names,
+            &skills,
+            has_skills_dir,
+        )
+        .await?;
         let skills = Arc::new(skills);
 
         let project = match &self.config.project_instructions {
@@ -175,29 +231,11 @@ impl OrchestratorBuilder {
             None => None,
         };
 
-        // Snapshot prompt lúc build (registry bất biến, không hot reload).
-        let mut prompts: Vec<(String, String)> = Vec::new();
-        for def in registry.list() {
-            let prompt = tokio::fs::read_to_string(&def.prompt_path)
-                .await
-                .map_err(|_| {
-                    OrchestratorError::config(
-                        ConfigReason::PromptPathInvalid,
-                        format!(
-                            "agent '{}': prompt_path must be a readable UTF-8 file",
-                            def.id
-                        ),
-                    )
-                })?;
-            prompts.push((def.id.clone(), prompt));
-        }
         let prompt_builder = PromptBuilder::new(
             BASE_INSTRUCTIONS,
             project.as_deref(),
             prompts.iter().map(|(id, p)| (id.as_str(), p.as_str())),
         );
-        let agents: HashMap<String, AgentDefinition> =
-            registry.list().map(|d| (d.id.clone(), d.clone())).collect();
 
         // Owner guard từ lúc mở execution store (không đợi M5). Lock nhả khi supervisor
         // và mọi task local đã dừng.
@@ -232,10 +270,6 @@ impl OrchestratorBuilder {
         }
 
         let signal = AdmissionSignal::new(self.drop_admission_triggers);
-        let routes: HashMap<String, RunRoute> = registry
-            .list()
-            .filter_map(|d| route_of(d, &fingerprints).map(|r| (d.id.clone(), r)))
-            .collect();
         let replay_safe = replay_safe_names(&tools);
         let limits = ToolLimits {
             timeout: self.config.runtime.tool_timeout,
@@ -318,15 +352,18 @@ impl OrchestratorBuilder {
                     (gw.clone(), Some(gw))
                 }
             };
-        let live_agents = Arc::new(RwLock::new(agents));
-        let live_fingerprints = Arc::new(RwLock::new(fingerprints.clone()));
+        let catalog = Arc::new(RwLock::new(LiveAgentCatalog::new(
+            agents,
+            fingerprints,
+            None,
+        )));
         let shutdown = CancellationToken::new();
         let runtime = AgentRuntime::new(
             store.clone(),
             gateway,
             prompt_builder.clone(),
             executor,
-            Arc::clone(&live_agents),
+            Arc::clone(&catalog),
             ContextPolicy {
                 limit_tokens: self.config.runtime.context_limit_tokens,
                 threshold_percent: self.config.runtime.compaction_threshold_percent,
@@ -347,9 +384,7 @@ impl OrchestratorBuilder {
 
         Ok(Orchestrator {
             base_version,
-            registry,
-            live_agents,
-            live_fingerprints,
+            catalog,
             prompt: prompt_builder,
             tasks,
             skills,
@@ -357,7 +392,6 @@ impl OrchestratorBuilder {
             has_provider_runtime,
             client_gateway,
             tools,
-            fingerprints,
             store_dir: self.config.store_dir,
             store,
             artifacts,

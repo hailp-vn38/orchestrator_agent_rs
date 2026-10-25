@@ -730,20 +730,61 @@ async fn build_creates_store_with_owner_lock_and_clean_install_schema() {
 
 #[tokio::test]
 async fn live_reconfigure_updates_provider_model_steps_and_prompt() {
+    struct PingTool;
+    #[async_trait::async_trait]
+    impl orchestrator_agent_rs::HostTool for PingTool {
+        fn descriptor(&self) -> orchestrator_agent_rs::ToolDescriptor {
+            orchestrator_agent_rs::ToolDescriptor {
+                name: "ping".into(),
+                description: "ping tool".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                effect: orchestrator_agent_rs::ToolEffect::ReadOnly,
+            }
+        }
+        async fn execute(
+            &self,
+            ctx: orchestrator_agent_rs::ToolContext,
+            _args: serde_json::Value,
+        ) -> Result<orchestrator_agent_rs::ToolOutcome, orchestrator_agent_rs::ToolError> {
+            Ok(orchestrator_agent_rs::ToolOutcome {
+                call_id: ctx.scope().tool_call_id.clone(),
+                content: "pong".into(),
+                metadata: serde_json::Value::Null,
+            })
+        }
+    }
+
     let env = Env::new();
     let gw = ScriptedGateway::new();
+    gw.push_tool_calls("", vec![("call-1", "ping", serde_json::json!({}))]);
     gw.push_text("reply-1");
     gw.push_text("reply-2");
-    let o = env.build(&gw).await;
+
+    let mut cfg = env.config();
+    cfg.agents[0] = cfg.agents[0]
+        .clone()
+        .with_allowed_tools(["ping".to_string()]);
+    let o = Orchestrator::builder(cfg)
+        .register_tool(Arc::new(PingTool))
+        .with_gateway(gw.clone())
+        .build()
+        .await
+        .unwrap();
 
     let defs_before = o.agent_definitions();
     assert_eq!(defs_before.len(), 2);
 
+    // Hold gateway on step 1 of t1 so we can reconfigure while t1 is in-flight
+    gw.hold();
     let sid = o.create_session(&alice(), "root").await.unwrap();
     let t1 = o.submit(&alice(), &sid, "hello".into()).await.unwrap();
-    let r1 = wait_terminal(&o, &alice(), &sid, &t1.turn_id).await;
-    assert_eq!(r1.status, RunStatus::Completed);
-    assert_eq!(r1.output.as_deref(), Some("reply-1"));
+    while gw.call_count() < 1 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 
     std::fs::write(
         env.dir.path().join("root.md"),
@@ -770,6 +811,7 @@ async fn live_reconfigure_updates_provider_model_steps_and_prompt() {
         vec![
             AgentDefinition::new("root", "fake-v2", "model-v2")
                 .with_mode(AgentMode::Primary)
+                .with_allowed_tools(["ping".to_string()])
                 .with_steps(4)
                 .with_max_output_tokens(2048)
                 .with_prompt_path(env.dir.path().join("root.md")),
@@ -782,6 +824,16 @@ async fn live_reconfigure_updates_provider_model_steps_and_prompt() {
     .await
     .unwrap();
 
+    // Release gateway so in-flight t1 completes tool "ping" and executes step 2
+    gw.release();
+    let r1 = wait_terminal(&o, &alice(), &sid, &t1.turn_id).await;
+    assert_eq!(r1.status, RunStatus::Completed);
+    assert_eq!(r1.output.as_deref(), Some("reply-1"));
+
+    // Verify Orchestrator getters reflect reconfigured catalog and fingerprints
+    assert_eq!(o.agent("root").unwrap().provider_id, "fake-v2");
+    assert_eq!(o.agent("root").unwrap().model_id, "model-v2");
+    assert!(o.provider_fingerprint("fake-v2").is_some());
     let defs_after = o.agent_definitions();
     let root_after = defs_after.iter().find(|d| d.id == "root").unwrap();
     assert_eq!(root_after.provider_id, "fake-v2");
@@ -798,15 +850,19 @@ async fn live_reconfigure_updates_provider_model_steps_and_prompt() {
     assert_eq!(r2.output.as_deref(), Some("reply-2"));
 
     let requests = gw.requests();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].provider_id, "fake");
-    assert_eq!(requests[0].model_id, "model-x");
-    assert!(requests[0].system.contains(AGENT_PROMPT));
-
-    assert_eq!(requests[1].provider_id, "fake-v2");
-    assert_eq!(requests[1].model_id, "model-v2");
-    assert_eq!(requests[1].params.max_output_tokens, Some(2048));
-    assert!(requests[1]
+    assert_eq!(requests.len(), 3);
+    // Both step 1 and step 2 of in-flight t1 keep the original snapshot
+    for req in &requests[0..2] {
+        assert_eq!(req.provider_id, "fake");
+        assert_eq!(req.model_id, "model-x");
+        assert!(req.system.contains(AGENT_PROMPT));
+        assert!(!req.system.contains("Updated custom root system prompt."));
+    }
+    // New turn t2 receives the reconfigured provider, model, params, and system prompt
+    assert_eq!(requests[2].provider_id, "fake-v2");
+    assert_eq!(requests[2].model_id, "model-v2");
+    assert_eq!(requests[2].params.max_output_tokens, Some(2048));
+    assert!(requests[2]
         .system
         .contains("Updated custom root system prompt."));
 

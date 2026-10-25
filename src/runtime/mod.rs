@@ -18,7 +18,7 @@
 //! M5: hủy hợp tác có hai nguồn — shutdown (`interrupted`/`SHUTTING_DOWN`, phục hồi được) và
 //! `cancel` của host (`cancelled`/`CANCELLED`, terminal).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use serde_json::json;
@@ -26,10 +26,10 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, Instrument};
 
-use crate::agent::AgentDefinition;
 use crate::executor::{Effective, ToolExecutor, CODE_OUTCOME_UNKNOWN};
 use crate::feed::{event, tool_payload, Emitter};
 use crate::gateway::{GatewayError, LlmGateway};
+use crate::orchestrator::LiveAgentCatalog;
 use crate::prompt::PromptBuilder;
 use crate::store::{SessionStore, StoredToolCall};
 use crate::types::RunStatus;
@@ -38,6 +38,8 @@ mod compact;
 mod model;
 mod settle;
 mod terminal;
+
+use model::RunSnapshot;
 
 /// Hướng dẫn gửi cho model khi chạm `steps` cap (không persist; đây là execution stop,
 /// không phải bằng chứng hoàn tất nghiệp vụ).
@@ -72,7 +74,7 @@ pub(crate) struct AgentRuntime {
     prompt: PromptBuilder,
     executor: ToolExecutor,
     /// Bảng định nghĩa agent live (chia sẻ với Orchestrator để hỗ trợ reconfigure).
-    agents: Arc<RwLock<HashMap<String, AgentDefinition>>>,
+    catalog: Arc<RwLock<LiveAgentCatalog>>,
     context: ContextPolicy,
     /// Token shutdown của engine: phân biệt hủy do shutdown với `cancel` của host.
     shutdown: CancellationToken,
@@ -105,7 +107,7 @@ impl AgentRuntime {
         gateway: Arc<dyn LlmGateway>,
         prompt: PromptBuilder,
         executor: ToolExecutor,
-        agents: Arc<RwLock<HashMap<String, AgentDefinition>>>,
+        catalog: Arc<RwLock<LiveAgentCatalog>>,
         context: ContextPolicy,
         shutdown: CancellationToken,
         emitter: Emitter,
@@ -115,7 +117,7 @@ impl AgentRuntime {
             gateway,
             prompt,
             executor,
-            agents,
+            catalog,
             context,
             shutdown,
             emitter,
@@ -149,19 +151,24 @@ impl AgentRuntime {
             )
             .await;
         let agent = self
-            .agents
+            .catalog
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .get(&run.agent_id)
+            .get_agent(&run.agent_id)
             .cloned();
         let Some(agent) = agent else {
             return self.fail(run_id, GatewayError::NotConfigured).await;
         };
         let eff =
             Effective::resolve(&agent, &run.policy).for_session(run.parent_session_id.is_some());
-        let catalog = self.executor.skills().available(&eff.skills);
-        let Some(system_prompt) = self.prompt.system(&run.agent_id, &catalog) else {
+        let skill_catalog = self.executor.skills().available(&eff.skills);
+        let Some(system_prompt) = self.prompt.system(&run.agent_id, &skill_catalog) else {
             return self.fail(run_id, GatewayError::NotConfigured).await;
+        };
+        let snapshot = RunSnapshot {
+            tools: self.executor.definitions(&eff),
+            agent,
+            system_prompt,
         };
 
         // Run được sweep lại sau khi worker trước kết thúc mà chưa terminal. Invocation đã
@@ -193,15 +200,12 @@ impl AgentRuntime {
             }
 
             // Tới cap: request text-only, response là kết quả của run (không tạo run mới).
-            let capped = match (agent.steps, self.store.run_steps(run_id).await) {
+            let capped = match (snapshot.agent.steps, self.store.run_steps(run_id).await) {
                 (Some(limit), Ok(done)) => done >= limit,
                 (_, Err(_)) => return Settlement::Unsettled,
                 _ => false,
             };
-            let (response, step_id) = match self
-                .model_step(&run, &agent, &eff, &system_prompt, capped, cancel)
-                .await
-            {
+            let (response, step_id) = match self.model_step(&run, &snapshot, capped, cancel).await {
                 Ok(r) => r,
                 Err(done) => return done,
             };

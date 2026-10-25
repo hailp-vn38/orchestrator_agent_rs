@@ -15,7 +15,7 @@ pub enum AgentMode {
     All,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentDefinition {
     pub id: String,
     pub mode: AgentMode,

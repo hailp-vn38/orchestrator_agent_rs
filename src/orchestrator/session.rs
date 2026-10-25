@@ -1,36 +1,38 @@
 //! Truy vấn định nghĩa agent, vòng đời session, submit/result/history và cancel.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
-use crate::agent::{AgentDefinition, AgentMode, AgentRegistry};
+use crate::agent::{AgentDefinition, AgentMode};
 use crate::config::{LlmConfig, LlmProviderConfig};
 use crate::error::{ConfigReason, ErrorCode, OrchestratorError};
 use crate::feed::event;
-use crate::store::RunRoute;
 use crate::tool::ToolDescriptor;
 use crate::types::{
     AcceptedTurn, AgentResult, CallerContext, MessageView, Page, PageRequest, RunStatus,
     SessionPolicy,
 };
 
-use super::{route_of, Orchestrator};
+use super::builder::{validate_and_load_agents, ValidatedAgents};
+use super::{LiveAgentCatalog, Orchestrator};
 
 impl Orchestrator {
     pub fn agent(&self, id: &str) -> Option<&AgentDefinition> {
-        self.registry.get(id)
+        let guard = self.catalog.read().unwrap_or_else(|p| p.into_inner());
+        guard.get_agent(id)
     }
 
     /// Danh sách agent id đã sắp xếp (ổn định cho test/log).
     pub fn agent_ids(&self) -> Vec<&str> {
-        let mut ids: Vec<&str> = self.registry.list().map(|a| a.id.as_str()).collect();
+        let guard = self.catalog.read().unwrap_or_else(|p| p.into_inner());
+        let mut ids: Vec<&str> = guard.agents.keys().copied().collect();
         ids.sort_unstable();
         ids
     }
 
     /// Snapshot các `AgentDefinition` đang active (đã cập nhật qua `reconfigure`).
     pub fn agent_definitions(&self) -> Vec<AgentDefinition> {
-        let guard = self.live_agents.read().unwrap_or_else(|p| p.into_inner());
-        let mut defs: Vec<AgentDefinition> = guard.values().cloned().collect();
+        let guard = self.catalog.read().unwrap_or_else(|p| p.into_inner());
+        let mut defs: Vec<AgentDefinition> = guard.agents.values().map(|d| (*d).clone()).collect();
         defs.sort_by(|a, b| a.id.cmp(&b.id));
         defs
     }
@@ -58,58 +60,28 @@ impl Orchestrator {
             .map(|p| (p.id.trim().to_string(), p.routing_fingerprint()))
             .collect();
         let registered_tools: HashSet<String> = self.tools.keys().cloned().collect();
-        let provider_ids: HashSet<String> = new_fingerprints.keys().cloned().collect();
-        let registry = AgentRegistry::build(agents, &provider_ids, &registered_tools).await?;
+        let ValidatedAgents {
+            agents: new_agents,
+            routes: new_routes,
+            prompts,
+        } = validate_and_load_agents(
+            agents,
+            &new_fingerprints,
+            &registered_tools,
+            &self.skills,
+            self.has_skills_dir,
+        )
+        .await?;
 
-        if self.has_skills_dir {
-            for def in registry.list() {
-                if let Some(missing) = def
-                    .allowed_skills
-                    .iter()
-                    .find(|s| !self.skills.contains(s))
-                {
-                    return Err(OrchestratorError::config(
-                        ConfigReason::UnknownSkill,
-                        format!("agent '{}': unknown skill '{}'", def.id, missing),
-                    ));
-                }
-            }
-        }
-
-        let mut prompts: Vec<(String, String)> = Vec::new();
-        for def in registry.list() {
-            let prompt = tokio::fs::read_to_string(&def.prompt_path)
-                .await
-                .map_err(|_| {
-                    OrchestratorError::config(
-                        ConfigReason::PromptPathInvalid,
-                        format!(
-                            "agent '{}': prompt_path must be a readable UTF-8 file",
-                            def.id
-                        ),
-                    )
-                })?;
-            prompts.push((def.id.clone(), prompt));
-        }
-
-        let new_agents: HashMap<String, AgentDefinition> =
-            registry.list().map(|d| (d.id.clone(), d.clone())).collect();
-        let new_routes: HashMap<String, RunRoute> = registry
-            .list()
-            .filter_map(|d| route_of(d, &new_fingerprints).map(|r| (d.id.clone(), r)))
-            .collect();
-
+        let mut catalog_guard = self.catalog.write().unwrap_or_else(|p| p.into_inner());
         if let Some(gw) = &self.client_gateway {
             gw.replace_providers(&providers);
         }
         self.prompt
             .replace(prompts.iter().map(|(id, p)| (id.as_str(), p.as_str())));
         self.tasks.replace(&new_agents, new_routes);
-        *self.live_agents.write().unwrap_or_else(|p| p.into_inner()) = new_agents;
-        *self
-            .live_fingerprints
-            .write()
-            .unwrap_or_else(|p| p.into_inner()) = new_fingerprints;
+        *catalog_guard =
+            LiveAgentCatalog::new(new_agents, new_fingerprints, Some(&catalog_guard));
         Ok(())
     }
 
@@ -119,7 +91,8 @@ impl Orchestrator {
 
     /// Non-secret routing fingerprint của provider alias (EMB-16).
     pub fn provider_fingerprint(&self, provider_id: &str) -> Option<&str> {
-        self.fingerprints.get(provider_id).map(String::as_str)
+        let guard = self.catalog.read().unwrap_or_else(|p| p.into_inner());
+        guard.fingerprints.get(provider_id).copied()
     }
 
     pub fn base_instructions_version(&self) -> u32 {
@@ -147,11 +120,10 @@ impl Orchestrator {
     ) -> Result<String, OrchestratorError> {
         let _gate = self.supervisor.admission().await?;
         let agent = self
-            .live_agents
+            .catalog
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .get(agent_id)
-            .cloned()
+            .get_agent(agent_id)
             .ok_or_else(|| OrchestratorError::new(ErrorCode::NotFound, "agent not found"))?;
         if agent.mode == AgentMode::Subagent {
             return Err(OrchestratorError::new(

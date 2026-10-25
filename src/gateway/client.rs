@@ -46,11 +46,26 @@ impl ClientGateway {
             .iter()
             .map(|p| (p.id.trim().to_string(), p.clone()))
             .collect();
-        *self.providers.write().unwrap_or_else(|p| p.into_inner()) = next;
-        self.clients
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clear();
+        let mut invalidated_prefixes = Vec::new();
+        {
+            let mut guard = self.providers.write().unwrap_or_else(|p| p.into_inner());
+            for (id, old) in guard.iter() {
+                let changed = match next.get(id) {
+                    Some(new_cfg) => !same_provider_config(old, new_cfg),
+                    None => true,
+                };
+                if changed {
+                    invalidated_prefixes.push(format!("{id}\n"));
+                }
+            }
+            for (id, new_cfg) in next {
+                guard.insert(id, new_cfg);
+            }
+        }
+        if !invalidated_prefixes.is_empty() {
+            let mut clients = self.clients.lock().unwrap_or_else(|p| p.into_inner());
+            clients.retain(|key, _| !invalidated_prefixes.iter().any(|p| key.starts_with(p)));
+        }
     }
 
     fn client(
@@ -77,6 +92,18 @@ impl ClientGateway {
         clients.insert(key, Arc::clone(&client));
         Ok(client)
     }
+}
+
+fn same_provider_config(a: &LlmProviderConfig, b: &LlmProviderConfig) -> bool {
+    let same_auth = match (&a.auth, &b.auth) {
+        (ProviderAuth::None, ProviderAuth::None) => true,
+        (ProviderAuth::ApiKey(ka), ProviderAuth::ApiKey(kb)) => ka.expose() == kb.expose(),
+        _ => false,
+    };
+    a.backend == b.backend
+        && a.endpoint == b.endpoint
+        && a.request_timeout == b.request_timeout
+        && same_auth
 }
 
 fn build_client(
