@@ -2342,3 +2342,63 @@ async fn builtin_artifact_read_and_normal_tool_outcome_artifact_verification() {
 
     o.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn list_all_family_artifacts_returns_artifacts_across_multiple_session_families() {
+    let env = Env::new();
+    let cfg = env.config_with_tools(vec!["produce_artifact"], vec![]);
+    let gw = ScriptedGateway::new();
+
+    gw.push_tool_calls(
+        "",
+        vec![(
+            "call-s1",
+            "produce_artifact",
+            json!({ "name": "alpha-report.md", "body": "# Alpha" }),
+        )],
+    );
+    gw.push_text("alpha done");
+
+    gw.push_tool_calls(
+        "",
+        vec![(
+            "call-s2",
+            "produce_artifact",
+            json!({ "name": "beta-diagram.svg", "body": "<svg></svg>" }),
+        )],
+    );
+    gw.push_text("beta done");
+
+    let o = Orchestrator::builder(cfg)
+        .with_gateway(gw)
+        .register_tool(Arc::new(ProduceArtifactTool))
+        .build()
+        .await
+        .unwrap();
+
+    let s1 = o.create_session(&alice(), "root").await.unwrap();
+    let t1 = o.submit(&alice(), &s1, "create alpha".into()).await.unwrap();
+    let r1 = wait_terminal(&o, &alice(), &s1, &t1.turn_id).await;
+    assert_eq!(r1.status, RunStatus::Completed);
+
+    let s2 = o.create_session(&bob(), "root").await.unwrap();
+    let t2 = o.submit(&bob(), &s2, "create beta".into()).await.unwrap();
+    let r2 = wait_terminal(&o, &bob(), &s2, &t2.turn_id).await;
+    assert_eq!(r2.status, RunStatus::Completed);
+
+    let all = o.list_all_family_artifacts().await.unwrap();
+    assert_eq!(all.len(), 2);
+    let names: Vec<&str> = all.iter().map(|fa| fa.artifact.name.as_str()).collect();
+    assert!(names.contains(&"alpha-report.md"));
+    assert!(names.contains(&"beta-diagram.svg"));
+
+    let alpha = all.iter().find(|fa| fa.artifact.name == "alpha-report.md").unwrap();
+    assert_eq!(alpha.root_session_id, s1);
+    assert_eq!(alpha.producer_agent_id, "root");
+    assert_eq!(alpha.producer_tool_name.as_deref(), Some("produce_artifact"));
+
+    let beta = all.iter().find(|fa| fa.artifact.name == "beta-diagram.svg").unwrap();
+    assert_eq!(beta.root_session_id, s2);
+
+    o.shutdown().await.unwrap();
+}

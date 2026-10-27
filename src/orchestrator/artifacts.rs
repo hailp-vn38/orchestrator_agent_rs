@@ -10,6 +10,15 @@ use crate::types::{ArtifactRef, CallerContext, FamilyArtifact, Page, PageRequest
 use super::Orchestrator;
 
 impl Orchestrator {
+    /// Toàn bộ danh sách [`FamilyArtifact`] đã commit trên mọi session family trong store,
+    /// sắp xếp mới nhất trước `(created_at DESC, id DESC)` (phục vụ Host/Admin Artifact Catalog).
+    pub async fn list_all_family_artifacts(
+        &self,
+    ) -> Result<Vec<FamilyArtifact>, OrchestratorError> {
+        self.ensure_open()?;
+        self.artifacts.list_all_families().await
+    }
+
     /// Toàn bộ danh sách [`FamilyArtifact`] đã commit của một session family (`root_session_id`),
     /// gồm cả Root và các Child session trực thuộc, sắp xếp theo thứ tự tạo `(created_at, id)`.
     pub async fn list_family_artifacts(

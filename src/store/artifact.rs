@@ -340,39 +340,78 @@ impl SessionStore {
         .map_err(|e| OrchestratorError::storage("list family artifacts", &e))?;
 
         rows.iter()
-            .map(|row| {
-                let artifact = ref_from_row(row)?;
-                let producer_session_id: String = row
-                    .try_get("session_id")
-                    .map_err(|e| OrchestratorError::storage("read artifact session_id", &e))?;
-                let producer_agent_id: String = row
-                    .try_get("producer_agent_id")
-                    .map_err(|e| OrchestratorError::storage("read producer_agent_id", &e))?;
-                let turn_id: String = row
-                    .try_get("turn_id")
-                    .map_err(|e| OrchestratorError::storage("read artifact turn_id", &e))?;
-                let producer_invocation_id: Option<String> = row
-                    .try_get("producer_invocation_id")
-                    .map_err(|e| OrchestratorError::storage("read producer_invocation_id", &e))?;
-                let producer_tool_name: Option<String> = row
-                    .try_get("producer_tool_name")
-                    .map_err(|e| OrchestratorError::storage("read producer_tool_name", &e))?;
-                let created_at: i64 = row
-                    .try_get("created_at")
-                    .map_err(|e| OrchestratorError::storage("read created_at", &e))?;
-                Ok(FamilyArtifact {
-                    artifact,
-                    root_session_id: root_session_id.to_owned(),
-                    producer_session_id,
-                    producer_agent_id,
-                    turn_id,
-                    producer_invocation_id,
-                    producer_tool_name,
-                    created_at,
-                })
-            })
+            .map(|row| family_artifact_from_row(row, Some(root_session_id)))
             .collect()
     }
+
+    /// Toàn bộ các artifact đã commit trong `SessionStore` trên mọi session family,
+    /// kèm `root_session_id = COALESCE(s.parent_session_id, s.id)`, sắp xếp `(created_at DESC, id DESC)`.
+    pub(crate) async fn artifact_all_family_rows(
+        &self,
+        fetch_limit: i64,
+    ) -> Result<Vec<FamilyArtifact>, OrchestratorError> {
+        let rows = sqlx::query(
+            "SELECT a.id, a.session_id, a.turn_id, a.producer_invocation_id, a.role, \
+                    a.name, a.mime_type, a.size_bytes, a.sha256, a.created_at, \
+                    COALESCE(s.parent_session_id, s.id) AS root_session_id, \
+                    s.agent_id AS producer_agent_id, \
+                    ti.tool_name AS producer_tool_name \
+             FROM artifacts a \
+             JOIN sessions s ON s.id = a.session_id \
+             LEFT JOIN tool_invocations ti ON ti.id = a.producer_invocation_id \
+             ORDER BY a.created_at DESC, a.id DESC \
+             LIMIT ?1",
+        )
+        .bind(fetch_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| OrchestratorError::storage("list all family artifacts", &e))?;
+
+        rows.iter()
+            .map(|row| family_artifact_from_row(row, None))
+            .collect()
+    }
+}
+
+fn family_artifact_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    fixed_root_session_id: Option<&str>,
+) -> Result<FamilyArtifact, OrchestratorError> {
+    let artifact = ref_from_row(row)?;
+    let root_session_id = match fixed_root_session_id {
+        Some(id) => id.to_owned(),
+        None => row
+            .try_get("root_session_id")
+            .map_err(|e| OrchestratorError::storage("read root_session_id", &e))?,
+    };
+    let producer_session_id: String = row
+        .try_get("session_id")
+        .map_err(|e| OrchestratorError::storage("read artifact session_id", &e))?;
+    let producer_agent_id: String = row
+        .try_get("producer_agent_id")
+        .map_err(|e| OrchestratorError::storage("read producer_agent_id", &e))?;
+    let turn_id: String = row
+        .try_get("turn_id")
+        .map_err(|e| OrchestratorError::storage("read artifact turn_id", &e))?;
+    let producer_invocation_id: Option<String> = row
+        .try_get("producer_invocation_id")
+        .map_err(|e| OrchestratorError::storage("read producer_invocation_id", &e))?;
+    let producer_tool_name: Option<String> = row
+        .try_get("producer_tool_name")
+        .map_err(|e| OrchestratorError::storage("read producer_tool_name", &e))?;
+    let created_at: i64 = row
+        .try_get("created_at")
+        .map_err(|e| OrchestratorError::storage("read created_at", &e))?;
+    Ok(FamilyArtifact {
+        artifact,
+        root_session_id,
+        producer_session_id,
+        producer_agent_id,
+        turn_id,
+        producer_invocation_id,
+        producer_tool_name,
+        created_at,
+    })
 }
 
 fn ref_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ArtifactRef, OrchestratorError> {

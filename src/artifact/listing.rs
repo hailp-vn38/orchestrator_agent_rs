@@ -6,8 +6,17 @@ use crate::error::{ErrorCode, OrchestratorError};
 use crate::types::{ArtifactRef, CallerContext, FamilyArtifact, Page, PageRequest};
 
 const MAX_FAMILY_ARTIFACTS: i64 = 500;
+const MAX_ALL_FAMILY_ARTIFACTS: i64 = 2000;
 
 impl ArtifactStore {
+    /// Toàn bộ danh sách [`FamilyArtifact`] đã commit trên mọi session family trong store,
+    /// phục vụ Host/Admin tổng hợp danh mục Artifact xuyên phiên.
+    pub(crate) async fn list_all_families(&self) -> Result<Vec<FamilyArtifact>, OrchestratorError> {
+        self.db
+            .artifact_all_family_rows(MAX_ALL_FAMILY_ARTIFACTS)
+            .await
+    }
+
     /// Toàn bộ danh sách [`FamilyArtifact`] đã commit của một session family (`root_session_id`),
     /// gồm cả Root và các Child session trực thuộc.
     pub(crate) async fn list_for_family(
