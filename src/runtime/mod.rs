@@ -161,14 +161,16 @@ impl AgentRuntime {
         };
         let eff =
             Effective::resolve(&agent, &run.policy).for_session(run.parent_session_id.is_some());
-        let skill_catalog = self.executor.skills().available(&eff.skills);
+        let skills = self.executor.skills_snapshot();
+        let skill_catalog = skills.available(&eff.skills);
         let Some(system_prompt) = self.prompt.system(&run.agent_id, &skill_catalog) else {
             return self.fail(run_id, GatewayError::NotConfigured).await;
         };
         let snapshot = RunSnapshot {
-            tools: self.executor.definitions(&eff),
+            tools: self.executor.definitions(&eff, &skills),
             agent,
             system_prompt,
+            skills,
         };
 
         // Run được sweep lại sau khi worker trước kết thúc mà chưa terminal. Invocation đã
@@ -190,7 +192,7 @@ impl AgentRuntime {
 
         loop {
             if let Flow::Stop(done) = self
-                .settle_pending(run_id, &run, &eff, pending, cancel)
+                .settle_pending(run_id, &run, &eff, &snapshot.skills, pending, cancel)
                 .await
             {
                 return done;

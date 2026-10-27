@@ -52,6 +52,7 @@ pub use gateway::{
 };
 pub use orchestrator::{Orchestrator, OrchestratorBuilder};
 pub use secret::SecretString;
+pub use skill::{valid_skill_id, SkillDocument, SkillDocumentError, SkillReloadReport};
 pub use tool::{
     HostTool, ToolArtifacts, ToolCheckpoint, ToolContext, ToolDescriptor, ToolEffect, ToolError,
     ToolOutcome, ToolScope,

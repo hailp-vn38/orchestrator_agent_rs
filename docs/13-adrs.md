@@ -181,3 +181,11 @@ Mỗi quyết định dưới đây có trạng thái **Accepted** theo thảo l
 **Alternatives rejected:** Mixing `LlmConfig` and runtime providers (ambiguous routing and fingerprint source), exposing the raw `LlmGateway` publicly (leaks internal seam and `llm` crate types).
 
 **Consequences:** Host is responsible for credential handling, timeouts and error sanitising (`GatewayError`); fingerprint must change when the alias targets a different backend or recovery may resume on the wrong one.
+
+## ADR-019 — Canonical `SkillDocument` Codec and Per-Run `SkillManager` Snapshot on `reload_skills`
+
+**Status:** Accepted (2026-10-28); **extends ADR-004**.
+
+**Decision:** Export `SkillDocument` (`parse` + `render`) and `valid_skill_id` as the single frontmatter/body codec shared with host servers, and add `Orchestrator::reload_skills() -> Result<SkillReloadReport, OrchestratorError>` backed by `SkillManager::discover_lenient` and `Arc<RwLock<Arc<SkillManager>>>`. `AgentRuntime` pins an `Arc<SkillManager>` inside `RunSnapshot` at run start so in-flight runs observe a consistent skill catalog and content while subsequent runs pick up reloaded skills immediately.
+
+**Why:** Admin hosts need to create, edit, and delete `skills/<id>/SKILL.md` at runtime without restarting the process, without coupling skill filesystem health to provider/agent `reconfigure`, and without frontmatter quoting drift between host and engine.

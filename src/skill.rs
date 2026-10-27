@@ -1,6 +1,8 @@
-//! `SkillManager` (docs/04): index bất biến scan **một lần** lúc build từ `skills/<id>/SKILL.md`.
+//! `SkillManager` (docs/04, ADR-019): index bất biến từ `skills/<id>/SKILL.md` với hỗ trợ
+//! hot-reload nguyên tử (`Orchestrator::reload_skills`) và snapshot `Arc<SkillManager>` theo từng run.
 //!
-//! - Snapshot metadata + nội dung trong memory; thay đổi cần restart (không hot reload).
+//! - Mỗi `AgentRun` ghim một `Arc<SkillManager>` cố định lúc bắt đầu; `reload_skills()` cập nhật
+//!   snapshot cho các lượt chạy mới mà không cần khởi động lại tiến trình.
 //! - `available` và `load` dùng cùng effective permissions của session; catalog không phải
 //!   cơ chế bảo mật nên `load` kiểm tra lại quyền tại invocation.
 //! - Skill id đến từ LLM chỉ được tra trong index, không bao giờ ghép vào đường dẫn. Entry là
@@ -26,6 +28,127 @@ pub(crate) struct SkillSummary {
     pub id: String,
     pub name: String,
     pub description: String,
+}
+
+/// Tài liệu `SKILL.md` chuẩn hóa (single source of truth cho parse + render giữa engine và host).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillDocument {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub body: String,
+}
+
+/// Lỗi parse hoặc render `SKILL.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillDocumentError {
+    InvalidId,
+    TooLarge { size: usize, max_bytes: usize },
+    MissingFrontmatter,
+    MissingField(&'static str),
+    InvalidField(&'static str),
+    EmptyBody,
+}
+
+impl std::fmt::Display for SkillDocumentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidId => f.write_str("skill id must match [a-z0-9][a-z0-9_-]{0,63}"),
+            Self::TooLarge { size, max_bytes } => write!(
+                f,
+                "SKILL.md is {size} bytes, exceeding the {max_bytes} byte limit"
+            ),
+            Self::MissingFrontmatter => {
+                f.write_str("SKILL.md needs a frontmatter with name and description")
+            }
+            Self::MissingField(field) => write!(f, "frontmatter is missing '{field}'"),
+            Self::InvalidField(field) => write!(
+                f,
+                "frontmatter field '{field}' is invalid or contains unsupported characters"
+            ),
+            Self::EmptyBody => f.write_str("SKILL.md body must not be empty"),
+        }
+    }
+}
+
+impl std::error::Error for SkillDocumentError {}
+
+fn validate_frontmatter_field(
+    field: &'static str,
+    raw: &str,
+    max_chars: usize,
+) -> Result<String, SkillDocumentError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(SkillDocumentError::MissingField(field));
+    }
+    if trimmed.chars().count() > max_chars
+        || trimmed
+            .chars()
+            .any(|c| c == '"' || c == '\r' || c == '\n' || c.is_control())
+    {
+        return Err(SkillDocumentError::InvalidField(field));
+    }
+    Ok(trimmed.to_owned())
+}
+
+impl SkillDocument {
+    /// Parse và kiểm tra toàn vẹn một tệp `SKILL.md`.
+    pub fn parse(id: &str, text: &str, max_bytes: usize) -> Result<Self, SkillDocumentError> {
+        if !valid_skill_id(id) {
+            return Err(SkillDocumentError::InvalidId);
+        }
+        let size = text.len();
+        if size > max_bytes {
+            return Err(SkillDocumentError::TooLarge { size, max_bytes });
+        }
+        let (front, raw_body) =
+            parse_frontmatter(text).ok_or(SkillDocumentError::MissingFrontmatter)?;
+        let name = validate_frontmatter_field(
+            "name",
+            front.get("name").map(String::as_str).unwrap_or(""),
+            128,
+        )?;
+        let description = validate_frontmatter_field(
+            "description",
+            front.get("description").map(String::as_str).unwrap_or(""),
+            1024,
+        )?;
+        let body = raw_body.trim().to_owned();
+        if body.is_empty() {
+            return Err(SkillDocumentError::EmptyBody);
+        }
+        Ok(Self {
+            id: id.to_owned(),
+            name,
+            description,
+            body,
+        })
+    }
+
+    /// Render lại `SKILL.md` theo đúng định dạng mà `parse_frontmatter` đọc lại không suy hao.
+    pub fn render(&self) -> Result<String, SkillDocumentError> {
+        if !valid_skill_id(&self.id) {
+            return Err(SkillDocumentError::InvalidId);
+        }
+        let name = validate_frontmatter_field("name", &self.name, 128)?;
+        let description = validate_frontmatter_field("description", &self.description, 1024)?;
+        let body = self.body.trim();
+        if body.is_empty() {
+            return Err(SkillDocumentError::EmptyBody);
+        }
+        Ok(format!(
+            "---\nname: \"{}\"\ndescription: \"{}\"\n---\n\n{}\n",
+            name, description, body
+        ))
+    }
+}
+
+/// Báo cáo kết quả `Orchestrator::reload_skills()`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillReloadReport {
+    pub loaded: Vec<String>,
+    pub skipped: Vec<(String, String)>,
 }
 
 struct SkillEntry {
@@ -76,7 +199,7 @@ pub(crate) struct SkillManager {
     max_bytes: usize,
 }
 
-pub(crate) fn valid_skill_id(id: &str) -> bool {
+pub fn valid_skill_id(id: &str) -> bool {
     let mut chars = id.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit())
         && id.len() <= 64
@@ -166,6 +289,100 @@ impl SkillManager {
         Ok(Self { skills, max_bytes })
     }
 
+    /// Scan `root` theo chế độ khoan dung cho runtime reload: bỏ qua entry/skill lỗi hoặc trùng tên,
+    /// ghi `tracing::warn!` và trả về danh sách `(id, reason)` bị bỏ qua.
+    pub(crate) async fn discover_lenient(
+        root: &Path,
+        max_bytes: usize,
+    ) -> Result<(Self, Vec<(String, String)>), OrchestratorError> {
+        let bad_root = |m: &str| OrchestratorError::config(ConfigReason::InvalidSkillsDir, m);
+        let root = tokio::fs::canonicalize(root)
+            .await
+            .map_err(|_| bad_root("skills_dir must be an existing directory"))?;
+        if !tokio::fs::metadata(&root)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            return Err(bad_root("skills_dir must be an existing directory"));
+        }
+
+        let mut names = Vec::new();
+        let mut rd = tokio::fs::read_dir(&root)
+            .await
+            .map_err(|_| bad_root("skills_dir is not readable"))?;
+        while let Some(entry) = rd
+            .next_entry()
+            .await
+            .map_err(|_| bad_root("skills_dir is not readable"))?
+        {
+            if let Ok(name) = entry.file_name().into_string() {
+                names.push(name);
+            }
+        }
+        names.sort();
+
+        let mut skills = BTreeMap::new();
+        let mut by_name: BTreeMap<String, String> = BTreeMap::new();
+        let mut skipped = Vec::new();
+        for id in names {
+            let path = root.join(&id);
+            let Ok(meta) = tokio::fs::symlink_metadata(&path).await else {
+                skipped.push((id, "entry is not readable".into()));
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                tracing::warn!(skill_id = %id, "skipping symlinked skill entry during reload");
+                skipped.push((id, "skill entries must not be symlinks".into()));
+                continue;
+            }
+            if !meta.is_dir() {
+                continue;
+            }
+            if !valid_skill_id(&id) {
+                tracing::warn!(skill_id = %id, "skipping skill directory with invalid id during reload");
+                skipped.push((
+                    id,
+                    "id must match [a-z0-9][a-z0-9_-]{0,63} (directory name)".into(),
+                ));
+                continue;
+            }
+            let Ok(dir) = tokio::fs::canonicalize(&path).await else {
+                skipped.push((id, "directory is not readable".into()));
+                continue;
+            };
+            if !dir.starts_with(&root) {
+                skipped.push((id, "directory escapes the skills root".into()));
+                continue;
+            }
+            match Self::index_one(&id, dir, max_bytes).await {
+                Ok(entry) => {
+                    if let Some(other) = by_name.get(&entry.summary.name) {
+                        let reason = format!(
+                            "duplicate frontmatter name '{}' (already used by '{}')",
+                            entry.summary.name, other
+                        );
+                        tracing::warn!(skill_id = %id, %reason, "skipping duplicate skill during reload");
+                        skipped.push((id, reason));
+                        continue;
+                    }
+                    by_name.insert(entry.summary.name.clone(), id.clone());
+                    skills.insert(id, entry);
+                }
+                Err(err) => {
+                    let reason = err.to_string();
+                    tracing::warn!(skill_id = %id, %reason, "skipping malformed skill during reload");
+                    skipped.push((id, reason));
+                }
+            }
+        }
+        Ok((Self { skills, max_bytes }, skipped))
+    }
+
+    pub(crate) fn skill_ids(&self) -> Vec<String> {
+        self.skills.keys().cloned().collect()
+    }
+
     async fn index_one(
         id: &str,
         dir: PathBuf,
@@ -193,28 +410,18 @@ impl SkillManager {
         let text = tokio::fs::read_to_string(&file)
             .await
             .map_err(|_| invalid(id, "SKILL.md must be readable UTF-8 text"))?;
-        let (front, body) = parse_frontmatter(&text)
-            .ok_or_else(|| invalid(id, "SKILL.md needs a frontmatter with name and description"))?;
-        let field = |key: &str| {
-            front
-                .get(key)
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-                .map(str::to_owned)
-        };
-        let name = field("name").ok_or_else(|| invalid(id, "frontmatter is missing 'name'"))?;
-        let description = field("description")
-            .ok_or_else(|| invalid(id, "frontmatter is missing 'description'"))?;
+        let doc = SkillDocument::parse(id, &text, MAX_INDEX_READ_BYTES as usize)
+            .map_err(|e| invalid(id, &e.to_string()))?;
         let size = text.len();
         let related_files = list_related(&dir).await;
         Ok(SkillEntry {
             summary: SkillSummary {
-                id: id.to_owned(),
-                name,
-                description,
+                id: doc.id,
+                name: doc.name,
+                description: doc.description,
             },
             dir,
-            body: (size <= max_bytes).then(|| body.trim().to_owned()),
+            body: (size <= max_bytes).then_some(doc.body),
             size,
             related_files,
         })

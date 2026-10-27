@@ -14,9 +14,12 @@ Skill là gói hướng dẫn chuyên biệt trong `SKILL.md` với tài nguyên
 
 Tham khảo: https://github.com/anomalyco/opencode/blob/dev/packages/core/src/skill/instructions.ts và https://github.com/anomalyco/opencode/blob/dev/packages/core/src/tool/plugin/skill.ts.
 
-## 4.3. Discovery trong MVP
+## 4.3. Discovery, `SkillDocument` Codec & Hot-Reload (`reload_skills`)
 
-Chỉ hỗ trợ `skills/` của project, một ID duy nhất. Duplicate ID hoặc frontmatter thiếu tên/mô tả được báo ngay ở startup; không merge. Không có user-global source, remote URL skill, version manager hay hot reload. Thay đổi skill cần restart.
+Chỉ hỗ trợ `skills/` của project, một ID duy nhất (`[a-z0-9][a-z0-9_-]{0,63}`).
+- **Startup (`OrchestratorBuilder::build`)**: chạy `SkillManager::discover` theo chế độ fail-fast — duplicate frontmatter `name`, symlink, traversal hoặc thiếu frontmatter `name`/`description` báo lỗi cấu hình ngay.
+- **Canonical Codec (`SkillDocument`)**: crate expose public `SkillDocument { id, name, description, body }`, `SkillDocument::parse(id, text, max_bytes)`, `SkillDocument::render(&self)` và `valid_skill_id(id)` để host server dùng chung một bộ parser/renderer không suy hao (`parse(render(doc)) == doc`).
+- **Live Reload (`Orchestrator::reload_skills`)**: host có thể gọi `reload_skills()` độc lập với `reconfigure()` để quét lại `skills_dir` theo chế độ khoan dung (`SkillManager::discover_lenient`), bỏ qua các skill lỗi/trùng tên với `tracing::warn!` và trả về `SkillReloadReport { loaded, skipped }`. Mỗi `AgentRun` chụp một `Arc<SkillManager>` cố định trong `RunSnapshot` ngay khi bắt đầu run, bảo đảm run đang chạy không bị đổi giữa chừng khi `reload_skills()` diễn ra.
 
 ```markdown
 ---

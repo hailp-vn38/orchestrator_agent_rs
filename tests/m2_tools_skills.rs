@@ -915,3 +915,195 @@ async fn startup_validation_rejects_bad_skill_configuration() {
     assert_eq!(config_reason(err), ConfigReason::ProjectInstructionsInvalid);
     let _ = ErrorCode::NotFound;
 }
+
+#[test]
+fn skill_document_round_trip_and_validation() {
+    use orchestrator_agent_rs::{valid_skill_id, SkillDocument, SkillDocumentError};
+
+    assert!(valid_skill_id("wiki-ingest"));
+    assert!(!valid_skill_id("Bad_ID"));
+
+    let raw = "---\nname: \"wiki-ingest\"\ndescription: \"Compile sources: entities & concepts\"\n---\n\n# Wiki Ingest\n\nStep 1: Read source.\n";
+    let doc = SkillDocument::parse("wiki-ingest", raw, 64 * 1024).unwrap();
+    assert_eq!(doc.id, "wiki-ingest");
+    assert_eq!(doc.name, "wiki-ingest");
+    assert_eq!(doc.description, "Compile sources: entities & concepts");
+    assert_eq!(doc.body, "# Wiki Ingest\n\nStep 1: Read source.");
+
+    let rendered = doc.render().unwrap();
+    let reparsed = SkillDocument::parse("wiki-ingest", &rendered, 64 * 1024).unwrap();
+    assert_eq!(reparsed, doc);
+
+    // Rejects quotes or newlines in frontmatter fields so round-trip never corrupts
+    let bad_quote = SkillDocument {
+        id: "wiki-ingest".into(),
+        name: "bad \"quote\"".into(),
+        description: "ok".into(),
+        body: "body".into(),
+    };
+    assert_eq!(
+        bad_quote.render(),
+        Err(SkillDocumentError::InvalidField("name"))
+    );
+
+    let bad_newline = SkillDocument {
+        id: "wiki-ingest".into(),
+        name: "ok".into(),
+        description: "line1\nline2".into(),
+        body: "body".into(),
+    };
+    assert_eq!(
+        bad_newline.render(),
+        Err(SkillDocumentError::InvalidField("description"))
+    );
+
+    // Rejects empty body
+    assert_eq!(
+        SkillDocument::parse(
+            "wiki-ingest",
+            "---\nname: a\ndescription: b\n---\n   \n",
+            1024
+        ),
+        Err(SkillDocumentError::EmptyBody)
+    );
+
+    // Rejects oversized document
+    assert_eq!(
+        SkillDocument::parse("wiki-ingest", raw, 10),
+        Err(SkillDocumentError::TooLarge {
+            size: raw.len(),
+            max_bytes: 10
+        })
+    );
+}
+
+#[tokio::test]
+async fn reload_skills_discovers_new_edited_and_deleted_skills_and_skips_malformed() {
+    let env = Env::new();
+    env.add_skill("alpha", "alpha", "ALPHA-V1");
+    let gw = ScriptedGateway::new();
+    let mut cfg = env.config(env.agent(&["skill"], &["alpha"]));
+    cfg.skills_dir = Some(env.skills());
+    let o = build(cfg, &gw, vec![]).await.unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+
+    // 1. Edit alpha -> V2, add gamma -> V1, add broken skill (missing frontmatter)
+    env.add_skill("alpha", "alpha", "ALPHA-V2");
+    env.add_skill("gamma", "gamma", "GAMMA-V1");
+    let broken_dir = env.skills().join("broken");
+    std::fs::create_dir_all(&broken_dir).unwrap();
+    std::fs::write(broken_dir.join("SKILL.md"), "# broken skill without frontmatter\n").unwrap();
+
+    let report = o.reload_skills().await.unwrap();
+    assert_eq!(report.loaded, vec!["alpha", "gamma"]);
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(report.skipped[0].0, "broken");
+
+    // Reconfigure agent to also allow gamma
+    let providers = vec![LlmProviderConfig {
+        id: "fake".into(),
+        backend: LlmBackend::OpenAi,
+        endpoint: None,
+        auth: ProviderAuth::ApiKey(SecretString::new("sk-test-not-real")),
+        request_timeout: Duration::from_secs(30),
+    }];
+    o.reconfigure(providers.clone(), vec![env.agent(&["skill"], &["alpha", "gamma"])])
+        .await
+        .unwrap();
+
+    gw.push_tool_calls(
+        "",
+        vec![
+            ("c1", "skill", json!({"id": "alpha"})),
+            ("c2", "skill", json!({"id": "gamma"})),
+        ],
+    );
+    gw.push_text("loaded v2 and gamma");
+    let r = run_turn(&o, &sid, "use updated skills").await;
+    assert_eq!(r.status, RunStatus::Completed);
+    let h = history(&o, &sid).await;
+    let tools = tool_messages(&h);
+    assert!(tools[0].text.contains("ALPHA-V2"), "{}", tools[0].text);
+    assert!(tools[1].text.contains("GAMMA-V1"), "{}", tools[1].text);
+
+    // 2. Delete gamma and broken from disk, reload skills -> gamma disappears from catalog
+    std::fs::remove_dir_all(env.skills().join("gamma")).unwrap();
+    std::fs::remove_dir_all(&broken_dir).unwrap();
+    let report2 = o.reload_skills().await.unwrap();
+    assert_eq!(report2.loaded, vec!["alpha"]);
+    assert!(report2.skipped.is_empty());
+
+    gw.push_tool_calls("", vec![("c3", "skill", json!({"id": "gamma"}))]);
+    gw.push_text("gamma missing");
+    let r2 = run_turn(&o, &sid, "try deleted gamma").await;
+    assert_eq!(r2.status, RunStatus::Completed);
+    let reqs = gw.requests();
+    let last_step_first_req = &reqs[reqs.len() - 2];
+    assert!(
+        !last_step_first_req.system.contains("<id>gamma</id>"),
+        "deleted skill must not appear in available_skills"
+    );
+    let h2 = history(&o, &sid).await;
+    let tools2 = tool_messages(&h2);
+    assert!(
+        tools2.last().unwrap().text.contains("SKILL_NOT_FOUND"),
+        "{}",
+        tools2.last().unwrap().text
+    );
+}
+
+#[tokio::test]
+async fn active_run_keeps_pinned_skill_snapshot_across_reload() {
+    let env = Env::new();
+    env.add_skill("alpha", "alpha", "ALPHA-PINNED-V1");
+    let gw = ScriptedGateway::new();
+    let (slow, runs) = Probe::new(
+        "wait_step",
+        ToolEffect::ReadOnly,
+        Behavior::Sleep(Duration::from_millis(250)),
+    );
+    gw.push_tool_calls("", vec![("c1", "wait_step", json!({"text": "hold"}))]);
+    gw.push_tool_calls("", vec![("c2", "skill", json!({"id": "alpha"}))]);
+    gw.push_text("done v1");
+
+    let mut cfg = env.config(env.agent(&["wait_step", "skill"], &["alpha"]));
+    cfg.skills_dir = Some(env.skills());
+    let o = build(cfg, &gw, vec![slow]).await.unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+
+    let turn = o.submit(&alice(), &sid, "start run".into()).await.unwrap();
+    // Wait until wait_step has started executing so the run snapshot is already captured
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while runs.load(Ordering::SeqCst) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "wait_step never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Mutate alpha to V2 and reload skills while the run is still in-flight
+    env.add_skill("alpha", "alpha", "ALPHA-RELOADED-V2");
+    let report = o.reload_skills().await.unwrap();
+    assert_eq!(report.loaded, vec!["alpha"]);
+
+    let r1 = wait_terminal(&o, &sid, &turn.turn_id).await;
+    assert_eq!(r1.status, RunStatus::Completed);
+    let h1 = history(&o, &sid).await;
+    let tools1 = tool_messages(&h1);
+    assert!(
+        tools1[1].text.contains("ALPHA-PINNED-V1"),
+        "in-flight run must read from its pinned skill snapshot: {}",
+        tools1[1].text
+    );
+
+    // Subsequent turn sees V2
+    gw.push_tool_calls("", vec![("c3", "skill", json!({"id": "alpha"}))]);
+    gw.push_text("done v2");
+    let r2 = run_turn(&o, &sid, "next turn").await;
+    assert_eq!(r2.status, RunStatus::Completed);
+    let h2 = history(&o, &sid).await;
+    let tools2 = tool_messages(&h2);
+    assert!(
+        tools2.last().unwrap().text.contains("ALPHA-RELOADED-V2"),
+        "new turn must read from reloaded skill snapshot: {}",
+        tools2.last().unwrap().text
+    );
+}

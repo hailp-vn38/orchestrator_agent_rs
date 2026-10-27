@@ -195,8 +195,8 @@ impl OrchestratorBuilder {
         }
 
         let names: HashSet<String> = tools.keys().cloned().collect();
-        let has_skills_dir = self.config.skills_dir.is_some();
-        let skills = match &self.config.skills_dir {
+        let skills_dir = self.config.skills_dir.clone();
+        let skills = match &skills_dir {
             Some(dir) => SkillManager::discover(dir, self.config.runtime.skill_max_bytes).await?,
             None => SkillManager::empty(self.config.runtime.skill_max_bytes),
         };
@@ -209,10 +209,10 @@ impl OrchestratorBuilder {
             &fingerprints,
             &names,
             &skills,
-            has_skills_dir,
+            skills_dir.is_some(),
         )
         .await?;
-        let skills = Arc::new(skills);
+        let skills = Arc::new(RwLock::new(Arc::new(skills)));
 
         let project = match &self.config.project_instructions {
             Some(path) => {
@@ -388,7 +388,7 @@ impl OrchestratorBuilder {
             prompt: prompt_builder,
             tasks,
             skills,
-            has_skills_dir,
+            skills_dir,
             has_provider_runtime,
             client_gateway,
             tools,

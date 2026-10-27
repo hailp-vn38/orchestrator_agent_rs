@@ -8,6 +8,7 @@ use tracing::{warn, Instrument};
 use crate::executor::{Dispatch, Effective, Prepared};
 use crate::feed::{event, tool_payload};
 use crate::gateway::GatewayError;
+use crate::skill::SkillManager;
 use crate::store::{PendingInvocation, RunRecord};
 use crate::tool::ToolScope;
 use crate::types::RunStatus;
@@ -21,6 +22,7 @@ impl AgentRuntime {
         run_id: &str,
         run: &RunRecord,
         eff: &Effective,
+        skills: &SkillManager,
         pending: Vec<PendingInvocation>,
         cancel: &CancellationToken,
     ) -> Flow {
@@ -36,7 +38,7 @@ impl AgentRuntime {
                 tool = %inv.tool_name
             );
             if let Some(done) = self
-                .settle_one(run_id, run, eff, &inv, cancel)
+                .settle_one(run_id, run, eff, skills, &inv, cancel)
                 .instrument(span)
                 .await
             {
@@ -52,6 +54,7 @@ impl AgentRuntime {
         run_id: &str,
         run: &RunRecord,
         eff: &Effective,
+        skills: &SkillManager,
         inv: &PendingInvocation,
         cancel: &CancellationToken,
     ) -> Option<Settlement> {
@@ -68,7 +71,11 @@ impl AgentRuntime {
                     Err(_) => return Some(Settlement::Unsettled),
                 }
                 let scope = self.scope(run, eff, inv, run_id);
-                match self.executor.run(runnable, scope, eff, cancel).await {
+                match self
+                    .executor
+                    .run(runnable, scope, eff, skills, cancel)
+                    .await
+                {
                     Dispatch::Settled(s) => s,
                     Dispatch::Cancelled => {
                         return Some(self.fail(run_id, GatewayError::Cancelled).await)

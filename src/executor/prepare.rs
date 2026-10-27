@@ -5,6 +5,7 @@ use super::{
     CODE_DEPTH_LIMIT, CODE_INVALID_ARGS, CODE_NOT_ALLOWED, CODE_UNAVAILABLE, SKILL_TOOL,
 };
 use crate::gateway::ModelTool;
+use crate::skill::SkillManager;
 use crate::subagent::{self, SubagentInput, SUBAGENT_TOOL};
 use crate::tool::RESERVED_TOOL_NAMES;
 use serde_json::{json, Value};
@@ -13,7 +14,7 @@ use std::sync::Arc;
 impl ToolExecutor {
     /// Chỉ tool được phép: tool bị từ chối không xuất hiện trong request tới model.
     /// `skill` chỉ được cung cấp khi session thực sự có skill để nạp.
-    pub(crate) fn definitions(&self, eff: &Effective) -> Vec<ModelTool> {
+    pub(crate) fn definitions(&self, eff: &Effective, skills: &SkillManager) -> Vec<ModelTool> {
         let mut out: Vec<ModelTool> = self
             .descriptors
             .values()
@@ -24,7 +25,7 @@ impl ToolExecutor {
                 input_schema: d.input_schema.clone(),
             })
             .collect();
-        if eff.tools.contains(SKILL_TOOL) && !self.skills.available(&eff.skills).is_empty() {
+        if eff.tools.contains(SKILL_TOOL) && !skills.available(&eff.skills).is_empty() {
             out.push(skill_tool());
         }
         if eff.tools.contains(ARTIFACT_READ_TOOL) {

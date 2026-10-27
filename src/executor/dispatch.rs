@@ -4,7 +4,7 @@ use super::{
     CODE_TIMEOUT,
 };
 use crate::feed::ProgressSink;
-use crate::skill::render;
+use crate::skill::{render, SkillManager};
 use crate::subagent::Delegation;
 use crate::tool::{HostTool, ToolContext, ToolEffect, ToolError, ToolOutcome, ToolScope};
 use futures::FutureExt;
@@ -22,10 +22,11 @@ impl ToolExecutor {
         runnable: Runnable,
         scope: ToolScope,
         eff: &Effective,
+        skills: &SkillManager,
         cancel: &CancellationToken,
     ) -> Dispatch {
         match runnable {
-            Runnable::Skill { id } => Dispatch::Settled(match self.skills.load(&eff.skills, &id) {
+            Runnable::Skill { id } => Dispatch::Settled(match skills.load(&eff.skills, &id) {
                 Ok(loaded) => {
                     let content = render(&loaded);
                     // Skill không bị cắt theo tool cap: `skill_max_bytes` đã chặn lỗi rõ ràng.

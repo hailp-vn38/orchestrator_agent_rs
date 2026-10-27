@@ -1,11 +1,13 @@
 //! Truy vấn định nghĩa agent, vòng đời session, submit/result/history và cancel.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 use crate::agent::{AgentDefinition, AgentMode};
 use crate::config::{LlmConfig, LlmProviderConfig};
 use crate::error::{ConfigReason, ErrorCode, OrchestratorError};
 use crate::feed::event;
+use crate::skill::{SkillManager, SkillReloadReport};
 use crate::tool::ToolDescriptor;
 use crate::types::{
     AcceptedTurn, AgentResult, CallerContext, MessageView, Page, PageRequest, RunStatus,
@@ -60,6 +62,7 @@ impl Orchestrator {
             .map(|p| (p.id.trim().to_string(), p.routing_fingerprint()))
             .collect();
         let registered_tools: HashSet<String> = self.tools.keys().cloned().collect();
+        let current_skills = self.skills.read().unwrap_or_else(|p| p.into_inner()).clone();
         let ValidatedAgents {
             agents: new_agents,
             routes: new_routes,
@@ -68,8 +71,8 @@ impl Orchestrator {
             agents,
             &new_fingerprints,
             &registered_tools,
-            &self.skills,
-            self.has_skills_dir,
+            &current_skills,
+            self.skills_dir.is_some(),
         )
         .await?;
 
@@ -83,6 +86,20 @@ impl Orchestrator {
         *catalog_guard =
             LiveAgentCatalog::new(new_agents, new_fingerprints, Some(&catalog_guard));
         Ok(())
+    }
+
+    /// Quét lại `skills_dir` ở chế độ khoan dung (bỏ qua skill lỗi/trùng tên với `tracing::warn!`)
+    /// và cập nhật snapshot `SkillManager` cho các run bắt đầu sau thời điểm này.
+    pub async fn reload_skills(&self) -> Result<SkillReloadReport, OrchestratorError> {
+        self.ensure_open()?;
+        let Some(dir) = &self.skills_dir else {
+            return Ok(SkillReloadReport::default());
+        };
+        let (manager, skipped) =
+            SkillManager::discover_lenient(dir, self.runtime.skill_max_bytes).await?;
+        let loaded = manager.skill_ids();
+        *self.skills.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(manager);
+        Ok(SkillReloadReport { loaded, skipped })
     }
 
     pub fn tool_descriptors(&self) -> Vec<ToolDescriptor> {

@@ -10,7 +10,7 @@ use crate::subagent::{SubagentInput, TaskManager};
 use crate::tool::{HostTool, ToolDescriptor, ToolEffect, ToolServices};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 mod dispatch;
@@ -98,7 +98,7 @@ pub(crate) enum Dispatch {
 pub(crate) struct ToolExecutor {
     tools: BTreeMap<String, Arc<dyn HostTool>>,
     descriptors: BTreeMap<String, ToolDescriptor>,
-    skills: Arc<SkillManager>,
+    skills: Arc<RwLock<Arc<SkillManager>>>,
     tasks: TaskManager,
     limits: ToolLimits,
     feed: ExecutionFeed,
@@ -108,7 +108,7 @@ pub(crate) struct ToolExecutor {
 impl ToolExecutor {
     pub(crate) fn new(
         tools: BTreeMap<String, Arc<dyn HostTool>>,
-        skills: Arc<SkillManager>,
+        skills: Arc<RwLock<Arc<SkillManager>>>,
         tasks: TaskManager,
         limits: ToolLimits,
         feed: ExecutionFeed,
@@ -129,7 +129,7 @@ impl ToolExecutor {
         }
     }
 
-    pub(crate) fn skills(&self) -> &SkillManager {
-        &self.skills
+    pub(crate) fn skills_snapshot(&self) -> Arc<SkillManager> {
+        self.skills.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 }

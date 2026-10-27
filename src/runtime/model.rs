@@ -1,7 +1,7 @@
 //! Một LLM step: dựng request, gọi gateway (stream/non-stream), ghi usage.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde_json::json;
 
@@ -15,6 +15,7 @@ use crate::gateway::{
     GatewayError, ModelMessage, ModelRequest, ModelResponse, ModelRole, ModelTool, StreamEvent,
 };
 use crate::prompt::context_messages;
+use crate::skill::SkillManager;
 use crate::store::{new_id, RunRecord};
 
 use super::{AgentRuntime, Settlement, STEP_LIMIT_GUIDANCE};
@@ -23,6 +24,7 @@ pub(super) struct RunSnapshot {
     pub agent: AgentDefinition,
     pub system_prompt: String,
     pub tools: Vec<ModelTool>,
+    pub skills: Arc<SkillManager>,
 }
 
 impl AgentRuntime {
