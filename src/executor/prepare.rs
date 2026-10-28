@@ -16,13 +16,14 @@ impl ToolExecutor {
     /// `skill` chỉ được cung cấp khi session thực sự có skill để nạp.
     pub(crate) fn definitions(&self, eff: &Effective, skills: &SkillManager) -> Vec<ModelTool> {
         let mut out: Vec<ModelTool> = self
-            .descriptors
+            .tools
             .values()
+            .map(|t| t.descriptor())
             .filter(|d| eff.tools.contains(&d.name))
             .map(|d| ModelTool {
-                name: d.name.clone(),
-                description: d.description.clone(),
-                input_schema: d.input_schema.clone(),
+                name: d.name,
+                description: d.description,
+                input_schema: d.input_schema,
             })
             .collect();
         if eff.tools.contains(SKILL_TOOL) && !skills.available(&eff.skills).is_empty() {
@@ -110,7 +111,7 @@ impl ToolExecutor {
                 Err(e) => reject(CODE_INVALID_ARGS, format!("invalid arguments: {e}")),
             };
         }
-        let (Some(tool), Some(desc)) = (self.tools.get(name), self.descriptors.get(name)) else {
+        let Some(tool) = self.tools.get(name) else {
             // Tên built-in dành riêng nhưng chưa có handler.
             let code = if RESERVED_TOOL_NAMES.contains(&name) {
                 CODE_UNAVAILABLE
@@ -119,6 +120,7 @@ impl ToolExecutor {
             };
             return reject(code, format!("tool '{shown}' is not available"));
         };
+        let desc = tool.descriptor();
         match validate_args(&desc.input_schema, &args) {
             Ok(()) => Prepared::Run(Runnable::Host {
                 tool: Arc::clone(tool),

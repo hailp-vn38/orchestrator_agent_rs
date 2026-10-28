@@ -992,7 +992,11 @@ async fn reload_skills_discovers_new_edited_and_deleted_skills_and_skips_malform
     env.add_skill("gamma", "gamma", "GAMMA-V1");
     let broken_dir = env.skills().join("broken");
     std::fs::create_dir_all(&broken_dir).unwrap();
-    std::fs::write(broken_dir.join("SKILL.md"), "# broken skill without frontmatter\n").unwrap();
+    std::fs::write(
+        broken_dir.join("SKILL.md"),
+        "# broken skill without frontmatter\n",
+    )
+    .unwrap();
 
     let report = o.reload_skills().await.unwrap();
     assert_eq!(report.loaded, vec!["alpha", "gamma"]);
@@ -1007,9 +1011,12 @@ async fn reload_skills_discovers_new_edited_and_deleted_skills_and_skips_malform
         auth: ProviderAuth::ApiKey(SecretString::new("sk-test-not-real")),
         request_timeout: Duration::from_secs(30),
     }];
-    o.reconfigure(providers.clone(), vec![env.agent(&["skill"], &["alpha", "gamma"])])
-        .await
-        .unwrap();
+    o.reconfigure(
+        providers.clone(),
+        vec![env.agent(&["skill"], &["alpha", "gamma"])],
+    )
+    .await
+    .unwrap();
 
     gw.push_tool_calls(
         "",
@@ -1075,7 +1082,10 @@ async fn active_run_keeps_pinned_skill_snapshot_across_reload() {
     // Wait until wait_step has started executing so the run snapshot is already captured
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while runs.load(Ordering::SeqCst) == 0 {
-        assert!(tokio::time::Instant::now() < deadline, "wait_step never started");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "wait_step never started"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
@@ -1105,5 +1115,117 @@ async fn active_run_keeps_pinned_skill_snapshot_across_reload() {
         tools2.last().unwrap().text.contains("ALPHA-RELOADED-V2"),
         "new turn must read from reloaded skill snapshot: {}",
         tools2.last().unwrap().text
+    );
+}
+
+struct DynamicSchemaTool {
+    state: Arc<Mutex<(String, Vec<String>)>>,
+}
+
+#[async_trait::async_trait]
+impl HostTool for DynamicSchemaTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        let (desc, modes) = self.state.lock().unwrap().clone();
+        ToolDescriptor {
+            name: "dynamic_video".into(),
+            description: desc,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "mode": { "type": "string", "enum": modes }
+                },
+                "required": ["mode"],
+                "additionalProperties": false
+            }),
+            effect: ToolEffect::ReadOnly,
+        }
+    }
+
+    async fn execute(&self, ctx: ToolContext, args: Value) -> Result<ToolOutcome, ToolError> {
+        Ok(ToolOutcome {
+            call_id: ctx.scope().tool_call_id.clone(),
+            content: format!("ran mode={}", args["mode"].as_str().unwrap_or_default()),
+            metadata: json!({}),
+        })
+    }
+}
+
+#[tokio::test]
+async fn tool_executor_definitions_and_prepare_reflect_live_descriptor_changes() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    let state = Arc::new(Mutex::new((
+        "Active provider: muse (max 10s/clip)".to_owned(),
+        vec!["clip10".to_owned()],
+    )));
+    let dyn_tool: Arc<dyn HostTool> = Arc::new(DynamicSchemaTool {
+        state: state.clone(),
+    });
+
+    let cfg = env.config(env.agent(&["dynamic_video"], &[]));
+    let o = build(cfg, &gw, vec![dyn_tool]).await.unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+
+    // Turn 1: sees initial descriptor and validates against ["clip10"]
+    gw.push_tool_calls(
+        "",
+        vec![("c1", "dynamic_video", json!({ "mode": "clip10" }))],
+    );
+    gw.push_text("turn 1 done");
+    let r1 = run_turn(&o, &sid, "turn 1").await;
+    assert_eq!(r1.status, RunStatus::Completed);
+    let reqs1 = gw.requests();
+    let advertised1 = reqs1[0]
+        .tools
+        .iter()
+        .find(|t| t.name == "dynamic_video")
+        .unwrap();
+    assert_eq!(
+        advertised1.description,
+        "Active provider: muse (max 10s/clip)"
+    );
+
+    // Switch provider constraints at runtime without rebuilding Orchestrator
+    *state.lock().unwrap() = (
+        "Active provider: builtin (max 60s/clip)".to_owned(),
+        vec!["full60".to_owned()],
+    );
+
+    // Turn 2: model sees updated description, old enum value is rejected, new enum value succeeds
+    gw.push_tool_calls(
+        "",
+        vec![
+            ("c2_bad", "dynamic_video", json!({ "mode": "clip10" })),
+            ("c2_ok", "dynamic_video", json!({ "mode": "full60" })),
+        ],
+    );
+    gw.push_text("turn 2 done");
+    let r2 = run_turn(&o, &sid, "turn 2").await;
+    assert_eq!(r2.status, RunStatus::Completed);
+
+    let reqs2 = gw.requests();
+    let advertised2 = reqs2
+        .last()
+        .unwrap()
+        .tools
+        .iter()
+        .find(|t| t.name == "dynamic_video")
+        .unwrap();
+    assert_eq!(
+        advertised2.description,
+        "Active provider: builtin (max 60s/clip)"
+    );
+
+    let h2 = history(&o, &sid).await;
+    let tools2 = tool_messages(&h2);
+    assert!(
+        tools2[1].text.contains("INVALID_ARGUMENTS"),
+        "expected old enum value to be rejected by live schema: {}",
+        tools2[1].text
+    );
+    assert!(
+        tools2[2].text.contains("ran mode=full60"),
+        "expected new enum value to pass live schema: {}",
+        tools2[2].text
     );
 }
