@@ -2,12 +2,16 @@
 //! library validate cục bộ, không gọi remote khi build.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::AgentDefinition;
 use crate::error::{ConfigReason, OrchestratorError};
+use crate::gateway::{GatewayError, ModelRequest, ModelResponse, StreamSink};
 use crate::secret::SecretString;
 
 #[derive(Debug, Clone)]
@@ -277,10 +281,26 @@ impl LlmBackend {
     }
 }
 
+/// Seam thực thi lượt gọi model tùy biến do host cung cấp (ví dụ: Internal OAuth LLM Gateway
+/// với lease ngắn hạn trong RAM và `extra_headers` động theo từng nhà cung cấp).
+#[async_trait]
+pub trait CustomModelExecutor: Send + Sync + std::fmt::Debug {
+    /// Định danh routing phi bí mật dùng để tính `routing_fingerprint()` (EMB-16).
+    fn routing_fingerprint(&self) -> String;
+
+    async fn complete(
+        &self,
+        request: &ModelRequest,
+        cancel: &CancellationToken,
+        sink: StreamSink<'_>,
+    ) -> Result<ModelResponse, GatewayError>;
+}
+
 #[derive(Debug, Clone)]
 pub enum ProviderAuth {
     None,
     ApiKey(SecretString),
+    CustomExecutor(Arc<dyn CustomModelExecutor>),
 }
 
 /// Version của canonical encoding; đổi encoding phải tăng số này.
@@ -301,7 +321,8 @@ impl LlmProviderConfig {
                 format!("provider '{id}': request_timeout must be > 0"),
             ));
         }
-        match (&self.endpoint, self.backend.endpoint_required()) {
+        let is_custom = matches!(self.auth, ProviderAuth::CustomExecutor(_));
+        match (&self.endpoint, self.backend.endpoint_required() && !is_custom) {
             (None, true) => {
                 return Err(OrchestratorError::config(
                     ConfigReason::EndpointRequired,
@@ -321,23 +342,28 @@ impl LlmProviderConfig {
             }
             (None, false) => {}
         }
-        let key_ok = match &self.auth {
-            ProviderAuth::ApiKey(k) => !k.is_empty(),
-            ProviderAuth::None => false,
-        };
-        if self.backend.api_key_required() && !key_ok {
-            return Err(OrchestratorError::config(
-                ConfigReason::MissingApiKey,
-                format!("provider '{id}': an API key is required for this backend"),
-            ));
-        }
-        if let ProviderAuth::ApiKey(k) = &self.auth {
-            if k.is_empty() {
+        match &self.auth {
+            ProviderAuth::ApiKey(k) if k.is_empty() => {
                 return Err(OrchestratorError::config(
                     ConfigReason::MissingApiKey,
                     format!("provider '{id}': API key must not be empty"),
                 ));
             }
+            ProviderAuth::CustomExecutor(exec) if exec.routing_fingerprint().trim().is_empty() => {
+                return Err(OrchestratorError::config(
+                    ConfigReason::MissingApiKey,
+                    format!(
+                        "provider '{id}': custom executor routing_fingerprint must not be empty"
+                    ),
+                ));
+            }
+            ProviderAuth::None if self.backend.api_key_required() => {
+                return Err(OrchestratorError::config(
+                    ConfigReason::MissingApiKey,
+                    format!("provider '{id}': an API key is required for this backend"),
+                ));
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -348,17 +374,24 @@ impl LlmProviderConfig {
     }
 
     /// SHA-256 có version của các trường non-secret làm đổi routing (EMB-16):
-    /// backend kind + endpoint chuẩn hóa. Không gồm auth hay timeout.
+    /// backend kind + endpoint chuẩn hóa (+ custom executor fingerprint nếu có). Không gồm secret hay timeout.
     pub fn routing_fingerprint(&self) -> String {
         let endpoint = self
             .endpoint
             .as_deref()
             .and_then(normalize_endpoint)
             .unwrap_or_else(|| "-".to_string());
-        let canonical = format!(
-            "orchestrator-provider-fingerprint/{FINGERPRINT_VERSION}\nbackend={}\nendpoint={endpoint}\n",
-            self.backend.kind()
-        );
+        let canonical = match &self.auth {
+            ProviderAuth::CustomExecutor(exec) => format!(
+                "orchestrator-provider-fingerprint/{FINGERPRINT_VERSION}\nbackend={}\nendpoint={endpoint}\ncustom_executor={}\n",
+                self.backend.kind(),
+                exec.routing_fingerprint().trim()
+            ),
+            ProviderAuth::None | ProviderAuth::ApiKey(_) => format!(
+                "orchestrator-provider-fingerprint/{FINGERPRINT_VERSION}\nbackend={}\nendpoint={endpoint}\n",
+                self.backend.kind()
+            ),
+        };
         let digest = Sha256::digest(canonical.as_bytes());
         let mut out = String::with_capacity(FINGERPRINT_VERSION.len() + 1 + 64);
         out.push_str(FINGERPRINT_VERSION);

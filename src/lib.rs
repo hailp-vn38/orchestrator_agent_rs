@@ -41,7 +41,8 @@ mod types;
 pub use agent::{AgentDefinition, AgentMode, AgentRegistry};
 pub use artifact::{ArtifactDownload, ArtifactInput, ArtifactReader};
 pub use config::{
-    LlmBackend, LlmConfig, LlmProviderConfig, OrchestratorConfig, ProviderAuth, RuntimeConfig,
+    CustomModelExecutor, LlmBackend, LlmConfig, LlmProviderConfig, OrchestratorConfig,
+    ProviderAuth, RuntimeConfig,
 };
 pub use error::{ConfigReason, ErrorCode, OrchestratorError};
 pub use feed::{ExecutionEvent, FeedItem, Subscription};

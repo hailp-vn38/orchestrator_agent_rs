@@ -10,11 +10,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{LlmBackend, LlmProviderConfig, ProviderAuth};
 
-use super::collect::{collect, RawStream};
+use super::collect::{collect, strip_thinking_blocks, RawStream, ThinkStreamFilter};
 use super::convert::to_chat_messages;
 use super::error::{map_error, GatewayError};
 use super::types::{
-    LlmGateway, ModelRequest, ModelResponse, ModelUsage, ReasoningEffort, StreamSink,
+    LlmGateway, ModelRequest, ModelResponse, ModelUsage, ReasoningEffort, StreamEvent, StreamSink,
 };
 
 /// Trần output token mỗi request khi agent không đặt `ModelParams::max_output_tokens`.
@@ -98,6 +98,9 @@ fn same_provider_config(a: &LlmProviderConfig, b: &LlmProviderConfig) -> bool {
     let same_auth = match (&a.auth, &b.auth) {
         (ProviderAuth::None, ProviderAuth::None) => true,
         (ProviderAuth::ApiKey(ka), ProviderAuth::ApiKey(kb)) => ka.expose() == kb.expose(),
+        (ProviderAuth::CustomExecutor(ea), ProviderAuth::CustomExecutor(eb)) => {
+            ea.routing_fingerprint() == eb.routing_fingerprint()
+        }
         _ => false,
     };
     a.backend == b.backend
@@ -174,25 +177,50 @@ impl LlmGateway for ClientGateway {
         if request.model_id.trim().is_empty() {
             return Err(GatewayError::NotConfigured);
         }
-        let client = self.client(&cfg, request)?;
-        let messages = to_chat_messages(&request.messages);
-        let tools: Vec<Tool> = request
-            .tools
-            .iter()
-            .map(|t| Tool {
-                tool_type: "function".to_string(),
-                function: FunctionTool {
-                    name: t.name.clone(),
-                    description: t.description.clone(),
-                    parameters: t.input_schema.clone(),
-                },
-                cache_control: None,
-            })
-            .collect();
-
         // Deadline bao trùm cả bước tạo stream lẫn đọc stream: đây là timeout của *một*
         // request LLM, không phải của cả run.
         let work = async {
+            if let ProviderAuth::CustomExecutor(ref executor) = cfg.auth {
+                let filter = Mutex::new(ThinkStreamFilter::new());
+                let filtered_sink = |ev: StreamEvent| match ev {
+                    StreamEvent::TextDelta(t) => {
+                        if !t.is_empty() {
+                            let visible =
+                                filter.lock().unwrap_or_else(|p| p.into_inner()).push(&t);
+                            if !visible.is_empty() {
+                                sink(StreamEvent::TextDelta(visible));
+                            }
+                        }
+                    }
+                    other => sink(other),
+                };
+                let mut resp = executor.complete(request, cancel, &filtered_sink).await?;
+                let tail = filter.lock().unwrap_or_else(|p| p.into_inner()).flush();
+                if !tail.is_empty() {
+                    sink(StreamEvent::TextDelta(tail));
+                }
+                resp.text = strip_thinking_blocks(&resp.text);
+                if resp.text.trim().is_empty() && resp.tool_calls.is_empty() {
+                    return Err(GatewayError::Protocol);
+                }
+                return Ok(resp);
+            }
+
+            let client = self.client(&cfg, request)?;
+            let messages = to_chat_messages(&request.messages);
+            let tools: Vec<Tool> = request
+                .tools
+                .iter()
+                .map(|t| Tool {
+                    tool_type: "function".to_string(),
+                    function: FunctionTool {
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        parameters: t.input_schema.clone(),
+                    },
+                    cache_control: None,
+                })
+                .collect();
             let raw: RawStream = client
                 .chat_stream_with_tools(&messages, (!tools.is_empty()).then_some(&tools[..]))
                 .await

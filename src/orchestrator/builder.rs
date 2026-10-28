@@ -286,7 +286,7 @@ impl OrchestratorBuilder {
             .iter()
             .filter_map(|p| match &p.auth {
                 ProviderAuth::ApiKey(key) => Some(key.expose().to_owned()),
-                ProviderAuth::None => None,
+                ProviderAuth::None | ProviderAuth::CustomExecutor(_) => None,
             })
             .collect();
         #[allow(unused_mut)]

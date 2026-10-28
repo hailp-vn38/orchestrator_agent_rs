@@ -400,3 +400,89 @@ fn model_usage_estimates_missing_fields_and_preserves_measured_tokens() {
     assert_eq!(partial, ModelUsage::new(80, 2));
     assert_eq!(partial.total_tokens(), 82);
 }
+
+#[tokio::test]
+async fn client_gateway_delegates_to_custom_executor_with_usage_and_timeout() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::config::{CustomModelExecutor, LlmBackend, LlmProviderConfig, ProviderAuth};
+    use super::client::ClientGateway;
+    use super::types::{LlmGateway, StreamSink};
+
+    #[derive(Debug)]
+    struct TestCustomExecutor {
+        fingerprint: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl CustomModelExecutor for TestCustomExecutor {
+        fn routing_fingerprint(&self) -> String {
+            self.fingerprint.clone()
+        }
+
+        async fn complete(
+            &self,
+            request: &ModelRequest,
+            _cancel: &CancellationToken,
+            sink: StreamSink<'_>,
+        ) -> Result<ModelResponse, GatewayError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            sink(StreamEvent::TextDelta(format!("model={}:", request.model_id)));
+            sink(StreamEvent::TextDelta("ok".to_string()));
+            Ok(ModelResponse {
+                text: format!("model={}:ok", request.model_id),
+                finish_reason: "stop".to_string(),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let exec = Arc::new(TestCustomExecutor {
+        fingerprint: "gw:pool:anthropic".to_string(),
+        calls: Arc::clone(&calls),
+    });
+    let cfg = LlmProviderConfig {
+        id: "gw_claude".to_string(),
+        backend: LlmBackend::Anthropic,
+        endpoint: Some("https://api.anthropic.com/v1".to_string()),
+        auth: ProviderAuth::CustomExecutor(exec),
+        request_timeout: Duration::from_secs(5),
+    };
+    assert!(cfg.validate().is_ok());
+    let fp1 = cfg.routing_fingerprint();
+    assert!(fp1.starts_with("v1:"));
+
+    let gw = ClientGateway::new(std::slice::from_ref(&cfg));
+    let req = ModelRequest {
+        provider_id: "gw_claude".to_string(),
+        model_id: "claude-sonnet-4-20250514".to_string(),
+        system: "You are helpful.".to_string(),
+        messages: vec![ModelMessage::text(ModelRole::User, "Hello")],
+        tools: Vec::new(),
+        params: ModelParams::default(),
+    };
+    let streamed = Mutex::new(Vec::new());
+    let sink = |ev: StreamEvent| streamed.lock().unwrap().push(ev);
+    let resp = gw
+        .complete(&req, &CancellationToken::new(), &sink)
+        .await
+        .expect("custom executor complete");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(resp.text, "model=claude-sonnet-4-20250514:ok");
+    assert!(resp.usage.is_some());
+    assert!(resp.usage.unwrap().total_tokens() > 0);
+    assert_eq!(
+        streamed.into_inner().unwrap(),
+        vec![
+            StreamEvent::TextDelta("model=claude-sonnet-4-20250514:".to_string()),
+            StreamEvent::TextDelta("ok".to_string()),
+        ]
+    );
+}

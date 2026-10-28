@@ -60,7 +60,7 @@ pub fn strip_thinking_blocks(text: &str) -> String {
 }
 
 /// Bộ lọc `<think>...</think>` theo từng mảnh stream để không phát suy nghĩ nháp ra `TextDelta`.
-struct ThinkStreamFilter {
+pub(crate) struct ThinkStreamFilter {
     buf: String,
     in_think: bool,
     emitted_any: bool,
@@ -68,7 +68,7 @@ struct ThinkStreamFilter {
 }
 
 impl ThinkStreamFilter {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             buf: String::new(),
             in_think: false,
@@ -77,7 +77,7 @@ impl ThinkStreamFilter {
         }
     }
 
-    fn push(&mut self, chunk: &str) -> String {
+    pub(crate) fn push(&mut self, chunk: &str) -> String {
         self.buf.push_str(chunk);
         let mut out = String::new();
         loop {
@@ -138,7 +138,7 @@ impl ThinkStreamFilter {
         out
     }
 
-    fn flush(&mut self) -> String {
+    pub(crate) fn flush(&mut self) -> String {
         if self.in_think || self.buf.is_empty() {
             self.buf.clear();
             return String::new();
