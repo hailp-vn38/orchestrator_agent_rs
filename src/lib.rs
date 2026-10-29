@@ -51,7 +51,7 @@ pub use gateway::{
     ModelRole, ModelTool, ModelToolCall, ModelUsage, ProviderRuntime, ReasoningEffort,
     RuntimeProvider, StreamEvent, StreamSink,
 };
-pub use orchestrator::{Orchestrator, OrchestratorBuilder};
+pub use orchestrator::{Orchestrator, OrchestratorBuilder, MAX_SUBMIT_ARTIFACTS};
 pub use secret::SecretString;
 pub use skill::{valid_skill_id, SkillDocument, SkillDocumentError, SkillReloadReport};
 pub use tool::{

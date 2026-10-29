@@ -20,6 +20,13 @@ use crate::types::ArtifactRef;
 
 static ARTIFACT_ID_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// File đã được ghi + fsync + rename vào `committed/`, đã có id/hash/size nhưng CHƯA có row metadata.
+/// Nếu không bao giờ được publish, `sweep_orphans` sẽ dọn sau `staging_grace`.
+pub(crate) struct StagedArtifact {
+    pub reference: ArtifactRef,
+    pub storage_key: String,
+}
+
 pub(super) fn new_ordered_artifact_id() -> String {
     let ts_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -37,15 +44,33 @@ impl ArtifactStore {
         scope: &ArtifactWriteScope,
         input: ArtifactInput,
     ) -> Result<ArtifactRef, ToolError> {
+        let staged = self
+            .stage(&scope.owner_id, &scope.workspace_id, input)
+            .await?;
+        if let Err(err) = self
+            .publish_metadata(scope, &staged.reference, &staged.storage_key)
+            .await
+        {
+            self.discard_staged(std::slice::from_ref(&staged)).await;
+            return Err(err);
+        }
+        Ok(staged.reference)
+    }
+
+    /// Validate name/mime → disk reserve + quota sơ bộ → stream_to_staging → fsync → rename.
+    pub(crate) async fn stage(
+        &self,
+        owner_id: &str,
+        workspace_id: &str,
+        input: ArtifactInput,
+    ) -> Result<StagedArtifact, ToolError> {
         let name = validate_name(&input.name)?;
         let mime_type = validate_mime(&input.mime_type)?;
         self.check_disk_reserve(0)?;
 
         // Kiểm tra nhanh quota trước khi ghi file lớn ra đĩa; kiểm tra chính thức lặp lại
         // bên trong write transaction SQLite để chống race condition.
-        let current_used = self
-            .workspace_used_bytes(&scope.owner_id, &scope.workspace_id)
-            .await?;
+        let current_used = self.workspace_used_bytes(owner_id, workspace_id).await?;
         if current_used >= self.limits.workspace_quota_bytes {
             return Err(ToolError {
                 code: CODE_WORKSPACE_QUOTA_EXCEEDED.into(),
@@ -104,7 +129,7 @@ impl ArtifactStore {
 
         let artifact_id = new_ordered_artifact_id();
         let reference = ArtifactRef {
-            id: artifact_id.clone(),
+            id: artifact_id,
             name,
             mime_type,
             size_bytes,
@@ -112,12 +137,18 @@ impl ArtifactStore {
             role: input.role,
         };
 
-        if let Err(err) = self.publish_metadata(scope, &reference, &storage_key).await {
-            let _ = fs::remove_file(&committed_path).await;
-            return Err(err);
-        }
+        Ok(StagedArtifact {
+            reference,
+            storage_key,
+        })
+    }
 
-        Ok(reference)
+    /// Best-effort xoá file committed khi không publish được (lỗi tx, SessionBusy...).
+    pub(crate) async fn discard_staged(&self, staged: &[StagedArtifact]) {
+        for item in staged {
+            let committed_path = self.committed_dir.join(&item.storage_key);
+            let _ = fs::remove_file(&committed_path).await;
+        }
     }
 
     pub(super) async fn stream_to_staging(

@@ -61,6 +61,10 @@ impl ArtifactStore {
         &self.fault
     }
 
+    pub(crate) fn workspace_quota_bytes(&self) -> u64 {
+        self.limits.workspace_quota_bytes
+    }
+
     #[cfg(test)]
     pub(crate) fn committed_dir(&self) -> &Path {
         &self.committed_dir

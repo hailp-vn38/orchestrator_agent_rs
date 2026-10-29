@@ -62,7 +62,11 @@ impl Orchestrator {
             .map(|p| (p.id.trim().to_string(), p.routing_fingerprint()))
             .collect();
         let registered_tools: HashSet<String> = self.tools.keys().cloned().collect();
-        let current_skills = self.skills.read().unwrap_or_else(|p| p.into_inner()).clone();
+        let current_skills = self
+            .skills
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         let ValidatedAgents {
             agents: new_agents,
             routes: new_routes,
@@ -83,8 +87,7 @@ impl Orchestrator {
         self.prompt
             .replace(prompts.iter().map(|(id, p)| (id.as_str(), p.as_str())));
         self.tasks.replace(&new_agents, new_routes);
-        *catalog_guard =
-            LiveAgentCatalog::new(new_agents, new_fingerprints, Some(&catalog_guard));
+        *catalog_guard = LiveAgentCatalog::new(new_agents, new_fingerprints, Some(&catalog_guard));
         Ok(())
     }
 
@@ -176,6 +179,90 @@ impl Orchestrator {
             .await?;
         self.supervisor.notify_admitted();
         Ok(turn)
+    }
+
+    /// Giống [`Self::submit`], nhưng stage trước danh sách `inputs` (tối đa
+    /// [`super::MAX_SUBMIT_ARTIFACTS`]) để cấp `ArtifactRef` cho `build_text`, sau đó ghi
+    /// `agent_runs` + user message + metadata `artifacts` nguyên tử trong cùng một
+    /// transaction SQLite trước khi đánh thức supervisor.
+    pub async fn submit_with_artifacts<F>(
+        &self,
+        caller: &CallerContext,
+        session_id: &str,
+        inputs: Vec<crate::artifact::ArtifactInput>,
+        build_text: F,
+    ) -> Result<(AcceptedTurn, Vec<crate::types::ArtifactRef>), OrchestratorError>
+    where
+        F: FnOnce(&[crate::types::ArtifactRef]) -> String,
+    {
+        let _gate = self.supervisor.admission().await?;
+        if inputs.is_empty() {
+            return Err(OrchestratorError::new(
+                ErrorCode::InvalidInput,
+                "inputs must not be empty",
+            ));
+        }
+        if inputs.len() > super::MAX_SUBMIT_ARTIFACTS {
+            return Err(OrchestratorError::new(
+                ErrorCode::InvalidInput,
+                format!(
+                    "at most {} artifacts may be submitted at once",
+                    super::MAX_SUBMIT_ARTIFACTS
+                ),
+            ));
+        }
+
+        let mut staged = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            match self
+                .artifacts
+                .stage(&caller.owner_id, &caller.workspace_id, input)
+                .await
+            {
+                Ok(item) => staged.push(item),
+                Err(err) => {
+                    self.artifacts.discard_staged(&staged).await;
+                    return Err(crate::artifact::map_tool_error_to_orchestrator(err));
+                }
+            }
+        }
+
+        let refs: Vec<crate::types::ArtifactRef> =
+            staged.iter().map(|s| s.reference.clone()).collect();
+        let text = build_text(&refs);
+        if text.trim().is_empty() {
+            self.artifacts.discard_staged(&staged).await;
+            return Err(OrchestratorError::new(
+                ErrorCode::InvalidInput,
+                "text must not be empty",
+            ));
+        }
+
+        let staged_pairs: Vec<(crate::types::ArtifactRef, String)> = staged
+            .iter()
+            .map(|s| (s.reference.clone(), s.storage_key.clone()))
+            .collect();
+        let turn = match self
+            .store
+            .admit_turn_with_artifacts(
+                caller,
+                session_id,
+                &text,
+                |agent_id| self.route(agent_id),
+                &staged_pairs,
+                self.artifacts.workspace_quota_bytes(),
+            )
+            .await
+        {
+            Ok(turn) => turn,
+            Err(err) => {
+                self.artifacts.discard_staged(&staged).await;
+                return Err(err);
+            }
+        };
+
+        self.supervisor.notify_admitted();
+        Ok((turn, refs))
     }
 
     /// Projection của attempt mới nhất cho `(session_id, turn_id)`; đang chạy thì `output=None`.

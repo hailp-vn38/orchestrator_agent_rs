@@ -1,11 +1,17 @@
 //! Admission của turn (Root) và child turn (delegation depth 1).
 
+use super::artifact::PublishError;
 use super::codec::{db, new_id, parse_policy, policy_json, text_json};
 use super::types::{ChildAdmission, ChildAdmitError, ChildTarget, RunRoute};
 use super::SessionStore;
 use crate::error::{ErrorCode, OrchestratorError};
-use crate::types::{AcceptedTurn, CallerContext, SessionPolicy};
+use crate::types::{AcceptedTurn, ArtifactRef, CallerContext, SessionPolicy};
 use sqlx::Row;
+
+enum AdmitInTxError {
+    Rejected,
+    Other(OrchestratorError),
+}
 
 impl SessionStore {
     /// Một transaction ngắn: cấp sequence, claim run `running` (partial unique index) và
@@ -17,7 +23,87 @@ impl SessionStore {
         text: &str,
         resolve: impl Fn(&str) -> Option<RunRoute>,
     ) -> Result<AcceptedTurn, OrchestratorError> {
+        self.admit_turn_with_artifacts(caller, session_id, text, resolve, &[], 0)
+            .await
+    }
+
+    /// Admit turn và đồng thời INSERT danh sách `staged` artifacts vào đúng `(session_id, turn_id)`
+    /// vừa cấp phát trong cùng một write transaction SQLite.
+    pub(crate) async fn admit_turn_with_artifacts(
+        &self,
+        caller: &CallerContext,
+        session_id: &str,
+        text: &str,
+        resolve: impl Fn(&str) -> Option<RunRoute>,
+        staged: &[(ArtifactRef, String)],
+        workspace_quota_bytes: u64,
+    ) -> Result<AcceptedTurn, OrchestratorError> {
         let mut tx = self.pool.begin().await.map_err(db("begin admission"))?;
+        let (turn, _run_id) =
+            match Self::admit_turn_in_tx(&mut tx, caller, session_id, text, resolve).await {
+                Ok(pair) => pair,
+                Err(AdmitInTxError::Rejected) => {
+                    let _ = tx.rollback().await;
+                    return Err(self.explain_rejection(caller, session_id).await);
+                }
+                Err(AdmitInTxError::Other(err)) => {
+                    let _ = tx.rollback().await;
+                    return Err(err);
+                }
+            };
+
+        let record_scope = super::artifact::ArtifactRecordScope {
+            owner_id: &caller.owner_id,
+            workspace_id: &caller.workspace_id,
+            session_id,
+            turn_id: &turn.turn_id,
+            producer_invocation_id: None,
+        };
+        for (reference, storage_key) in staged {
+            if let Err(err) = Self::insert_artifact_in_tx(
+                &mut tx,
+                &record_scope,
+                reference,
+                storage_key,
+                workspace_quota_bytes,
+            )
+            .await
+            {
+                let _ = tx.rollback().await;
+                let mapped = match err {
+                    PublishError::QuotaExceeded => OrchestratorError::new(
+                        ErrorCode::Unavailable,
+                        format!(
+                            "{}: workspace artifact storage quota exceeded",
+                            crate::artifact::CODE_WORKSPACE_QUOTA_EXCEEDED
+                        ),
+                    ),
+                    PublishError::Db(msg) => OrchestratorError::new(
+                        ErrorCode::Unavailable,
+                        format!("{}: {msg}", crate::artifact::CODE_ARTIFACT_UNAVAILABLE),
+                    ),
+                    PublishError::SessionOutOfScope
+                    | PublishError::InvocationInactive
+                    | PublishError::TurnNotInSession => OrchestratorError::new(
+                        ErrorCode::PermissionDenied,
+                        "artifact publication denied",
+                    ),
+                };
+                return Err(mapped);
+            }
+        }
+
+        tx.commit().await.map_err(db("commit admission"))?;
+        Ok(turn)
+    }
+
+    async fn admit_turn_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        caller: &CallerContext,
+        session_id: &str,
+        text: &str,
+        resolve: impl Fn(&str) -> Option<RunRoute>,
+    ) -> Result<(AcceptedTurn, String), AdmitInTxError> {
         let claimed = sqlx::query(
             "UPDATE sessions SET next_sequence = next_sequence + 1, \
              state_revision = state_revision + 1, updated_at = unixepoch() \
@@ -28,30 +114,34 @@ impl SessionStore {
         .bind(session_id)
         .bind(&caller.owner_id)
         .bind(&caller.workspace_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
-        .map_err(db("claim sequence"))?;
+        .map_err(|e| AdmitInTxError::Other(db("claim sequence")(e)))?;
         let Some(row) = claimed else {
-            let _ = tx.rollback().await;
-            return Err(self.explain_rejection(caller, session_id).await);
+            return Err(AdmitInTxError::Rejected);
         };
-        let seq: i64 = row.try_get("seq").map_err(db("read sequence"))?;
-        let agent_id: String = row.try_get("agent_id").map_err(db("read agent"))?;
+        let seq: i64 = row
+            .try_get("seq")
+            .map_err(|e| AdmitInTxError::Other(db("read sequence")(e)))?;
+        let agent_id: String = row
+            .try_get("agent_id")
+            .map_err(|e| AdmitInTxError::Other(db("read agent")(e)))?;
         // Turn mới nhất đang chờ reconcile outcome không xác định: không được đi tiếp tới
         // model request kế tiếp (docs/18 §18.4.2 `RECOVERY_BLOCKED`).
-        if super::recovery::session_awaits_reconciliation(&mut tx, session_id).await? {
-            let _ = tx.rollback().await;
-            return Err(OrchestratorError::new(
+        if super::recovery::session_awaits_reconciliation(tx, session_id)
+            .await
+            .map_err(AdmitInTxError::Other)?
+        {
+            return Err(AdmitInTxError::Other(OrchestratorError::new(
                 ErrorCode::RecoveryBlocked,
                 "the session has an interrupted tool call whose outcome must be resolved first",
-            ));
+            )));
         }
         let Some(route) = resolve(&agent_id) else {
-            let _ = tx.rollback().await;
-            return Err(OrchestratorError::new(
+            return Err(AdmitInTxError::Other(OrchestratorError::new(
                 ErrorCode::InvalidInput,
                 "the session's agent is no longer configured",
-            ));
+            )));
         };
 
         let run_id = new_id();
@@ -68,18 +158,17 @@ impl SessionStore {
         .bind(&route.provider_id)
         .bind(&route.model_id)
         .bind(&route.fingerprint)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await;
         match inserted {
             Ok(_) => {}
             Err(sqlx::Error::Database(d)) if d.is_unique_violation() => {
-                let _ = tx.rollback().await;
-                return Err(OrchestratorError::new(
+                return Err(AdmitInTxError::Other(OrchestratorError::new(
                     ErrorCode::SessionBusy,
                     "the session already has an active run",
-                ));
+                )));
             }
-            Err(e) => return Err(db("claim run")(e)),
+            Err(e) => return Err(AdmitInTxError::Other(db("claim run")(e))),
         }
 
         sqlx::query(
@@ -91,14 +180,16 @@ impl SessionStore {
         .bind(seq)
         .bind(text_json(text))
         .bind(&turn_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
-        .map_err(db("insert user message"))?;
-        tx.commit().await.map_err(db("commit admission"))?;
-        Ok(AcceptedTurn {
-            session_id: session_id.to_owned(),
-            turn_id,
-        })
+        .map_err(|e| AdmitInTxError::Other(db("insert user message")(e)))?;
+        Ok((
+            AcceptedTurn {
+                session_id: session_id.to_owned(),
+                turn_id,
+            },
+            run_id,
+        ))
     }
 
     /// Một transaction ngắn (docs/06 §6.3): verify ownership/ancestry, append child input,

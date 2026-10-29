@@ -31,3 +31,13 @@ pub(super) fn map_io_error(context: &'static str, err: &io::Error) -> ToolError 
         message: "artifact storage operation failed".into(),
     }
 }
+
+pub(crate) fn map_tool_error_to_orchestrator(err: ToolError) -> OrchestratorError {
+    let code = match err.code.as_str() {
+        CODE_ARTIFACT_INVALID_INPUT | CODE_ARTIFACT_TOO_LARGE => ErrorCode::InvalidInput,
+        CODE_ARTIFACT_PERMISSION_DENIED => ErrorCode::PermissionDenied,
+        CODE_ARTIFACT_NOT_FOUND => ErrorCode::NotFound,
+        _ => ErrorCode::Unavailable,
+    };
+    OrchestratorError::new(code, format!("{}: {}", err.code, err.message))
+}

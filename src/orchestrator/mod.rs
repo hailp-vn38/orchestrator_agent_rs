@@ -81,6 +81,10 @@ impl LiveAgentCatalog {
     }
 }
 
+/// Số lượng tối đa [`crate::ArtifactInput`] cho phép đính kèm trong một lần gọi
+/// [`Orchestrator::submit_with_artifacts`].
+pub const MAX_SUBMIT_ARTIFACTS: usize = 4;
+
 pub struct Orchestrator {
     base_version: u32,
     catalog: Arc<RwLock<LiveAgentCatalog>>,

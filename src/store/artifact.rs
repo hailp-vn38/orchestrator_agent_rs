@@ -27,6 +27,15 @@ pub(crate) struct PublishScope<'a> {
     pub(crate) producer_invocation_id: Option<&'a str>,
 }
 
+/// Scope dùng cho `insert_artifact_in_tx` khi ghi row vào bảng `artifacts`.
+pub(crate) struct ArtifactRecordScope<'a> {
+    pub(crate) owner_id: &'a str,
+    pub(crate) workspace_id: &'a str,
+    pub(crate) session_id: &'a str,
+    pub(crate) turn_id: &'a str,
+    pub(crate) producer_invocation_id: Option<&'a str>,
+}
+
 /// Lý do `artifact_publish` thất bại; `ArtifactStore` ánh xạ sang mã `ToolError` tương ứng.
 pub(crate) enum PublishError {
     /// Lỗi DB ở bước được mô tả (message tĩnh).
@@ -134,17 +143,50 @@ impl SessionStore {
             }
         }
 
+        let record_scope = ArtifactRecordScope {
+            owner_id: scope.owner_id,
+            workspace_id: scope.workspace_id,
+            session_id: scope.session_id,
+            turn_id: scope.turn_id,
+            producer_invocation_id: scope.producer_invocation_id,
+        };
+        if let Err(err) = Self::insert_artifact_in_tx(
+            &mut tx,
+            &record_scope,
+            reference,
+            storage_key,
+            workspace_quota_bytes,
+        )
+        .await
+        {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
+
+        tx.commit()
+            .await
+            .map_err(|_| PublishError::Db("could not commit artifact metadata"))?;
+        Ok(())
+    }
+
+    /// Kiểm tra workspace quota rồi `INSERT INTO artifacts` bên trong write transaction đang mở.
+    pub(crate) async fn insert_artifact_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        scope: &ArtifactRecordScope<'_>,
+        reference: &ArtifactRef,
+        storage_key: &str,
+        workspace_quota_bytes: u64,
+    ) -> Result<(), PublishError> {
         let used: i64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(size_bytes), 0) FROM artifacts \
              WHERE owner_id = ?1 AND workspace_id = ?2",
         )
         .bind(scope.owner_id)
         .bind(scope.workspace_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|_| PublishError::Db("could not verify workspace quota"))?;
         if (used.max(0) as u64).saturating_add(reference.size_bytes) > workspace_quota_bytes {
-            let _ = tx.rollback().await;
             return Err(PublishError::QuotaExceeded);
         }
 
@@ -165,13 +207,10 @@ impl SessionStore {
         .bind(reference.size_bytes as i64)
         .bind(&reference.sha256)
         .bind(storage_key)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(|_| PublishError::Db("could not insert artifact metadata"))?;
 
-        tx.commit()
-            .await
-            .map_err(|_| PublishError::Db("could not commit artifact metadata"))?;
         Ok(())
     }
 

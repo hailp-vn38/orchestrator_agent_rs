@@ -2377,7 +2377,10 @@ async fn list_all_family_artifacts_returns_artifacts_across_multiple_session_fam
         .unwrap();
 
     let s1 = o.create_session(&alice(), "root").await.unwrap();
-    let t1 = o.submit(&alice(), &s1, "create alpha".into()).await.unwrap();
+    let t1 = o
+        .submit(&alice(), &s1, "create alpha".into())
+        .await
+        .unwrap();
     let r1 = wait_terminal(&o, &alice(), &s1, &t1.turn_id).await;
     assert_eq!(r1.status, RunStatus::Completed);
 
@@ -2392,13 +2395,229 @@ async fn list_all_family_artifacts_returns_artifacts_across_multiple_session_fam
     assert!(names.contains(&"alpha-report.md"));
     assert!(names.contains(&"beta-diagram.svg"));
 
-    let alpha = all.iter().find(|fa| fa.artifact.name == "alpha-report.md").unwrap();
+    let alpha = all
+        .iter()
+        .find(|fa| fa.artifact.name == "alpha-report.md")
+        .unwrap();
     assert_eq!(alpha.root_session_id, s1);
     assert_eq!(alpha.producer_agent_id, "root");
-    assert_eq!(alpha.producer_tool_name.as_deref(), Some("produce_artifact"));
+    assert_eq!(
+        alpha.producer_tool_name.as_deref(),
+        Some("produce_artifact")
+    );
 
-    let beta = all.iter().find(|fa| fa.artifact.name == "beta-diagram.svg").unwrap();
+    let beta = all
+        .iter()
+        .find(|fa| fa.artifact.name == "beta-diagram.svg")
+        .unwrap();
     assert_eq!(beta.root_session_id, s2);
+
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn submit_with_artifacts_commits_turn_artifacts_and_enforces_subagent_argument_scope() {
+    let env = Env::new();
+    let cfg = env.config_with_tools(vec!["subagent"], vec!["consume_artifact", "sneaky_read"]);
+    let gw = ScriptedGateway::new();
+    let hidden_target = Arc::new(Mutex::new(String::new()));
+
+    let hidden_for_step = Arc::clone(&hidden_target);
+    gw.push_with(move |req: &ModelRequest| {
+        let user_msg = req
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == ModelRole::User)
+            .expect("user message");
+        let art_id = user_msg
+            .text
+            .split_whitespace()
+            .find(|tok| tok.starts_with("art-"))
+            .expect("artifact id in user prompt")
+            .to_string();
+        *hidden_for_step.lock().unwrap() = art_id.clone();
+        ModelResponse {
+            text: String::new(),
+            finish_reason: "tool_use".into(),
+            tool_calls: vec![ModelToolCall {
+                id: "call-sub-1".into(),
+                name: "subagent".into(),
+                arguments: json!({
+                    "agent": "worker",
+                    "description": "process uploaded audio",
+                    "prompt": format!("Process uploaded audio {art_id}"),
+                }),
+            }],
+            usage: None,
+        }
+    });
+
+    // Subagent first tries sneaky_read (not in arguments_json -> PERMISSION_DENIED)
+    gw.push_tool_calls(
+        "",
+        vec![("call-sneaky", "sneaky_read", json!({ "note": "probe" }))],
+    );
+    // Then subagent calls consume_artifact with artifact_id in arguments_json -> succeeds
+    let hidden_for_consume = Arc::clone(&hidden_target);
+    gw.push_with(move |_req: &ModelRequest| {
+        let art_id = hidden_for_consume.lock().unwrap().clone();
+        ModelResponse {
+            text: String::new(),
+            finish_reason: "tool_use".into(),
+            tool_calls: vec![ModelToolCall {
+                id: "call-consume".into(),
+                name: "consume_artifact".into(),
+                arguments: json!({ "artifact_id": art_id }),
+            }],
+            usage: None,
+        }
+    });
+    gw.push_text("worker finished reading wav");
+    gw.push_text("root finished");
+
+    let o = Orchestrator::builder(cfg)
+        .with_gateway(gw)
+        .register_tool(Arc::new(ConsumeArtifactTool))
+        .register_tool(Arc::new(SneakyReadTool {
+            hidden_target: Arc::clone(&hidden_target),
+        }))
+        .build()
+        .await
+        .unwrap();
+
+    let s = o.create_session(&alice(), "root").await.unwrap();
+    let payload = b"RIFF-fake-wav-payload".to_vec();
+    let (turn, refs) = o
+        .submit_with_artifacts(
+            &alice(),
+            &s,
+            vec![ArtifactInput::intermediate_bytes(
+                "sample.wav",
+                "audio/wav",
+                payload.clone(),
+            )],
+            |refs| format!("Please transcribe {}", refs[0].id),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(refs.len(), 1);
+    assert!(refs[0].id.starts_with("art-"));
+    assert_eq!(refs[0].name, "sample.wav");
+    assert_eq!(refs[0].size_bytes, payload.len() as u64);
+
+    let r = wait_terminal(&o, &alice(), &s, &turn.turn_id).await;
+    assert_eq!(r.status, RunStatus::Completed);
+    assert_eq!(r.output.as_deref(), Some("root finished"));
+
+    let turn_arts = o
+        .list_artifacts(&alice(), &s, &turn.turn_id, PageRequest::first(10))
+        .await
+        .unwrap();
+    assert_eq!(turn_arts.items.len(), 1);
+    assert_eq!(turn_arts.items[0].id, refs[0].id);
+
+    let family_arts = o.list_family_artifacts(&alice(), &s).await.unwrap();
+    assert_eq!(family_arts.len(), 1);
+    assert_eq!(family_arts[0].artifact.id, refs[0].id);
+    assert_eq!(family_arts[0].turn_id, turn.turn_id);
+    assert!(family_arts[0].producer_tool_name.is_none());
+
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn submit_with_artifacts_is_atomic_on_second_artifact_quota_and_session_archived() {
+    let env = Env::new();
+    let mut cfg = env.config_with_tools(vec![], vec![]);
+    cfg.runtime.artifact_max_bytes = 8;
+    cfg.runtime.owner_workspace_quota_bytes = 10;
+    let gw = ScriptedGateway::new();
+
+    let o = Orchestrator::builder(cfg)
+        .with_gateway(gw)
+        .build()
+        .await
+        .unwrap();
+
+    let s = o.create_session(&alice(), "root").await.unwrap();
+
+    // Two 6-byte files: each <= 10 during stage(), but 6 + 6 = 12 > 10 inside admit_turn_with_artifacts tx.
+    let err = o
+        .submit_with_artifacts(
+            &alice(),
+            &s,
+            vec![
+                ArtifactInput::intermediate_bytes("a.wav", "audio/wav", b"123456".to_vec()),
+                ArtifactInput::intermediate_bytes("b.wav", "audio/wav", b"654321".to_vec()),
+            ],
+            |refs| format!("uploaded {} and {}", refs[0].id, refs[1].id),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::Unavailable);
+    assert!(
+        err.message().contains("WORKSPACE_QUOTA_EXCEEDED"),
+        "unexpected error message: {}",
+        err.message()
+    );
+
+    let mut conn = env.sql().await;
+    let run_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE session_id = ?1")
+            .bind(&s)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    let msg_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id = ?1")
+        .bind(&s)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    let art_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM artifacts")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        run_count, 0,
+        "no agent_runs row should remain after rollback"
+    );
+    assert_eq!(msg_count, 0, "no messages row should remain after rollback");
+    assert_eq!(
+        art_count, 0,
+        "no artifacts row should remain after rollback"
+    );
+
+    let committed_files: Vec<_> = std::fs::read_dir(env.store().join("artifacts/committed"))
+        .unwrap()
+        .collect();
+    assert!(
+        committed_files.is_empty(),
+        "discard_staged must clean up committed files on tx rollback"
+    );
+
+    // Archive session and verify submit_with_artifacts rolls back and discards staged file.
+    o.archive_session(&alice(), &s).await.unwrap();
+    let err_archived = o
+        .submit_with_artifacts(
+            &alice(),
+            &s,
+            vec![ArtifactInput::intermediate_bytes(
+                "c.wav",
+                "audio/wav",
+                b"1234".to_vec(),
+            )],
+            |refs| format!("uploaded {}", refs[0].id),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err_archived.code(), ErrorCode::SessionArchived);
+    let committed_after_archived: Vec<_> =
+        std::fs::read_dir(env.store().join("artifacts/committed"))
+            .unwrap()
+            .collect();
+    assert!(committed_after_archived.is_empty());
 
     o.shutdown().await.unwrap();
 }
