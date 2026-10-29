@@ -49,13 +49,20 @@ pub(super) fn admit_failure(error: ChildAdmitError) -> Delegation {
 /// Chuyển attempt terminal của child thành outcome của parent invocation.
 pub(super) fn outcome_of(scope: &ToolScope, result: AgentResult) -> Result<ToolOutcome, ToolError> {
     let sid = &result.session_id;
+    let child_code = result.error.as_ref().map_or("", |e| e.code.as_str());
+    let is_blocked = matches!(child_code, "TOOL_OUTCOME_UNKNOWN" | "RECOVERY_BLOCKED");
     let error = |code: &str, why: &str| {
-        let child_code = result.error.as_ref().map_or("", |e| e.code.as_str());
+        let guidance = if is_blocked {
+            "that session is blocked by an unresolved mutating tool call and cannot be resumed \
+             until an operator resolves it; omit session_id to start a new subagent session if \
+             needed"
+        } else {
+            "its history is kept and it can be resumed with session_id"
+        };
         Err(ToolError {
             code: code.into(),
             message: format!(
-                "subagent session {sid} {why}{}; its history is kept and it can be resumed \
-                 with session_id",
+                "subagent session {sid} {why}{}; {guidance}",
                 if child_code.is_empty() {
                     String::new()
                 } else {

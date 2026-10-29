@@ -1872,7 +1872,16 @@ async fn resolving_a_child_the_parent_already_gave_up_on_does_not_resume_it() {
     let t = o.submit(&alice(), &sid, "delegate".into()).await.unwrap();
     let r = wait_terminal(&o, &sid, &t.turn_id).await;
     assert_eq!(r.status, RunStatus::Completed, "{:?}", r.error);
-    assert!(tool_texts(&history(&o, &sid).await)[0].contains("CHILD_FAILED"));
+    let parent_tool_msg = &tool_texts(&history(&o, &sid).await)[0];
+    assert!(parent_tool_msg.contains("CHILD_FAILED"), "{parent_tool_msg}");
+    assert!(
+        parent_tool_msg.contains("omit session_id to start a new subagent session"),
+        "{parent_tool_msg}"
+    );
+    assert!(
+        !parent_tool_msg.contains("can be resumed with session_id"),
+        "{parent_tool_msg}"
+    );
 
     let (child_sid, child_turn, child_inv) = {
         let mut c = env.sql().await;
