@@ -157,14 +157,26 @@ impl AgentRuntime {
             .get_agent(&run.agent_id)
             .cloned();
         let Some(agent) = agent else {
-            return self.fail(run_id, GatewayError::NotConfigured).await;
+            return self
+                .fail_with_detail(
+                    run_id,
+                    GatewayError::NotConfigured,
+                    Some("agent definition not found in catalog"),
+                )
+                .await;
         };
         let eff =
             Effective::resolve(&agent, &run.policy).for_session(run.parent_session_id.is_some());
         let skills = self.executor.skills_snapshot();
         let skill_catalog = skills.available(&eff.skills);
         let Some(system_prompt) = self.prompt.system(&run.agent_id, &skill_catalog) else {
-            return self.fail(run_id, GatewayError::NotConfigured).await;
+            return self
+                .fail_with_detail(
+                    run_id,
+                    GatewayError::NotConfigured,
+                    Some("failed to build system prompt for agent"),
+                )
+                .await;
         };
         let snapshot = RunSnapshot {
             tools: self.executor.definitions(&eff, &skills),
@@ -214,7 +226,13 @@ impl AgentRuntime {
 
             if capped || response.tool_calls.is_empty() {
                 if !capped && run.parent_session_id.is_none() && response.text.trim().is_empty() {
-                    return self.fail(run_id, GatewayError::Protocol).await;
+                    return self
+                        .fail_with_detail(
+                            run_id,
+                            GatewayError::Protocol,
+                            Some("root agent finished with empty text and no tool calls"),
+                        )
+                        .await;
                 }
                 // Tool call (nếu có) bị bỏ khi đã hết steps: chưa persist, không execute.
                 let text = if capped && response.text.trim().is_empty() {
@@ -266,7 +284,13 @@ impl AgentRuntime {
                 .iter()
                 .any(|c| c.id.trim().is_empty() || !seen.insert(c.id.as_str()))
             {
-                return self.fail(run_id, GatewayError::Protocol).await;
+                return self
+                    .fail_with_detail(
+                        run_id,
+                        GatewayError::Protocol,
+                        Some("model returned duplicate or empty tool_call_id"),
+                    )
+                    .await;
             }
             let calls: Vec<StoredToolCall> = response
                 .tool_calls

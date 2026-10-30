@@ -10,17 +10,70 @@ use super::{AgentRuntime, Settlement};
 
 impl AgentRuntime {
     pub(super) async fn fail(&self, run_id: &str, error: GatewayError) -> Settlement {
-        let (status, code, message) = match error {
-            GatewayError::Cancelled if self.shutdown.is_cancelled() => (
-                RunStatus::Interrupted,
-                CODE_SHUTTING_DOWN,
-                "the run was interrupted by shutdown",
-            ),
-            GatewayError::Cancelled => (RunStatus::Cancelled, "CANCELLED", "the run was cancelled"),
+        self.fail_with_detail(run_id, error, None).await
+    }
+
+    pub(super) async fn fail_with_detail(
+        &self,
+        run_id: &str,
+        error: GatewayError,
+        extra_detail: Option<&str>,
+    ) -> Settlement {
+        let (status, code, base_message) = match error {
+            GatewayError::Cancelled if self.shutdown.is_cancelled() => {
+                return self
+                    .finish(
+                        run_id,
+                        RunStatus::Interrupted,
+                        CODE_SHUTTING_DOWN,
+                        "the run was interrupted by shutdown",
+                    )
+                    .await;
+            }
+            GatewayError::Cancelled => {
+                return self
+                    .finish(
+                        run_id,
+                        RunStatus::Cancelled,
+                        "CANCELLED",
+                        "the run was cancelled",
+                    )
+                    .await;
+            }
             GatewayError::Timeout => (RunStatus::TimedOut, error.code(), error.message()),
             _ => (RunStatus::Failed, error.code(), error.message()),
         };
-        self.finish(run_id, status, code, message).await
+        let run_meta = self.store.load_run(run_id).await.ok().flatten();
+        let step_num = self
+            .store
+            .run_steps(run_id)
+            .await
+            .ok()
+            .map(|s| s.saturating_add(1));
+        let gw_detail = run_meta
+            .as_ref()
+            .and_then(|r| self.gateway.take_last_error_detail(&r.provider_id));
+        let detail = gw_detail
+            .as_deref()
+            .or(extra_detail)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let ctx_header = match (&run_meta, step_num) {
+            (Some(r), Some(step)) => format!(
+                "{base_message} [agent='{}', provider='{}', model='{}', step={step}]",
+                r.agent_id, r.provider_id, r.model_id
+            ),
+            (Some(r), None) => format!(
+                "{base_message} [agent='{}', provider='{}', model='{}']",
+                r.agent_id, r.provider_id, r.model_id
+            ),
+            _ => base_message.to_owned(),
+        };
+        let message = match detail {
+            Some(d) => format!("{ctx_header}: {d}"),
+            None => ctx_header,
+        };
+        self.finish(run_id, status, code, &message).await
     }
 
     /// Supervisor bỏ cuộc sau nhiều lần `Unsettled` liên tiếp: chuyển run sang `interrupted`

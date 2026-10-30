@@ -868,4 +868,3 @@ async fn live_reconfigure_updates_provider_model_steps_and_prompt() {
 
     o.shutdown().await.unwrap();
 }
-

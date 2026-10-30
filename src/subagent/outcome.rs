@@ -50,6 +50,10 @@ pub(super) fn admit_failure(error: ChildAdmitError) -> Delegation {
 pub(super) fn outcome_of(scope: &ToolScope, result: AgentResult) -> Result<ToolOutcome, ToolError> {
     let sid = &result.session_id;
     let child_code = result.error.as_ref().map_or("", |e| e.code.as_str());
+    let child_msg = result
+        .error
+        .as_ref()
+        .map_or("", |e| e.message.trim());
     let is_blocked = matches!(child_code, "TOOL_OUTCOME_UNKNOWN" | "RECOVERY_BLOCKED");
     let error = |code: &str, why: &str| {
         let guidance = if is_blocked {
@@ -59,16 +63,15 @@ pub(super) fn outcome_of(scope: &ToolScope, result: AgentResult) -> Result<ToolO
         } else {
             "its history is kept and it can be resumed with session_id"
         };
+        let detail_suffix = match (child_code.is_empty(), child_msg.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => format!(" ({child_code})"),
+            (true, false) => format!(" ({child_msg})"),
+            (false, false) => format!(" ({child_code}: {child_msg})"),
+        };
         Err(ToolError {
             code: code.into(),
-            message: format!(
-                "subagent session {sid} {why}{}; {guidance}",
-                if child_code.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({child_code})")
-                }
-            ),
+            message: format!("subagent session {sid} {why}{detail_suffix}; {guidance}"),
         })
     };
     match result.status {

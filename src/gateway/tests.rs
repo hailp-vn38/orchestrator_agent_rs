@@ -408,9 +408,9 @@ async fn client_gateway_delegates_to_custom_executor_with_usage_and_timeout() {
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
-    use crate::config::{CustomModelExecutor, LlmBackend, LlmProviderConfig, ProviderAuth};
     use super::client::ClientGateway;
     use super::types::{LlmGateway, StreamSink};
+    use crate::config::{CustomModelExecutor, LlmBackend, LlmProviderConfig, ProviderAuth};
 
     #[derive(Debug)]
     struct TestCustomExecutor {
@@ -431,7 +431,10 @@ async fn client_gateway_delegates_to_custom_executor_with_usage_and_timeout() {
             sink: StreamSink<'_>,
         ) -> Result<ModelResponse, GatewayError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            sink(StreamEvent::TextDelta(format!("model={}:", request.model_id)));
+            sink(StreamEvent::TextDelta(format!(
+                "model={}:",
+                request.model_id
+            )));
             sink(StreamEvent::TextDelta("ok".to_string()));
             Ok(ModelResponse {
                 text: format!("model={}:ok", request.model_id),

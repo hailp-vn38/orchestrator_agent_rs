@@ -94,3 +94,91 @@ fn http_status(msg: &str) -> Option<u16> {
     let i = msg.find("status: ")? + 8;
     msg[i..].chars().take(3).collect::<String>().parse().ok()
 }
+
+/// Tạo mô tả chẩn đoán an toàn (không chứa raw secret hay endpoint URL) từ `LLMError`.
+pub(crate) fn error_detail(e: &LLMError) -> Option<String> {
+    match e {
+        LLMError::AuthError(_) => Some("upstream rejected authentication credentials".to_owned()),
+        LLMError::InvalidRequest(m) if looks_like_overflow(m) => {
+            Some("upstream reported prompt/context length exceeded".to_owned())
+        }
+        LLMError::InvalidRequest(_) => {
+            Some("upstream rejected request payload or parameters".to_owned())
+        }
+        LLMError::ToolConfigError(_) => Some("invalid tool schema configuration".to_owned()),
+        LLMError::ProviderError(_) => Some("upstream provider error response".to_owned()),
+        LLMError::HttpError(_) => Some("HTTP transport connection or stream read error".to_owned()),
+        LLMError::RetryExceeded { attempts, .. } => {
+            Some(format!("HTTP retries exhausted after {attempts} attempts"))
+        }
+        LLMError::ResponseFormatError {
+            message,
+            raw_response,
+        } => match http_status(message) {
+            Some(status)
+                if looks_like_overflow(message) || looks_like_overflow(raw_response) =>
+            {
+                Some(format!(
+                    "upstream returned HTTP {status} (context length exceeded)"
+                ))
+            }
+            Some(status) => Some(format!("upstream returned HTTP {status}")),
+            None => Some("upstream response format mismatch".to_owned()),
+        },
+        LLMError::JsonError(_) => Some("malformed JSON in upstream response".to_owned()),
+        LLMError::Generic(_) => Some("upstream stream/protocol error".to_owned()),
+    }
+}
+
+/// Làm sạch chuỗi chẩn đoán lỗi: loại bỏ URL (`http://`, `https://`), địa chỉ IP/localhost
+/// và các token nhạy cảm (`sk-...`, `Bearer ...`, JWT `eyJ...`).
+pub fn sanitize_diagnostic_detail(raw: &str) -> String {
+    let mut out = Vec::new();
+    let mut redact_next = false;
+    for token in raw.split_whitespace() {
+        if redact_next {
+            out.push("[REDACTED]".to_owned());
+            redact_next = false;
+            continue;
+        }
+        let clean_tok = token.trim_matches(|c: char| {
+            matches!(
+                c,
+                '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+            )
+        });
+        let lower = clean_tok.to_ascii_lowercase();
+        if lower == "bearer" {
+            out.push(token.to_owned());
+            redact_next = true;
+            continue;
+        }
+        let is_sensitive = lower.contains("://")
+            || lower.contains("127.0.0.1")
+            || lower.contains("localhost")
+            || lower.contains("0.0.0.0")
+            || lower.contains("[::1]")
+            || lower.starts_with("sk-")
+            || lower.starts_with("pk-")
+            || lower.starts_with("rk-")
+            || lower.starts_with("ghp_")
+            || lower.starts_with("gho_")
+            || lower.starts_with("ghu_")
+            || lower.starts_with("xoxb-")
+            || lower.starts_with("xoxp-")
+            || clean_tok.starts_with("eyJ")
+            || clean_tok.starts_with("AIza");
+        if is_sensitive {
+            out.push("[REDACTED]".to_owned());
+        } else {
+            out.push(token.to_owned());
+        }
+    }
+    let joined = out.join(" ");
+    if joined.chars().count() > 300 {
+        let truncated: String = joined.chars().take(300).collect();
+        format!("{truncated}...")
+    } else {
+        joined
+    }
+}

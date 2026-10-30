@@ -288,6 +288,12 @@ pub trait CustomModelExecutor: Send + Sync + std::fmt::Debug {
     /// Định danh routing phi bí mật dùng để tính `routing_fingerprint()` (EMB-16).
     fn routing_fingerprint(&self) -> String;
 
+    /// Chi tiết lỗi đã sanitize của lần gọi `complete()` gần nhất (nếu có), dùng để bổ sung
+    /// thông tin chẩn đoán vào `agent_runs.error_message` mà không lộ secret hay endpoint.
+    fn take_last_error_detail(&self) -> Option<String> {
+        None
+    }
+
     async fn complete(
         &self,
         request: &ModelRequest,
@@ -322,7 +328,10 @@ impl LlmProviderConfig {
             ));
         }
         let is_custom = matches!(self.auth, ProviderAuth::CustomExecutor(_));
-        match (&self.endpoint, self.backend.endpoint_required() && !is_custom) {
+        match (
+            &self.endpoint,
+            self.backend.endpoint_required() && !is_custom,
+        ) {
             (None, true) => {
                 return Err(OrchestratorError::config(
                     ConfigReason::EndpointRequired,

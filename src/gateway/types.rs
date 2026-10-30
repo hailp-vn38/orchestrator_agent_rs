@@ -218,4 +218,9 @@ pub trait LlmGateway: Send + Sync {
         cancel: &CancellationToken,
         sink: StreamSink<'_>,
     ) -> Result<ModelResponse, GatewayError>;
+
+    /// Lấy chi tiết lỗi đã sanitize của lần gọi `complete()` gần nhất cho `provider_id` (nếu có).
+    fn take_last_error_detail(&self, _provider_id: &str) -> Option<String> {
+        None
+    }
 }

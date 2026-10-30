@@ -4,7 +4,7 @@ use futures::{Stream, StreamExt};
 use llm::chat::StreamChunk;
 use llm::error::LLMError;
 
-use super::error::{map_error, GatewayError};
+use super::error::{error_detail, map_error, GatewayError};
 use super::types::{ModelResponse, ModelToolCall, StreamEvent, StreamSink};
 
 pub(crate) type RawStream = Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>;
@@ -171,17 +171,38 @@ fn partial_tag_suffix(text: &str, tag: &str) -> usize {
 /// (không có cả text lẫn tool call, thường do thinking ngốn hết `max_output_tokens`) là lỗi protocol.
 /// Tool call chỉ được trả khi **toàn** response kết thúc thành công: lỗi/hủy/timeout sau
 /// `ToolUseComplete` vẫn loại bỏ mọi call đã nhận (không có gì để dispatch).
+#[allow(dead_code)]
 pub(crate) async fn collect(
-    mut raw: RawStream,
+    raw: RawStream,
     sink: StreamSink<'_>,
 ) -> Result<ModelResponse, GatewayError> {
+    collect_with_detail(raw, sink).await.map_err(|(e, _)| e)
+}
+
+pub(crate) async fn collect_with_detail(
+    mut raw: RawStream,
+    sink: StreamSink<'_>,
+) -> Result<ModelResponse, (GatewayError, String)> {
     let mut text = String::new();
     let mut tool_calls = Vec::new();
     let mut think_filter = ThinkStreamFilter::new();
     loop {
         match raw.next().await {
-            None => return Err(GatewayError::Protocol),
-            Some(Err(e)) => return Err(map_error(&e)),
+            None => {
+                return Err((
+                    GatewayError::Protocol,
+                    format!(
+                        "SSE stream ended prematurely before Done chunk (received {} chars, {} tool calls)",
+                        text.len(),
+                        tool_calls.len()
+                    ),
+                ))
+            }
+            Some(Err(e)) => {
+                let detail =
+                    error_detail(&e).unwrap_or_else(|| "SSE stream chunk error".to_owned());
+                return Err((map_error(&e), detail));
+            }
             Some(Ok(chunk)) => match chunk {
                 StreamChunk::Text(t) => {
                     if !t.is_empty() {
@@ -198,7 +219,15 @@ pub(crate) async fn collect(
                     let arguments = if raw_args.is_empty() {
                         serde_json::json!({})
                     } else {
-                        serde_json::from_str(raw_args).map_err(|_| GatewayError::Protocol)?
+                        serde_json::from_str(raw_args).map_err(|_| {
+                            (
+                                GatewayError::Protocol,
+                                format!(
+                                    "tool '{}' returned malformed JSON arguments",
+                                    tool_call.function.name
+                                ),
+                            )
+                        })?
                     };
                     sink(StreamEvent::ToolCallReady {
                         id: tool_call.id.clone(),
@@ -217,7 +246,17 @@ pub(crate) async fn collect(
                     }
                     let clean_text = strip_thinking_blocks(&text);
                     if clean_text.trim().is_empty() && tool_calls.is_empty() {
-                        return Err(GatewayError::Protocol);
+                        let detail = if !text.trim().is_empty() {
+                            format!(
+                                "model output contained only <think> reasoning ({} chars, stop_reason='{stop_reason}') with no final text or tool calls",
+                                text.len()
+                            )
+                        } else {
+                            format!(
+                                "model finished with empty text and no tool calls (stop_reason='{stop_reason}')"
+                            )
+                        };
+                        return Err((GatewayError::Protocol, detail));
                     }
                     return Ok(ModelResponse {
                         text: clean_text,

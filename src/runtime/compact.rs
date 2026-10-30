@@ -6,7 +6,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::compaction::{plan, SUMMARY_SYSTEM};
 use crate::feed::event;
-use crate::gateway::{GatewayError, ModelMessage, ModelParams, ModelRequest, ModelRole, StreamEvent};
+use crate::gateway::{
+    GatewayError, ModelMessage, ModelParams, ModelRequest, ModelRole, StreamEvent,
+};
 use crate::store::{NewCheckpoint, RunRecord};
 
 use super::AgentRuntime;

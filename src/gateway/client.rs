@@ -10,9 +10,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{LlmBackend, LlmProviderConfig, ProviderAuth};
 
-use super::collect::{collect, strip_thinking_blocks, RawStream, ThinkStreamFilter};
+use super::collect::{collect_with_detail, strip_thinking_blocks, RawStream, ThinkStreamFilter};
 use super::convert::to_chat_messages;
-use super::error::{map_error, GatewayError};
+use super::error::{error_detail, map_error, sanitize_diagnostic_detail, GatewayError};
 use super::types::{
     LlmGateway, ModelRequest, ModelResponse, ModelUsage, ReasoningEffort, StreamEvent, StreamSink,
 };
@@ -26,6 +26,7 @@ const MAX_OUTPUT_TOKENS: u32 = 16_384;
 pub struct ClientGateway {
     providers: RwLock<HashMap<String, LlmProviderConfig>>,
     clients: Mutex<HashMap<String, Arc<dyn LLMProvider>>>,
+    last_errors: Mutex<HashMap<String, String>>,
 }
 
 impl ClientGateway {
@@ -38,7 +39,25 @@ impl ClientGateway {
                     .collect(),
             ),
             clients: Mutex::new(HashMap::new()),
+            last_errors: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn record_error(&self, provider_id: &str, detail: impl Into<String>) {
+        let sanitized = sanitize_diagnostic_detail(&detail.into());
+        if !sanitized.is_empty() {
+            self.last_errors
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(provider_id.trim().to_owned(), sanitized);
+        }
+    }
+
+    fn clear_error(&self, provider_id: &str) {
+        self.last_errors
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(provider_id.trim());
     }
 
     pub fn replace_providers(&self, providers: &[LlmProviderConfig]) {
@@ -161,20 +180,36 @@ fn build_client(
 
 #[async_trait]
 impl LlmGateway for ClientGateway {
+    fn take_last_error_detail(&self, provider_id: &str) -> Option<String> {
+        self.last_errors
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(provider_id.trim())
+    }
+
     async fn complete(
         &self,
         request: &ModelRequest,
         cancel: &CancellationToken,
         sink: StreamSink<'_>,
     ) -> Result<ModelResponse, GatewayError> {
+        let provider_key = request.provider_id.trim();
+        self.clear_error(provider_key);
         let cfg = self
             .providers
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .get(request.provider_id.trim())
+            .get(provider_key)
             .cloned()
-            .ok_or(GatewayError::NotConfigured)?;
+            .ok_or_else(|| {
+                self.record_error(
+                    provider_key,
+                    format!("provider '{provider_key}' is not registered in LlmConfig"),
+                );
+                GatewayError::NotConfigured
+            })?;
         if request.model_id.trim().is_empty() {
+            self.record_error(provider_key, "model_id is empty");
             return Err(GatewayError::NotConfigured);
         }
         // Deadline bao trùm cả bước tạo stream lẫn đọc stream: đây là timeout của *một*
@@ -185,8 +220,7 @@ impl LlmGateway for ClientGateway {
                 let filtered_sink = |ev: StreamEvent| match ev {
                     StreamEvent::TextDelta(t) => {
                         if !t.is_empty() {
-                            let visible =
-                                filter.lock().unwrap_or_else(|p| p.into_inner()).push(&t);
+                            let visible = filter.lock().unwrap_or_else(|p| p.into_inner()).push(&t);
                             if !visible.is_empty() {
                                 sink(StreamEvent::TextDelta(visible));
                             }
@@ -194,13 +228,37 @@ impl LlmGateway for ClientGateway {
                     }
                     other => sink(other),
                 };
-                let mut resp = executor.complete(request, cancel, &filtered_sink).await?;
+                let mut resp = match executor.complete(request, cancel, &filtered_sink).await {
+                    Ok(r) => r,
+                    Err(err) => {
+                        if let Some(detail) = executor.take_last_error_detail() {
+                            self.record_error(provider_key, detail);
+                        }
+                        return Err(err);
+                    }
+                };
                 let tail = filter.lock().unwrap_or_else(|p| p.into_inner()).flush();
                 if !tail.is_empty() {
                     sink(StreamEvent::TextDelta(tail));
                 }
+                let raw_len = resp.text.len();
                 resp.text = strip_thinking_blocks(&resp.text);
                 if resp.text.trim().is_empty() && resp.tool_calls.is_empty() {
+                    if let Some(detail) = executor.take_last_error_detail() {
+                        self.record_error(provider_key, detail);
+                    } else if raw_len > 0 {
+                        self.record_error(
+                            provider_key,
+                            format!(
+                                "model output contained only <think> reasoning ({raw_len} chars) with no final text or tool calls"
+                            ),
+                        );
+                    } else {
+                        self.record_error(
+                            provider_key,
+                            "model finished with empty text and no tool calls",
+                        );
+                    }
                     return Err(GatewayError::Protocol);
                 }
                 return Ok(resp);
@@ -224,13 +282,30 @@ impl LlmGateway for ClientGateway {
             let raw: RawStream = client
                 .chat_stream_with_tools(&messages, (!tools.is_empty()).then_some(&tools[..]))
                 .await
-                .map_err(|e| map_error(&e))?;
-            collect(raw, sink).await
+                .map_err(|e| {
+                    if let Some(detail) = error_detail(&e) {
+                        self.record_error(provider_key, detail);
+                    }
+                    map_error(&e)
+                })?;
+            collect_with_detail(raw, sink).await.map_err(|(err, detail)| {
+                self.record_error(provider_key, detail);
+                err
+            })
         };
         let mut response = tokio::select! {
             () = cancel.cancelled() => return Err(GatewayError::Cancelled),
             r = tokio::time::timeout(cfg.request_timeout, work) => {
-                r.unwrap_or(Err(GatewayError::Timeout))?
+                match r {
+                    Ok(inner) => inner?,
+                    Err(_) => {
+                        self.record_error(
+                            provider_key,
+                            format!("request timed out after {}ms", cfg.request_timeout.as_millis()),
+                        );
+                        return Err(GatewayError::Timeout);
+                    }
+                }
             }
         };
         response.usage = Some(ModelUsage::or_estimated(response.usage, request, &response));
