@@ -74,7 +74,7 @@ fn gateway(t: &Target, key: &str) -> ClientGateway {
         backend: LlmBackend::OpenAiCompatible,
         endpoint: Some(t.base.clone()),
         auth: ProviderAuth::ApiKey(SecretString::new(key.to_string())),
-        request_timeout: Duration::from_secs(60),
+        limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(60)),
     }])
 }
 

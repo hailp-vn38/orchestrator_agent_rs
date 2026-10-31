@@ -171,7 +171,7 @@ async fn live_root_delegates_to_child_with_skill_and_tool_then_follows_up_same_c
         backend: LlmBackend::OpenAiCompatible,
         endpoint: Some(endpoint.to_owned()),
         auth: ProviderAuth::ApiKey(SecretString::new(key)),
-        request_timeout: Duration::from_secs(90),
+        limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(90)),
     };
     let store = dir.path().join("store");
     let mut cfg = OrchestratorConfig::new(

@@ -16,6 +16,7 @@ mod runtime;
 #[cfg(test)]
 mod tests;
 mod types;
+mod watchdog;
 
 pub use client::ClientGateway;
 pub use collect::strip_thinking_blocks;

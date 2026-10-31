@@ -670,7 +670,7 @@ async fn main() -> Result<()> {
                 backend: LlmBackend::OpenAiCompatible,
                 endpoint: Some(endpoint),
                 auth: ProviderAuth::ApiKey(SecretString::new(key)),
-                request_timeout: Duration::from_secs(120),
+                limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(120)),
             }],
         },
         vec![

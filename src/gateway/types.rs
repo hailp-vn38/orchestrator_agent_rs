@@ -203,6 +203,8 @@ pub enum StreamEvent {
         id: String,
         name: String,
     },
+    /// Tín hiệu hoạt động của stream (reasoning, ping, tool task trên provider, hoặc chunk thô).
+    Activity,
 }
 
 /// Nơi nhận preview; gọi đồng bộ theo đúng thứ tự provider phát.

@@ -127,7 +127,7 @@ async fn live_tool_round_trip_and_skill_continuation() {
                 backend: LlmBackend::OpenAiCompatible,
                 endpoint: Some(base),
                 auth: ProviderAuth::ApiKey(SecretString::new(key)),
-                request_timeout: Duration::from_secs(90),
+                limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(90)),
             }],
         },
         vec![AgentDefinition::new("root", "g0-openai", model)

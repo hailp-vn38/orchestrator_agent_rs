@@ -40,7 +40,11 @@ impl AgentRuntime {
                     )
                     .await;
             }
-            GatewayError::Timeout => (RunStatus::TimedOut, error.code(), error.message()),
+            GatewayError::Timeout
+            | GatewayError::Stalled
+            | GatewayError::RequestLimitExceeded => {
+                (RunStatus::TimedOut, error.code(), error.message())
+            }
             _ => (RunStatus::Failed, error.code(), error.message()),
         };
         let run_meta = self.store.load_run(run_id).await.ok().flatten();

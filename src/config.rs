@@ -238,6 +238,24 @@ pub struct LlmConfig {
     pub providers: Vec<LlmProviderConfig>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestLimits {
+    pub first_byte: Duration,
+    pub idle: Duration,
+    pub max_total: Duration,
+}
+
+impl RequestLimits {
+    /// Cả ba giới hạn bằng nhau: giữ hành vi deadline cũ cho test và host chưa chuyển đổi.
+    pub const fn uniform(limit: Duration) -> Self {
+        Self {
+            first_byte: limit,
+            idle: limit,
+            max_total: limit,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LlmProviderConfig {
     /// Alias cấu hình cục bộ, duy nhất; không phải tên backend.
@@ -246,8 +264,8 @@ pub struct LlmProviderConfig {
     /// Bắt buộc với `Ollama` và `OpenAiCompatible`; tùy chọn với backend chuẩn.
     pub endpoint: Option<String>,
     pub auth: ProviderAuth,
-    /// Timeout cho *một* request LLM, không phải deadline cả session.
-    pub request_timeout: Duration,
+    /// Giới hạn thời gian cho *một* request LLM (`first_byte`, `idle`, `max_total`).
+    pub limits: RequestLimits,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -321,10 +339,16 @@ impl LlmProviderConfig {
                 "provider id must not be empty",
             ));
         }
-        if self.request_timeout.is_zero() {
+        if self.limits.first_byte.is_zero()
+            || self.limits.idle.is_zero()
+            || self.limits.max_total.is_zero()
+            || self.limits.idle > self.limits.max_total
+        {
             return Err(OrchestratorError::config(
                 ConfigReason::InvalidTimeout,
-                format!("provider '{id}': request_timeout must be > 0"),
+                format!(
+                    "provider '{id}': request limits must be > 0 and idle <= max_total"
+                ),
             ));
         }
         let is_custom = matches!(self.auth, ProviderAuth::CustomExecutor(_));

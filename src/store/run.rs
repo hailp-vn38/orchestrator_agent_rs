@@ -104,6 +104,33 @@ impl SessionStore {
         Ok(())
     }
 
+    pub(crate) async fn record_llm_attempt(
+        &self,
+        id: &str,
+        run_id: &str,
+        step: u32,
+        first_byte_ms: Option<u64>,
+        last_activity_ms: Option<u64>,
+        chars_received: u64,
+        outcome: &str,
+    ) -> Result<(), OrchestratorError> {
+        sqlx::query(
+            "INSERT INTO llm_attempts(id, run_id, step, first_byte_ms, last_activity_ms, \
+             chars_received, outcome) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(id)
+        .bind(run_id)
+        .bind(i64::from(step))
+        .bind(first_byte_ms.map(|v| v.min(i64::MAX as u64) as i64))
+        .bind(last_activity_ms.map(|v| v.min(i64::MAX as u64) as i64))
+        .bind(chars_received.min(i64::MAX as u64) as i64)
+        .bind(outcome)
+        .execute(&self.pool)
+        .await
+        .map_err(db("record llm attempt"))?;
+        Ok(())
+    }
+
     /// Tổng `(steps, input_tokens, output_tokens)` đã ghi nhận của `run_id`.
     pub(crate) async fn run_usage_summary(
         &self,

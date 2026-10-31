@@ -62,6 +62,14 @@ impl SessionStore {
         .iter()
         .map(|r| r.try_get("storage_key").map_err(db("read storage key")))
         .collect::<Result<Vec<String>, _>>()?;
+        sqlx::query(&format!(
+            "DELETE FROM llm_attempts WHERE run_id IN \
+             (SELECT id FROM agent_runs WHERE session_id IN {FAMILY})"
+        ))
+        .bind(root_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db("delete llm attempts"))?;
         for table in ["tool_invocations", "messages", "agent_runs"] {
             sqlx::query(&format!("DELETE FROM {table} WHERE session_id IN {FAMILY}"))
                 .bind(root_id)

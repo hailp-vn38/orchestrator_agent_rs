@@ -64,7 +64,7 @@ fn provider(id: &str, backend: LlmBackend, endpoint: Option<&str>) -> LlmProvide
         backend,
         endpoint: endpoint.map(Into::into),
         auth: ProviderAuth::ApiKey(SecretString::new(KEY)),
-        request_timeout: Duration::from_secs(30),
+        limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(30)),
     }
 }
 
@@ -149,7 +149,7 @@ async fn fingerprint_ignores_secret_and_timeout_but_tracks_endpoint() {
     let a = provider("a", LlmBackend::OpenAiCompatible, Some("http://h:1/v1"));
     let mut b = a.clone();
     b.auth = ProviderAuth::ApiKey(SecretString::new("rotated"));
-    b.request_timeout = Duration::from_secs(999);
+    b.limits = orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(999));
     assert_eq!(a.routing_fingerprint(), b.routing_fingerprint());
     let c = provider("a", LlmBackend::OpenAiCompatible, Some("http://h:2/v1"));
     assert_ne!(a.routing_fingerprint(), c.routing_fingerprint());
@@ -178,7 +178,10 @@ async fn rejects_invalid_llm_config_with_codes() {
             ConfigReason::EmptyProviderId,
         ),
         (
-            Box::new(|c| c.llm.providers[0].request_timeout = Duration::ZERO),
+            Box::new(|c| {
+                c.llm.providers[0].limits =
+                    orchestrator_agent_rs::RequestLimits::uniform(Duration::ZERO)
+            }),
             ConfigReason::InvalidTimeout,
         ),
         (

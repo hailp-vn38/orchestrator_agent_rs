@@ -225,7 +225,7 @@ fn build_config(dir: &std::path::Path, base: &str, key: &str, model: &str) -> Or
                 backend: LlmBackend::OpenAiCompatible,
                 endpoint: Some(base.to_owned()),
                 auth: ProviderAuth::ApiKey(SecretString::new(key)),
-                request_timeout: Duration::from_secs(90),
+                limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(90)),
             }],
         },
         vec![

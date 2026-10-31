@@ -16,6 +16,7 @@ use super::error::{error_detail, map_error, sanitize_diagnostic_detail, GatewayE
 use super::types::{
     LlmGateway, ModelRequest, ModelResponse, ModelUsage, ReasoningEffort, StreamEvent, StreamSink,
 };
+use super::watchdog::{Expiry, Watchdog};
 
 /// Trần output token mỗi request khi agent không đặt `ModelParams::max_output_tokens`.
 /// Đặt ở mức 16_384 để các model có thinking/reasoning không bị cạn ngân sách token trước khi
@@ -124,7 +125,7 @@ fn same_provider_config(a: &LlmProviderConfig, b: &LlmProviderConfig) -> bool {
     };
     a.backend == b.backend
         && a.endpoint == b.endpoint
-        && a.request_timeout == b.request_timeout
+        && a.limits == b.limits
         && same_auth
 }
 
@@ -147,7 +148,7 @@ fn build_client(
                 .max_output_tokens
                 .unwrap_or(MAX_OUTPUT_TOKENS),
         )
-        .timeout_seconds(cfg.request_timeout.as_secs().max(1))
+        .timeout_seconds(cfg.limits.max_total.as_secs().max(1))
         .system(request.system.clone());
     if let Some(t) = request.params.temperature {
         builder = builder.temperature(t);
@@ -212,21 +213,28 @@ impl LlmGateway for ClientGateway {
             self.record_error(provider_key, "model_id is empty");
             return Err(GatewayError::NotConfigured);
         }
-        // Deadline bao trùm cả bước tạo stream lẫn đọc stream: đây là timeout của *một*
-        // request LLM, không phải của cả run.
+        // Watchdog bao trùm cả bước tạo stream lẫn đọc stream: theo dõi first_byte, idle và max_total.
+        let watchdog = Watchdog::new(cfg.limits);
         let work = async {
             if let ProviderAuth::CustomExecutor(ref executor) = cfg.auth {
                 let filter = Mutex::new(ThinkStreamFilter::new());
-                let filtered_sink = |ev: StreamEvent| match ev {
-                    StreamEvent::TextDelta(t) => {
-                        if !t.is_empty() {
-                            let visible = filter.lock().unwrap_or_else(|p| p.into_inner()).push(&t);
-                            if !visible.is_empty() {
-                                sink(StreamEvent::TextDelta(visible));
+                let filtered_sink = |ev: StreamEvent| {
+                    watchdog.touch();
+                    match ev {
+                        StreamEvent::TextDelta(t) => {
+                            if !t.is_empty() {
+                                let visible = filter.lock().unwrap_or_else(|p| p.into_inner()).push(&t);
+                                if !visible.is_empty() {
+                                    sink(StreamEvent::TextDelta(visible));
+                                } else {
+                                    sink(StreamEvent::Activity);
+                                }
+                            } else {
+                                sink(StreamEvent::Activity);
                             }
                         }
+                        other => sink(other),
                     }
-                    other => sink(other),
                 };
                 let mut resp = match executor.complete(request, cancel, &filtered_sink).await {
                     Ok(r) => r,
@@ -288,25 +296,43 @@ impl LlmGateway for ClientGateway {
                     }
                     map_error(&e)
                 })?;
-            collect_with_detail(raw, sink).await.map_err(|(err, detail)| {
+            let watched_sink = |ev: StreamEvent| {
+                watchdog.touch();
+                sink(ev);
+            };
+            collect_with_detail(raw, &watched_sink).await.map_err(|(err, detail)| {
                 self.record_error(provider_key, detail);
                 err
             })
         };
         let mut response = tokio::select! {
             () = cancel.cancelled() => return Err(GatewayError::Cancelled),
-            r = tokio::time::timeout(cfg.request_timeout, work) => {
-                match r {
-                    Ok(inner) => inner?,
-                    Err(_) => {
+            expiry = watchdog.expired() => {
+                match expiry {
+                    Expiry::Stalled => {
                         self.record_error(
                             provider_key,
-                            format!("request timed out after {}ms", cfg.request_timeout.as_millis()),
+                            format!(
+                                "request stalled without activity (first_byte={}ms, idle={}ms)",
+                                cfg.limits.first_byte.as_millis(),
+                                cfg.limits.idle.as_millis()
+                            ),
                         );
-                        return Err(GatewayError::Timeout);
+                        return Err(GatewayError::Stalled);
+                    }
+                    Expiry::LimitExceeded => {
+                        self.record_error(
+                            provider_key,
+                            format!(
+                                "request exceeded max_total limit of {}ms",
+                                cfg.limits.max_total.as_millis()
+                            ),
+                        );
+                        return Err(GatewayError::RequestLimitExceeded);
                     }
                 }
             }
+            r = work => r?,
         };
         response.usage = Some(ModelUsage::or_estimated(response.usage, request, &response));
         Ok(response)

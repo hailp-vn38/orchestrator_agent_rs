@@ -155,7 +155,7 @@ impl Env {
             backend: LlmBackend::OpenAi,
             endpoint: None,
             auth: ProviderAuth::ApiKey(SecretString::new("sk-test-not-real")),
-            request_timeout: Duration::from_secs(30),
+            limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(30)),
         };
         let mut cfg = OrchestratorConfig::new(
             LlmConfig {

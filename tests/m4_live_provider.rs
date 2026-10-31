@@ -129,7 +129,7 @@ async fn live_streaming_tool_continuation_and_compaction_summary() {
                 backend: LlmBackend::OpenAiCompatible,
                 endpoint: Some(base),
                 auth: ProviderAuth::ApiKey(SecretString::new(key)),
-                request_timeout: Duration::from_secs(90),
+                limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(90)),
             }],
         },
         vec![AgentDefinition::new("root", "g0-openai", model)

@@ -567,7 +567,7 @@ async fn live_playlist_to_obsidian_notes() {
                 backend: LlmBackend::OpenAiCompatible,
                 endpoint: Some(base),
                 auth: ProviderAuth::ApiKey(SecretString::new(key)),
-                request_timeout: Duration::from_secs(180),
+                limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(180)),
             }],
         },
         vec![

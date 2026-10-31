@@ -205,8 +205,9 @@ async fn twenty_text_fragments_stream_in_order_and_assemble() {
     let expected: Vec<String> = (0..20).map(|i| format!("[{i}]")).collect();
     let deltas: Vec<String> = events
         .iter()
-        .map(|e| match e {
-            StreamEvent::TextDelta(t) => t.clone(),
+        .filter_map(|e| match e {
+            StreamEvent::TextDelta(t) => Some(t.clone()),
+            StreamEvent::Activity => None,
             other => panic!("unexpected {other:?}"),
         })
         .collect();
@@ -228,10 +229,13 @@ async fn tool_call_ready_then_error_is_a_preview_only() {
     assert_eq!(r, Err(GatewayError::Transport));
     assert_eq!(
         events,
-        vec![StreamEvent::ToolCallReady {
-            id: "c1".into(),
-            name: "t".into()
-        }]
+        vec![
+            StreamEvent::Activity,
+            StreamEvent::ToolCallReady {
+                id: "c1".into(),
+                name: "t".into()
+            }
+        ]
     );
 }
 
@@ -325,8 +329,9 @@ async fn collect_strips_thinking_blocks_from_stream_and_final_text() {
     assert_eq!(resp.text, "Final answer.");
     let streamed: String = events
         .into_iter()
-        .map(|e| match e {
-            StreamEvent::TextDelta(t) => t,
+        .filter_map(|e| match e {
+            StreamEvent::TextDelta(t) => Some(t),
+            StreamEvent::Activity => None,
             other => panic!("unexpected {other:?}"),
         })
         .collect();
@@ -410,7 +415,9 @@ async fn client_gateway_delegates_to_custom_executor_with_usage_and_timeout() {
 
     use super::client::ClientGateway;
     use super::types::{LlmGateway, StreamSink};
-    use crate::config::{CustomModelExecutor, LlmBackend, LlmProviderConfig, ProviderAuth};
+    use crate::config::{
+        CustomModelExecutor, LlmBackend, LlmProviderConfig, ProviderAuth, RequestLimits,
+    };
 
     #[derive(Debug)]
     struct TestCustomExecutor {
@@ -455,7 +462,7 @@ async fn client_gateway_delegates_to_custom_executor_with_usage_and_timeout() {
         backend: LlmBackend::Anthropic,
         endpoint: Some("https://api.anthropic.com/v1".to_string()),
         auth: ProviderAuth::CustomExecutor(exec),
-        request_timeout: Duration::from_secs(5),
+        limits: RequestLimits::uniform(Duration::from_secs(5)),
     };
     assert!(cfg.validate().is_ok());
     let fp1 = cfg.routing_fingerprint();
@@ -488,4 +495,238 @@ async fn client_gateway_delegates_to_custom_executor_with_usage_and_timeout() {
             StreamEvent::TextDelta("ok".to_string()),
         ]
     );
+}
+
+mod watchdog_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::time::Instant;
+    use tokio_util::sync::CancellationToken;
+
+    use super::super::client::ClientGateway;
+    use super::super::error::GatewayError;
+    use super::super::types::{
+        LlmGateway, ModelMessage, ModelParams, ModelRequest, ModelResponse, ModelRole, StreamEvent,
+        StreamSink,
+    };
+    use crate::config::{
+        CustomModelExecutor, LlmBackend, LlmProviderConfig, ProviderAuth, RequestLimits,
+    };
+
+    #[derive(Debug, Clone)]
+    enum Scenario {
+        /// Phát `count` đoạn cách nhau `interval`, rồi hoàn tất.
+        Steady { count: usize, interval: Duration },
+        /// Phát 1 đoạn tại `first_at`, rồi treo lâu hơn `idle`.
+        StallAfterFirst { first_at: Duration },
+        /// Không phát bất kỳ tín hiệu nào.
+        NeverFirstByte,
+        /// Phát `Activity` liên tục mỗi `interval` vượt quá `max_total`.
+        EndlessActivity { interval: Duration },
+        /// Phát `<think>` mỗi `interval` trong `count` lần, rồi phát câu trả lời cuối.
+        LongThinkBlock { count: usize, interval: Duration },
+    }
+
+    #[derive(Debug)]
+    struct ScenarioExecutor(Scenario);
+
+    #[async_trait::async_trait]
+    impl CustomModelExecutor for ScenarioExecutor {
+        fn routing_fingerprint(&self) -> String {
+            "test:watchdog".into()
+        }
+
+        async fn complete(
+            &self,
+            _request: &ModelRequest,
+            _cancel: &CancellationToken,
+            sink: StreamSink<'_>,
+        ) -> Result<ModelResponse, GatewayError> {
+            match self.0.clone() {
+                Scenario::Steady { count, interval } => {
+                    let mut text = String::new();
+                    for i in 0..count {
+                        tokio::time::sleep(interval).await;
+                        let part = format!("chunk-{i} ");
+                        sink(StreamEvent::TextDelta(part.clone()));
+                        text.push_str(&part);
+                    }
+                    Ok(ModelResponse {
+                        text,
+                        finish_reason: "stop".into(),
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    })
+                }
+                Scenario::StallAfterFirst { first_at } => {
+                    tokio::time::sleep(first_at).await;
+                    sink(StreamEvent::TextDelta("start".into()));
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    unreachable!()
+                }
+                Scenario::NeverFirstByte => {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    unreachable!()
+                }
+                Scenario::EndlessActivity { interval } => loop {
+                    tokio::time::sleep(interval).await;
+                    sink(StreamEvent::Activity);
+                },
+                Scenario::LongThinkBlock { count, interval } => {
+                    let mut full = String::from("<think>");
+                    sink(StreamEvent::TextDelta("<think>".into()));
+                    for i in 0..count {
+                        tokio::time::sleep(interval).await;
+                        let step = format!("reasoning step {i}... ");
+                        sink(StreamEvent::TextDelta(step.clone()));
+                        full.push_str(&step);
+                    }
+                    let tail = "</think>Final answer after thinking.";
+                    sink(StreamEvent::TextDelta(tail.into()));
+                    full.push_str(tail);
+                    Ok(ModelResponse {
+                        text: full,
+                        finish_reason: "stop".into(),
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    })
+                }
+            }
+        }
+    }
+
+    fn build_gw(limits: RequestLimits, scenario: Scenario) -> (ClientGateway, ModelRequest) {
+        let cfg = LlmProviderConfig {
+            id: "wd".into(),
+            backend: LlmBackend::OpenAi,
+            endpoint: None,
+            auth: ProviderAuth::CustomExecutor(Arc::new(ScenarioExecutor(scenario))),
+            limits,
+        };
+        let gw = ClientGateway::new(&[cfg]);
+        let req = ModelRequest {
+            provider_id: "wd".into(),
+            model_id: "m".into(),
+            system: "sys".into(),
+            messages: vec![ModelMessage::text(ModelRole::User, "hi")],
+            tools: Vec::new(),
+            params: ModelParams::default(),
+        };
+        (gw, req)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_steady_stream_five_minutes_completes() {
+        let limits = RequestLimits {
+            first_byte: Duration::from_secs(60),
+            idle: Duration::from_secs(60),
+            max_total: Duration::from_secs(600),
+        };
+        let (gw, req) = build_gw(
+            limits,
+            Scenario::Steady {
+                count: 10,
+                interval: Duration::from_secs(30),
+            },
+        );
+        let start = Instant::now();
+        let resp = gw
+            .complete(&req, &CancellationToken::new(), &|_| {})
+            .await
+            .expect("5 minute steady stream should complete");
+        assert!(resp.text.contains("chunk-9"));
+        assert_eq!(start.elapsed(), Duration::from_secs(300));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_stalls_at_idle_limit() {
+        let limits = RequestLimits {
+            first_byte: Duration::from_secs(60),
+            idle: Duration::from_secs(45),
+            max_total: Duration::from_secs(600),
+        };
+        let (gw, req) = build_gw(
+            limits,
+            Scenario::StallAfterFirst {
+                first_at: Duration::from_secs(10),
+            },
+        );
+        let start = Instant::now();
+        let err = gw
+            .complete(&req, &CancellationToken::new(), &|_| {})
+            .await
+            .expect_err("stream stalling after first byte must fail");
+        assert_eq!(err, GatewayError::Stalled);
+        assert_eq!(start.elapsed(), Duration::from_secs(55));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_stalls_at_first_byte_limit() {
+        let limits = RequestLimits {
+            first_byte: Duration::from_secs(40),
+            idle: Duration::from_secs(90),
+            max_total: Duration::from_secs(600),
+        };
+        let (gw, req) = build_gw(limits, Scenario::NeverFirstByte);
+        let start = Instant::now();
+        let err = gw
+            .complete(&req, &CancellationToken::new(), &|_| {})
+            .await
+            .expect_err("silent stream must fail at first_byte");
+        assert_eq!(err, GatewayError::Stalled);
+        assert_eq!(start.elapsed(), Duration::from_secs(40));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_enforces_max_total_despite_activity() {
+        let limits = RequestLimits {
+            first_byte: Duration::from_secs(60),
+            idle: Duration::from_secs(60),
+            max_total: Duration::from_secs(180),
+        };
+        let (gw, req) = build_gw(
+            limits,
+            Scenario::EndlessActivity {
+                interval: Duration::from_secs(20),
+            },
+        );
+        let start = Instant::now();
+        let err = gw
+            .complete(&req, &CancellationToken::new(), &|_| {})
+            .await
+            .expect_err("endless activity must still hit max_total");
+        assert_eq!(err, GatewayError::RequestLimitExceeded);
+        assert_eq!(start.elapsed(), Duration::from_secs(180));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_think_block() {
+        let limits = RequestLimits {
+            first_byte: Duration::from_secs(60),
+            idle: Duration::from_secs(60),
+            max_total: Duration::from_secs(600),
+        };
+        let (gw, req) = build_gw(
+            limits,
+            Scenario::LongThinkBlock {
+                count: 6,
+                interval: Duration::from_secs(30),
+            },
+        );
+        let seen = Mutex::new(Vec::new());
+        let start = Instant::now();
+        let resp = gw
+            .complete(&req, &CancellationToken::new(), &|ev| {
+                seen.lock().unwrap().push(ev);
+            })
+            .await
+            .expect("3 minutes of <think> must not stall");
+        assert_eq!(resp.text, "Final answer after thinking.");
+        assert_eq!(start.elapsed(), Duration::from_secs(180));
+        let events = seen.into_inner().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::Activity)),
+            "thinking chunks must emit Activity to downstream sink"
+        );
+    }
 }

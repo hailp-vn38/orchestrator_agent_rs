@@ -160,7 +160,7 @@ async fn rejects_invalid_runtime_configuration() {
             backend: LlmBackend::OpenAi,
             endpoint: None,
             auth: ProviderAuth::ApiKey(SecretString::new("sk-test")),
-            request_timeout: Duration::from_secs(5),
+            limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(5)),
         }],
     };
     assert_eq!(

@@ -150,7 +150,7 @@ impl Env {
                     backend: LlmBackend::OpenAiCompatible,
                     endpoint: Some(endpoint.into()),
                     auth: ProviderAuth::ApiKey(SecretString::new(key)),
-                    request_timeout: Duration::from_secs(30),
+                    limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(30)),
                 }],
             },
             agents,

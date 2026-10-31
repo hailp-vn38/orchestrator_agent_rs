@@ -118,7 +118,7 @@ async fn live_family_shows_deltas_and_progress_then_canonical_terminal() {
         backend: LlmBackend::OpenAiCompatible,
         endpoint: Some(base.clone()),
         auth: ProviderAuth::ApiKey(SecretString::new(key.clone())),
-        request_timeout: Duration::from_secs(90),
+        limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(90)),
     };
     let cfg = OrchestratorConfig::new(
         LlmConfig {
@@ -301,7 +301,7 @@ async fn live_long_tool_arguments_arrive_intact_and_run_only_after_finished() {
                 backend: LlmBackend::OpenAiCompatible,
                 endpoint: Some(base),
                 auth: ProviderAuth::ApiKey(SecretString::new(key)),
-                request_timeout: Duration::from_secs(90),
+                limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(90)),
             }],
         },
         vec![AgentDefinition::new("recorder", "live", model)

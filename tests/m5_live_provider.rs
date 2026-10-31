@@ -76,7 +76,7 @@ fn config(l: &Live, dir: &Path, request_timeout: Duration) -> OrchestratorConfig
                 backend: LlmBackend::OpenAiCompatible,
                 endpoint: Some(l.base.clone()),
                 auth: ProviderAuth::ApiKey(SecretString::new(l.key.clone())),
-                request_timeout,
+                limits: orchestrator_agent_rs::RequestLimits::uniform(request_timeout),
             }],
         },
         vec![AgentDefinition::new("root", "g0-openai", l.model.clone())

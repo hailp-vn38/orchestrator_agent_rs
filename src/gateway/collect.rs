@@ -203,70 +203,73 @@ pub(crate) async fn collect_with_detail(
                     error_detail(&e).unwrap_or_else(|| "SSE stream chunk error".to_owned());
                 return Err((map_error(&e), detail));
             }
-            Some(Ok(chunk)) => match chunk {
-                StreamChunk::Text(t) => {
-                    if !t.is_empty() {
-                        let visible = think_filter.push(&t);
-                        if !visible.is_empty() {
-                            sink(StreamEvent::TextDelta(visible));
+            Some(Ok(chunk)) => {
+                sink(StreamEvent::Activity);
+                match chunk {
+                    StreamChunk::Text(t) => {
+                        if !t.is_empty() {
+                            let visible = think_filter.push(&t);
+                            if !visible.is_empty() {
+                                sink(StreamEvent::TextDelta(visible));
+                            }
                         }
+                        text.push_str(&t);
                     }
-                    text.push_str(&t);
-                }
-                StreamChunk::ToolUseStart { .. } | StreamChunk::ToolUseInputDelta { .. } => {}
-                StreamChunk::ToolUseComplete { tool_call, .. } => {
-                    let raw_args = tool_call.function.arguments.trim();
-                    let arguments = if raw_args.is_empty() {
-                        serde_json::json!({})
-                    } else {
-                        serde_json::from_str(raw_args).map_err(|_| {
-                            (
-                                GatewayError::Protocol,
-                                format!(
-                                    "tool '{}' returned malformed JSON arguments",
-                                    tool_call.function.name
-                                ),
-                            )
-                        })?
-                    };
-                    sink(StreamEvent::ToolCallReady {
-                        id: tool_call.id.clone(),
-                        name: tool_call.function.name.clone(),
-                    });
-                    tool_calls.push(ModelToolCall {
-                        id: tool_call.id,
-                        name: tool_call.function.name,
-                        arguments,
-                    });
-                }
-                StreamChunk::Done { stop_reason } => {
-                    let tail = think_filter.flush();
-                    if !tail.is_empty() {
-                        sink(StreamEvent::TextDelta(tail));
-                    }
-                    let clean_text = strip_thinking_blocks(&text);
-                    if clean_text.trim().is_empty() && tool_calls.is_empty() {
-                        let detail = if !text.trim().is_empty() {
-                            format!(
-                                "model output contained only <think> reasoning ({} chars, stop_reason='{stop_reason}') with no final text or tool calls",
-                                text.len()
-                            )
+                    StreamChunk::ToolUseStart { .. } | StreamChunk::ToolUseInputDelta { .. } => {}
+                    StreamChunk::ToolUseComplete { tool_call, .. } => {
+                        let raw_args = tool_call.function.arguments.trim();
+                        let arguments = if raw_args.is_empty() {
+                            serde_json::json!({})
                         } else {
-                            format!(
-                                "model finished with empty text and no tool calls (stop_reason='{stop_reason}')"
-                            )
+                            serde_json::from_str(raw_args).map_err(|_| {
+                                (
+                                    GatewayError::Protocol,
+                                    format!(
+                                        "tool '{}' returned malformed JSON arguments",
+                                        tool_call.function.name
+                                    ),
+                                )
+                            })?
                         };
-                        return Err((GatewayError::Protocol, detail));
+                        sink(StreamEvent::ToolCallReady {
+                            id: tool_call.id.clone(),
+                            name: tool_call.function.name.clone(),
+                        });
+                        tool_calls.push(ModelToolCall {
+                            id: tool_call.id,
+                            name: tool_call.function.name,
+                            arguments,
+                        });
                     }
-                    return Ok(ModelResponse {
-                        text: clean_text,
-                        finish_reason: stop_reason,
-                        tool_calls,
-                        // `llm` 1.3.8 không phát usage trong stream: thiếu usage không phải lỗi.
-                        usage: None,
-                    });
+                    StreamChunk::Done { stop_reason } => {
+                        let tail = think_filter.flush();
+                        if !tail.is_empty() {
+                            sink(StreamEvent::TextDelta(tail));
+                        }
+                        let clean_text = strip_thinking_blocks(&text);
+                        if clean_text.trim().is_empty() && tool_calls.is_empty() {
+                            let detail = if !text.trim().is_empty() {
+                                format!(
+                                    "model output contained only <think> reasoning ({} chars, stop_reason='{stop_reason}') with no final text or tool calls",
+                                    text.len()
+                                )
+                            } else {
+                                format!(
+                                    "model finished with empty text and no tool calls (stop_reason='{stop_reason}')"
+                                )
+                            };
+                            return Err((GatewayError::Protocol, detail));
+                        }
+                        return Ok(ModelResponse {
+                            text: clean_text,
+                            finish_reason: stop_reason,
+                            tool_calls,
+                            // `llm` 1.3.8 không phát usage trong stream: thiếu usage không phải lỗi.
+                            usage: None,
+                        });
+                    }
                 }
-            },
+            }
         }
     }
 }

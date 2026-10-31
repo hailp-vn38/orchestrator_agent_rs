@@ -119,6 +119,10 @@ impl AgentRuntime {
             event::STEP_STARTED,
             json!({ "step_id": step_id }),
         );
+        let started = tokio::time::Instant::now();
+        let first_byte_ms = AtomicU64::new(u64::MAX);
+        let last_activity_ms = AtomicU64::new(u64::MAX);
+        let chars_received = AtomicU64::new(0);
         let filter = Mutex::new(feed.delta_filter());
         let next_index = AtomicU64::new(0);
         let emit_text = |text: &str| {
@@ -137,7 +141,16 @@ impl AgentRuntime {
             }
         };
         let sink = |event: StreamEvent| {
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+            let _ = first_byte_ms.compare_exchange(
+                u64::MAX,
+                elapsed_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            last_activity_ms.store(elapsed_ms, Ordering::Relaxed);
             if let StreamEvent::TextDelta(fragment) = event {
+                chars_received.fetch_add(fragment.chars().count() as u64, Ordering::Relaxed);
                 let safe = filter
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -155,6 +168,48 @@ impl AgentRuntime {
             });
         let tail = filter.lock().unwrap_or_else(|p| p.into_inner()).flush();
         emit_text(&tail);
+        if let Ok(ref response) = result {
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+            let _ = first_byte_ms.compare_exchange(
+                u64::MAX,
+                elapsed_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            if last_activity_ms.load(Ordering::Relaxed) == u64::MAX {
+                last_activity_ms.store(elapsed_ms, Ordering::Relaxed);
+            }
+            if chars_received.load(Ordering::Relaxed) == 0 && !response.text.is_empty() {
+                chars_received.store(response.text.chars().count() as u64, Ordering::Relaxed);
+            }
+        }
+        let outcome = match &result {
+            Ok(_) => "completed",
+            Err(e) => e.code(),
+        };
+        let step_num = self
+            .store
+            .run_steps(run_id)
+            .await
+            .unwrap_or(0)
+            .saturating_add(1);
+        let fb = match first_byte_ms.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            v => Some(v),
+        };
+        let la = match last_activity_ms.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            v => Some(v),
+        };
+        let chars = chars_received.load(Ordering::Relaxed);
+        if self
+            .store
+            .record_llm_attempt(step_id, run_id, step_num, fb, la, chars, outcome)
+            .await
+            .is_err()
+        {
+            warn!("could not record llm attempt");
+        }
         let ended = match &result {
             Ok(response) => json!({
                 "step_id": step_id,

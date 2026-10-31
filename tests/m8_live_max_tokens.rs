@@ -123,7 +123,7 @@ fn config(l: &Live, dir: &std::path::Path, agent: AgentDefinition) -> Orchestrat
                 backend: LlmBackend::OpenAiCompatible,
                 endpoint: Some(l.base.clone()),
                 auth: ProviderAuth::ApiKey(SecretString::new(l.key.clone())),
-                request_timeout: Duration::from_secs(90),
+                limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(90)),
             }],
         },
         vec![agent],

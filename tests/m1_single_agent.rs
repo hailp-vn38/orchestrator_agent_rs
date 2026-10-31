@@ -13,7 +13,7 @@ use orchestrator_agent_rs::test_support::{GatewayError, ModelRole, ScriptedGatew
 use orchestrator_agent_rs::{
     AgentDefinition, AgentMode, AgentResult, CallerContext, ErrorCode, LlmBackend, LlmConfig,
     LlmProviderConfig, MessageRole, Orchestrator, OrchestratorConfig, PageRequest, ProviderAuth,
-    RunStatus, SecretString,
+    RequestLimits, RunStatus, SecretString,
 };
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, SqliteConnection};
@@ -45,7 +45,7 @@ impl Env {
                     backend: LlmBackend::OpenAi,
                     endpoint: None,
                     auth: ProviderAuth::ApiKey(SecretString::new("sk-test-not-real")),
-                    request_timeout: Duration::from_secs(30),
+                    limits: RequestLimits::uniform(Duration::from_secs(30)),
                 }],
             },
             vec![
@@ -798,14 +798,14 @@ async fn live_reconfigure_updates_provider_model_steps_and_prompt() {
                 backend: LlmBackend::OpenAi,
                 endpoint: None,
                 auth: ProviderAuth::ApiKey(SecretString::new("sk-test-not-real")),
-                request_timeout: Duration::from_secs(30),
+                limits: RequestLimits::uniform(Duration::from_secs(30)),
             },
             LlmProviderConfig {
                 id: "fake-v2".into(),
                 backend: LlmBackend::OpenAi,
                 endpoint: Some("https://api.example.com/v1".into()),
                 auth: ProviderAuth::ApiKey(SecretString::new("sk-test-v2")),
-                request_timeout: Duration::from_secs(45),
+                limits: RequestLimits::uniform(Duration::from_secs(45)),
             },
         ],
         vec![
@@ -867,4 +867,59 @@ async fn live_reconfigure_updates_provider_model_steps_and_prompt() {
         .contains("Updated custom root system prompt."));
 
     o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn llm_attempt_recorded() {
+    use sqlx::Row;
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    gw.push_stream_text(&["hello ", "world"]);
+    gw.push_error(GatewayError::Stalled);
+    let o = env.build(&gw).await;
+
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+    let t1 = o.submit(&alice(), &sid, "turn 1".into()).await.unwrap();
+    let r1 = wait_terminal(&o, &alice(), &sid, &t1.turn_id).await;
+    assert_eq!(r1.status, RunStatus::Completed);
+
+    let t2 = o.submit(&alice(), &sid, "turn 2".into()).await.unwrap();
+    let r2 = wait_terminal(&o, &alice(), &sid, &t2.turn_id).await;
+    assert_eq!(r2.status, RunStatus::TimedOut);
+
+    o.shutdown().await.unwrap();
+
+    let mut conn = SqliteConnection::connect_with(
+        &SqliteConnectOptions::new().filename(env.store().join("orchestrator.db")),
+    )
+    .await
+    .unwrap();
+    let rows = sqlx::query(
+        "SELECT step, first_byte_ms, last_activity_ms, chars_received, outcome \
+         FROM llm_attempts ORDER BY rowid",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let step1: i64 = rows[0].get("step");
+    let fb1: Option<i64> = rows[0].get("first_byte_ms");
+    let la1: Option<i64> = rows[0].get("last_activity_ms");
+    let chars1: i64 = rows[0].get("chars_received");
+    let outcome1: String = rows[0].get("outcome");
+    assert_eq!(step1, 1);
+    assert!(fb1.is_some());
+    assert!(la1.is_some());
+    assert_eq!(chars1, 11);
+    assert_eq!(outcome1, "completed");
+
+    let step2: i64 = rows[1].get("step");
+    let fb2: Option<i64> = rows[1].get("first_byte_ms");
+    let chars2: i64 = rows[1].get("chars_received");
+    let outcome2: String = rows[1].get("outcome");
+    assert_eq!(step2, 1);
+    assert!(fb2.is_none());
+    assert_eq!(chars2, 0);
+    assert_eq!(outcome2, "PROVIDER_STALLED");
 }

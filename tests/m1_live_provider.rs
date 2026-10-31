@@ -77,7 +77,7 @@ async fn live_text_and_multi_turn_through_public_orchestrator() {
                 backend: LlmBackend::OpenAiCompatible,
                 endpoint: Some(base),
                 auth: ProviderAuth::ApiKey(SecretString::new(key)),
-                request_timeout: Duration::from_secs(60),
+                limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(60)),
             }],
         },
         vec![AgentDefinition::new("root", "g0-openai", model)
