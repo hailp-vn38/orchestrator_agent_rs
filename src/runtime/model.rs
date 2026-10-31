@@ -20,7 +20,9 @@ use crate::prompt::context_messages;
 use crate::skill::SkillManager;
 use crate::store::{new_id, RunRecord};
 
-use super::{AgentRuntime, Settlement, SPLIT_OUTPUT_GUIDANCE, STEP_LIMIT_GUIDANCE};
+use super::{
+    AgentRuntime, Settlement, BUDGET_WRAP_UP_GUIDANCE, SPLIT_OUTPUT_GUIDANCE, STEP_LIMIT_GUIDANCE,
+};
 
 const FAST_RETRY_BACKOFF: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(30)];
 const FAST_RETRY_MAX_WAIT: Duration = Duration::from_secs(30);
@@ -57,11 +59,12 @@ impl AgentRuntime {
         run: &RunRecord,
         snapshot: &RunSnapshot,
         capped: bool,
+        wrap_up: bool,
         cancel: &CancellationToken,
     ) -> Result<(ModelResponse, String), Settlement> {
         let run_id = run.run_id.as_str();
         let mut request = self
-            .step_request(run, snapshot, capped)
+            .step_request(run, snapshot, capped, wrap_up)
             .await
             .ok_or(Settlement::Unsettled)?;
         let agent_limit = snapshot.agent.context_limit_tokens;
@@ -70,7 +73,7 @@ impl AgentRuntime {
             // đi qua nhánh retry bên dưới.
             if let Ok(true) = self.compact(run, snapshot.agent.llm, cancel).await {
                 request = self
-                    .step_request(run, snapshot, capped)
+                    .step_request(run, snapshot, capped, wrap_up)
                     .await
                     .ok_or(Settlement::Unsettled)?;
             }
@@ -95,7 +98,7 @@ impl AgentRuntime {
                     match self.compact(run, snapshot.agent.llm, cancel).await {
                         Ok(true) => {
                             request = self
-                                .step_request(run, snapshot, capped)
+                                .step_request(run, snapshot, capped, wrap_up)
                                 .await
                                 .ok_or(Settlement::Unsettled)?;
                             continue;
@@ -137,7 +140,7 @@ impl AgentRuntime {
                     () = tokio::time::sleep(delay) => {}
                 }
                 request = self
-                    .step_request(run, snapshot, capped)
+                    .step_request(run, snapshot, capped, wrap_up)
                     .await
                     .ok_or(Settlement::Unsettled)?;
                 continue;
@@ -236,12 +239,11 @@ impl AgentRuntime {
             Ok(_) => "completed",
             Err(e) => e.code(),
         };
-        let step_num = self
-            .store
-            .turn_steps(&run.session_id, &run.turn_id)
-            .await
-            .unwrap_or(0)
-            .saturating_add(1);
+        let step_num =
+            crate::store::settle_sql(self.store.turn_steps(&run.session_id, &run.turn_id))
+                .await
+                .unwrap_or(0)
+                .saturating_add(1);
         let fb = match first_byte_ms.load(Ordering::Relaxed) {
             u64::MAX => None,
             v => Some(v),
@@ -251,11 +253,12 @@ impl AgentRuntime {
             v => Some(v),
         };
         let chars = chars_received.load(Ordering::Relaxed);
-        if self
-            .store
-            .record_llm_attempt(step_id, run_id, step_num, fb, la, chars, outcome)
-            .await
-            .is_err()
+        if crate::store::settle_sql(
+            self.store
+                .record_llm_attempt(step_id, run_id, step_num, fb, la, chars, outcome),
+        )
+        .await
+        .is_err()
         {
             warn!("could not record llm attempt");
         }
@@ -276,36 +279,48 @@ impl AgentRuntime {
     }
 
     /// Request của step; khi `capped` bỏ mọi tool và thêm hướng dẫn text-only; khi cùng bước đã
-    /// bị `RequestLimitExceeded` >= 2 lần trong turn thì đính kèm `SPLIT_OUTPUT_GUIDANCE`.
+    /// bị `RequestLimitExceeded` >= 2 lần trong turn thì đính kèm `SPLIT_OUTPUT_GUIDANCE`;
+    /// khi chạm 80% ngân sách thì đính kèm `BUDGET_WRAP_UP_GUIDANCE`.
     pub(super) async fn step_request(
         &self,
         run: &RunRecord,
         snapshot: &RunSnapshot,
         capped: bool,
+        wrap_up: bool,
     ) -> Option<ModelRequest> {
-        let mut request = self.build_request(run, snapshot).await?;
-        let step_num = self
-            .store
-            .turn_steps(&run.session_id, &run.turn_id)
-            .await
-            .ok()?
-            .saturating_add(1);
-        let limit_exceeded = self
-            .store
-            .turn_step_limit_exceeded_count(&run.session_id, &run.turn_id, step_num)
-            .await
-            .unwrap_or(0);
-        if capped {
-            request.tools.clear();
-            request
-                .messages
-                .push(ModelMessage::text(ModelRole::User, STEP_LIMIT_GUIDANCE));
-        } else if limit_exceeded >= 2 {
-            request
-                .messages
-                .push(ModelMessage::text(ModelRole::User, SPLIT_OUTPUT_GUIDANCE));
-        }
-        Some(request)
+        crate::store::settle_sql(async {
+            let mut request = self.build_request(run, snapshot).await?;
+            let step_num = self
+                .store
+                .turn_steps(&run.session_id, &run.turn_id)
+                .await
+                .ok()?
+                .saturating_add(1);
+            let limit_exceeded = self
+                .store
+                .turn_step_limit_exceeded_count(&run.session_id, &run.turn_id, step_num)
+                .await
+                .unwrap_or(0);
+            if capped {
+                request.tools.clear();
+                request
+                    .messages
+                    .push(ModelMessage::text(ModelRole::User, STEP_LIMIT_GUIDANCE));
+            } else {
+                if limit_exceeded >= 2 {
+                    request
+                        .messages
+                        .push(ModelMessage::text(ModelRole::User, SPLIT_OUTPUT_GUIDANCE));
+                }
+                if wrap_up {
+                    request
+                        .messages
+                        .push(ModelMessage::text(ModelRole::User, BUDGET_WRAP_UP_GUIDANCE));
+                }
+            }
+            Some(request)
+        })
+        .await
     }
 
     /// Ghi usage đo được; thiếu usage là bình thường (không lỗi, không bịa số).
@@ -315,7 +330,11 @@ impl AgentRuntime {
                 u.input_tokens.unwrap_or_default(),
                 u.output_tokens.unwrap_or_default(),
             );
-            if (i > 0 || o > 0) && self.store.add_usage(run_id, i, o).await.is_err() {
+            if (i > 0 || o > 0)
+                && crate::store::settle_sql(self.store.add_usage(run_id, i, o))
+                    .await
+                    .is_err()
+            {
                 warn!("could not record provider usage");
             }
         }

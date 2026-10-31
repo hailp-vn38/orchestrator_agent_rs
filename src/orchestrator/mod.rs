@@ -5,7 +5,7 @@
 //! M7 thêm `ArtifactStore`, `list_artifacts`, `open_artifact`, `backup_to`, và `AgentResult`
 //! artifact preview + cursor.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
@@ -28,6 +28,8 @@ mod builder;
 mod lifecycle;
 mod observe;
 mod query;
+mod recovery;
+pub(crate) use recovery::RecoveryContext;
 mod session;
 
 #[cfg(test)]
@@ -118,8 +120,7 @@ pub struct Orchestrator {
     artifacts: ArtifactStore,
     supervisor: Supervisor,
     runtime: RuntimeConfig,
-    /// Tool replay-safe (xem `replay_safe_names`) cho policy recovery sau operator resolve.
-    replay_safe: BTreeSet<String>,
+    recovery: Arc<RecoveryContext>,
     limits: ToolLimits,
     feed: ExecutionFeed,
     emitter: Emitter,

@@ -25,6 +25,33 @@ pub struct AcceptedTurn {
     pub turn_id: String,
 }
 
+/// Mã lỗi khi run kết thúc do chạm trần ngân sách (`RunBudget`).
+pub const CODE_BUDGET_EXHAUSTED: &str = "BUDGET_EXHAUSTED";
+
+/// Ngân sách thực thi của một turn, được lưu bền vững trong `agent_runs.budget_json`
+/// và truyền từ Root xuống Child (trừ phần dự trữ `reserve_secs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunBudget {
+    /// Thời điểm bắt đầu turn (unix epoch seconds); không đổi qua các attempt.
+    pub started_at: i64,
+    /// Hạn chót tổng tính cả thời gian chờ (unix epoch seconds).
+    pub total_deadline_at: i64,
+    /// Giới hạn thời gian thực chạy (seconds).
+    pub active_limit_secs: u64,
+    /// Phần dự trữ (seconds) để agent tổng hợp kết quả từng phần và để cha kết thúc sau con.
+    pub reserve_secs: u64,
+    /// Giới hạn tổng token trên cả turn (tùy chọn).
+    pub max_tokens: Option<u64>,
+    /// Tổng thời gian con đã chờ ở trạng thái `waiting_retry`/`waiting_user`, trừ khỏi thời gian chạy của cha.
+    pub waited_secs: u64,
+}
+
+/// Tùy chọn bổ sung khi submit một turn mới.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubmitOptions {
+    pub budget: Option<RunBudget>,
+}
+
 /// Operator đã được host xác thực **và** cấp capability reconcile. Không bao giờ deserialize
 /// từ input của LLM/client: host mint sau khi kiểm tra AuthN/AuthZ; engine kiểm tra lại
 /// owner/workspace và capability trước khi chấp nhận [`VerifiedToolResolution`].

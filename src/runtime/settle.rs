@@ -65,7 +65,7 @@ impl AgentRuntime {
             // Bị chặn trước dispatch: không có side effect; chỉ ghi lỗi đúng pairing.
             Prepared::Rejected(s) => s,
             Prepared::Run(runnable) => {
-                match self.store.begin_invocation(run_id, &inv.id).await {
+                match crate::store::settle_sql(self.store.begin_invocation(run_id, &inv.id)).await {
                     Ok(true) => {}
                     Ok(false) => return Some(Settlement::Terminal),
                     Err(_) => return Some(Settlement::Unsettled),
@@ -94,9 +94,7 @@ impl AgentRuntime {
                 }
             }
         };
-        match self
-            .store
-            .settle_invocation(run_id, &inv.id, &settled)
+        match crate::store::settle_sql(self.store.settle_invocation(run_id, &inv.id, &settled))
             .await
         {
             Ok(true) => {

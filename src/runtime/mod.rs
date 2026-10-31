@@ -46,6 +46,9 @@ use model::RunSnapshot;
 const STEP_LIMIT_GUIDANCE: &str = "The step limit for this task has been reached. Tools are \
 no longer available. Reply with text only: summarize the work completed so far and list the \
 remaining work, without calling any tool.";
+/// Hướng dẫn gửi cho model khi đã dùng từ 80% ngân sách thực thi trở lên (không persist).
+const BUDGET_WRAP_UP_GUIDANCE: &str = "More than 80% of the execution budget for this task \
+has been used. Wrap up your current work and prepare a final summary soon.";
 /// Hướng dẫn gửi cho model khi cùng một bước LLM chạm `RequestLimitExceeded` từ 2 lần trở lên.
 const SPLIT_OUTPUT_GUIDANCE: &str = "The previous response exceeded the single-request time \
 limit. Break the remaining work into smaller steps: use tools to save intermediate results \
@@ -142,7 +145,7 @@ impl AgentRuntime {
     }
 
     async fn execute_inner(&self, run_id: &str, cancel: &CancellationToken) -> Settlement {
-        let run = match self.store.load_run(run_id).await {
+        let run = match crate::store::settle_sql(self.store.load_run(run_id)).await {
             Ok(Some(r)) if r.status == RunStatus::Running => r,
             Ok(_) => return Settlement::Terminal,
             Err(_) => return Settlement::Unsettled,
@@ -192,10 +195,11 @@ impl AgentRuntime {
 
         // Run được sweep lại sau khi worker trước kết thúc mà chưa terminal. Invocation đã
         // `running` mà chưa có result nghĩa là outcome không xác định → chặn, không replay.
-        let mut pending = match self.store.pending_invocations(run_id).await {
-            Ok(p) => p,
-            Err(_) => return Settlement::Unsettled,
-        };
+        let mut pending =
+            match crate::store::settle_sql(self.store.pending_invocations(run_id)).await {
+                Ok(p) => p,
+                Err(_) => return Settlement::Unsettled,
+            };
         if pending.iter().any(|p| p.started) {
             return self
                 .finish(
@@ -219,16 +223,71 @@ impl AgentRuntime {
             }
 
             // Tới cap: request text-only, response là kết quả của run (không tạo run mới).
-            // Tính tổng steps trên toàn bộ turn (xuyên suốt các attempt).
-            let capped = match (
+            // Tính tổng steps và ngân sách trên toàn bộ turn (xuyên suốt các attempt).
+            let step_capped = match (
                 snapshot.agent.steps,
-                self.store.turn_steps(&run.session_id, &run.turn_id).await,
+                crate::store::settle_sql(self.store.turn_steps(&run.session_id, &run.turn_id))
+                    .await,
             ) {
                 (Some(limit), Ok(done)) => done >= limit,
                 (_, Err(_)) => return Settlement::Unsettled,
                 _ => false,
             };
-            let (response, step_id) = match self.model_step(&run, &snapshot, capped, cancel).await {
+            let (budget_wrap_up, budget_capped) =
+                match crate::store::settle_sql(self.store.run_budget(run_id)).await {
+                    Ok(Some(budget)) => {
+                        let active_secs = match crate::store::settle_sql(
+                            self.store
+                                .turn_active_secs(&run.session_id, &run.turn_id, &budget),
+                        )
+                        .await
+                        {
+                            Ok(s) => s,
+                            Err(_) => return Settlement::Unsettled,
+                        };
+                        let turn_tokens = match crate::store::settle_sql(
+                            self.store.turn_tokens(&run.session_id, &run.turn_id),
+                        )
+                        .await
+                        {
+                            Ok(t) => t,
+                            Err(_) => return Settlement::Unsettled,
+                        };
+                        let now = self.store.now_secs();
+                        let total_span = u64::try_from(
+                            budget
+                                .total_deadline_at
+                                .saturating_sub(budget.started_at)
+                                .max(0),
+                        )
+                        .unwrap_or(0);
+                        let total_elapsed =
+                            u64::try_from(now.saturating_sub(budget.started_at).max(0))
+                                .unwrap_or(0);
+                        let exhausted = active_secs >= budget.active_limit_secs
+                            || now >= budget.total_deadline_at
+                            || budget.max_tokens.is_some_and(|max| turn_tokens >= max);
+                        let wrap_up = !exhausted
+                            && ((budget.active_limit_secs > 0
+                                && active_secs.saturating_mul(5)
+                                    >= budget.active_limit_secs.saturating_mul(4))
+                                || (total_span > 0
+                                    && total_elapsed.saturating_mul(5)
+                                        >= total_span.saturating_mul(4))
+                                || budget.max_tokens.is_some_and(|max| {
+                                    max > 0
+                                        && turn_tokens.saturating_mul(5) >= max.saturating_mul(4)
+                                }));
+                        (wrap_up, exhausted)
+                    }
+                    Ok(None) => (false, false),
+                    Err(_) => return Settlement::Unsettled,
+                };
+            let capped = step_capped || budget_capped;
+            let (response, step_id) = match self
+                .model_step(&run, &snapshot, capped, budget_wrap_up, cancel)
+                .await
+            {
                 Ok(r) => r,
                 Err(done) => return done,
             };
@@ -243,15 +302,26 @@ impl AgentRuntime {
                         )
                         .await;
                 }
-                // Tool call (nếu có) bị bỏ khi đã hết steps: chưa persist, không execute.
+                // Tool call (nếu có) bị bỏ khi đã hết steps/budget: chưa persist, không execute.
                 let text = if capped && response.text.trim().is_empty() {
                     STEP_LIMIT_FALLBACK
                 } else {
                     response.text.as_str()
                 };
-                return match self.store.complete_run(run_id, text).await {
+                let completion_code = if budget_capped {
+                    Some(crate::types::CODE_BUDGET_EXHAUSTED)
+                } else {
+                    None
+                };
+                return match crate::store::settle_sql(self.store.complete_run(
+                    run_id,
+                    text,
+                    completion_code,
+                ))
+                .await
+                {
                     Ok(message_id) => {
-                        info!(capped, "run completed");
+                        info!(capped, budget_capped, "run completed");
                         if let Some(message_id) = message_id {
                             self.emitter
                                 .committed_run(
@@ -267,7 +337,7 @@ impl AgentRuntime {
                                 )
                                 .await;
                             self.emitter
-                                .run_terminal(run_id, RunStatus::Completed, None)
+                                .run_terminal(run_id, RunStatus::Completed, completion_code)
                                 .await;
                         }
                         Settlement::Terminal
@@ -310,10 +380,12 @@ impl AgentRuntime {
                     arguments: c.arguments.clone(),
                 })
                 .collect();
-            let committed = match self
-                .store
-                .commit_tool_calls(run_id, &response.text, &calls)
-                .await
+            let committed = match crate::store::settle_sql(self.store.commit_tool_calls(
+                run_id,
+                &response.text,
+                &calls,
+            ))
+            .await
             {
                 Ok(Some(c)) => c,
                 Ok(None) => return Settlement::Terminal, // run đã terminal ở nơi khác

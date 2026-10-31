@@ -148,11 +148,8 @@ impl ToolExecutor {
             cancelled.store(true, Ordering::Release);
             let grace = if shutdown_token.is_cancelled() {
                 shutdown_grace
-                    .checked_sub(Duration::from_secs(5))
-                    .filter(|d| !d.is_zero())
-                    .map_or(SHUTDOWN_CANCEL_GRACE_MAX, |d| {
-                        d.min(SHUTDOWN_CANCEL_GRACE_MAX)
-                    })
+                    .saturating_sub(Duration::from_secs(5))
+                    .min(SHUTDOWN_CANCEL_GRACE_MAX)
             } else {
                 USER_CANCEL_GRACE
             };
@@ -177,15 +174,30 @@ impl ToolExecutor {
                 Dispatch::Settled(self.settle(Ok(outcome)))
             }
             Ok(HostOutcome::Finished(Ok(Err(err)))) => {
+                if effect == ToolEffect::Resumable
+                    && self.shutdown.is_cancelled()
+                    && err.code == "CANCELLED"
+                {
+                    return Dispatch::Cancelled;
+                }
                 if effect == ToolEffect::Resumable && err.code == CODE_OUTCOME_UNKNOWN {
                     return Dispatch::Unknown(CODE_OUTCOME_UNKNOWN);
                 }
                 Dispatch::Settled(self.settle(Err(err)))
             }
             Ok(HostOutcome::CancelGraceElapsed) => Dispatch::Cancelled,
-            Err(_) => self.abnormal(effect, CODE_TIMEOUT, "the tool exceeded its time limit"),
+            Err(_) => {
+                self.abnormal(
+                    effect,
+                    &scope,
+                    CODE_TIMEOUT,
+                    "the tool exceeded its time limit",
+                )
+                .await
+            }
             Ok(HostOutcome::Finished(Err(_panic))) => {
-                self.abnormal(effect, CODE_PANICKED, "the tool panicked")
+                self.abnormal(effect, &scope, CODE_PANICKED, "the tool panicked")
+                    .await
             }
         }
     }
@@ -224,8 +236,26 @@ impl ToolExecutor {
         Ok(())
     }
 
-    /// Timeout/panic: tool ReadOnly/Resumable có thể báo lỗi kỹ thuật; tool Mutating có outcome unknown.
-    fn abnormal(&self, effect: ToolEffect, code: &str, message: &str) -> Dispatch {
+    /// Preserve an open resumable operation on timeout/panic, so a new invocation
+    /// cannot accidentally duplicate the remote side effect.
+    async fn abnormal(
+        &self,
+        effect: ToolEffect,
+        scope: &ToolScope,
+        code: &str,
+        message: &str,
+    ) -> Dispatch {
+        if effect == ToolEffect::Resumable {
+            let open = self
+                .services
+                .store
+                .current_operation(scope)
+                .await
+                .map_or(true, |op| op.is_some_and(|op| op.status.is_open()));
+            if open {
+                return Dispatch::Unknown(CODE_OUTCOME_UNKNOWN);
+            }
+        }
         match effect {
             ToolEffect::ReadOnly | ToolEffect::Resumable => {
                 Dispatch::Settled(Settled::failure(code, message))

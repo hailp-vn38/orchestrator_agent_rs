@@ -165,12 +165,13 @@ impl TaskManager {
                 agent_id: &input.agent,
             },
         };
-        let admitted = self
-            .store
-            .admit_child_turn(&scope.invocation_id, target, &input.prompt, |agent_id| {
-                routes_snapshot.get(agent_id).cloned()
-            })
-            .await;
+        let admitted = crate::store::settle_sql(self.store.admit_child_turn(
+            &scope.invocation_id,
+            target,
+            &input.prompt,
+            |agent_id| routes_snapshot.get(agent_id).cloned(),
+        ))
+        .await;
         let admission = match admitted {
             Ok(a) => a,
             Err(e) => return admit_failure(e),
@@ -215,10 +216,11 @@ impl TaskManager {
             if cancel.is_cancelled() {
                 return Delegation::Cancelled;
             }
-            match self
-                .store
-                .load_result(&admission.session_id, &admission.turn_id)
-                .await
+            match crate::store::settle_sql(
+                self.store
+                    .load_result(&admission.session_id, &admission.turn_id),
+            )
+            .await
             {
                 Ok(r) if r.status.is_terminal() => break r,
                 Ok(_) => errors = 0,

@@ -7,8 +7,7 @@ use super::SessionStore;
 use crate::artifact::{CODE_ARTIFACT_PERMISSION_DENIED, CODE_ARTIFACT_UNAVAILABLE};
 use crate::error::OrchestratorError;
 use crate::tool::{
-    OperationUpdate, ToolError, ToolOperation, ToolOperationStatus, ToolOperationSummary,
-    ToolScope,
+    OperationUpdate, ToolError, ToolOperation, ToolOperationStatus, ToolOperationSummary, ToolScope,
 };
 
 fn decode_operation_row(row: &sqlx::sqlite::SqliteRow) -> Result<ToolOperation, sqlx::Error> {
@@ -103,8 +102,8 @@ impl SessionStore {
         self.verify_invocation_scope(scope).await?;
         let now = self.now_secs();
         let op_id = new_id();
-        let cont_key = (!scope.root_session_id.trim().is_empty())
-            .then(|| scope.root_session_id.clone());
+        let cont_key =
+            (!scope.root_session_id.trim().is_empty()).then(|| scope.root_session_id.clone());
         sqlx::query(
             "INSERT INTO tool_operations(\
                 id, invocation_id, provider_ref, continuation_key, status, \
@@ -195,7 +194,7 @@ impl SessionStore {
     pub(crate) async fn list_tool_operations(
         &self,
     ) -> Result<Vec<ToolOperationSummary>, OrchestratorError> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "SELECT op.id, op.invocation_id, op.provider_ref, op.account_key, \
                     op.remote_session_id, op.continuation_key, op.batch_index, op.repairs_used, \
                     op.batch_paths_json, op.user_turns_before, op.request_json, op.status, \
@@ -208,13 +207,14 @@ impl SessionStore {
                         JOIN sessions fs ON fs.id = r.session_id \
                         WHERE (fs.id = COALESCE(s.parent_session_id, s.id) \
                                OR fs.parent_session_id = COALESCE(s.parent_session_id, s.id)) \
-                          AND r.status IN ('running', 'waiting_retry', 'waiting_user') \
+                          AND (r.status IN ('running', 'waiting_retry', 'waiting_user') OR ({recoverable})) \
                     ) AS root_has_active_work \
              FROM tool_operations op \
              JOIN tool_invocations ti ON ti.id = op.invocation_id \
              JOIN sessions s ON s.id = ti.session_id \
              ORDER BY op.rowid ASC",
-        )
+            recoverable = super::recovery::candidate_filter(),
+        ))
         .fetch_all(&self.pool)
         .await
         .map_err(db("list tool operations"))?;

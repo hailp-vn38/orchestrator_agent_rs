@@ -2,7 +2,7 @@
 
 use super::types::StoredToolCall;
 use crate::error::OrchestratorError;
-use crate::types::SessionPolicy;
+use crate::types::{RunBudget, SessionPolicy};
 
 /// Trần độ dài `error_message` được persist.
 pub(super) const MAX_ERROR_MESSAGE: usize = 500;
@@ -77,4 +77,31 @@ pub(super) fn text_of(content_json: &str) -> String {
 
 pub(super) fn sanitize_message(msg: &str) -> String {
     msg.chars().take(MAX_ERROR_MESSAGE).collect()
+}
+
+pub(crate) fn budget_json(budget: &RunBudget) -> String {
+    serde_json::json!({
+        "started_at": budget.started_at,
+        "total_deadline_at": budget.total_deadline_at,
+        "active_limit_secs": budget.active_limit_secs,
+        "reserve_secs": budget.reserve_secs,
+        "max_tokens": budget.max_tokens,
+        "waited_secs": budget.waited_secs,
+    })
+    .to_string()
+}
+
+pub(crate) fn parse_budget(raw: Option<&str>) -> Option<RunBudget> {
+    let v: serde_json::Value = serde_json::from_str(raw?).ok()?;
+    Some(RunBudget {
+        started_at: v.get("started_at")?.as_i64()?,
+        total_deadline_at: v.get("total_deadline_at")?.as_i64()?,
+        active_limit_secs: v.get("active_limit_secs")?.as_u64()?,
+        reserve_secs: v.get("reserve_secs")?.as_u64()?,
+        max_tokens: v.get("max_tokens").and_then(|x| x.as_u64()),
+        waited_secs: v
+            .get("waited_secs")
+            .and_then(|x| x.as_u64())
+            .unwrap_or_default(),
+    })
 }

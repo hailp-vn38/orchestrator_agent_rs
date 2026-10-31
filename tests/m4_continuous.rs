@@ -989,7 +989,10 @@ async fn followup_during_waiting() {
     assert_eq!(r1_waiting.status, RunStatus::WaitingUser);
 
     // Trong lúc đang ở trạng thái chờ, submit trực tiếp nhận SESSION_BUSY từ unique index.
-    let busy = o.submit(&alice(), &sid, "followup".into()).await.unwrap_err();
+    let busy = o
+        .submit(&alice(), &sid, "followup".into())
+        .await
+        .unwrap_err();
     assert_eq!(busy.code(), orchestrator_agent_rs::ErrorCode::SessionBusy);
 
     // Khi resume_waiting chạy xong turn 1, follow-up submit chạy tiếp bình thường.
@@ -1012,5 +1015,128 @@ async fn followup_during_waiting() {
     let r2 = run_turn(&o, &sid, "followup").await;
     assert_eq!(r2.status, RunStatus::Completed);
     assert_eq!(r2.output.as_deref(), Some("followup turn completed"));
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn budget_wrap_up_guidance() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    let (slow, _, _) = Probe::new("slow", Behavior::Sleep(Duration::from_secs(85)));
+    push_call(&gw, "c1", "slow", "work");
+    gw.push_text("wrapped up nicely");
+
+    let mut cfg = env.config(vec![env.root(&["slow"])]);
+    cfg.runtime.tool_timeout = Duration::from_secs(200);
+    let (o, sid) = root_session(&env, cfg, &gw, vec![slow]).await;
+
+    tokio::time::pause();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let budget = orchestrator_agent_rs::RunBudget {
+        started_at: now,
+        total_deadline_at: now + 3600,
+        active_limit_secs: 100,
+        reserve_secs: 10,
+        max_tokens: None,
+        waited_secs: 0,
+    };
+    let turn = o
+        .submit_with_options(
+            &alice(),
+            &sid,
+            "run with budget".into(),
+            orchestrator_agent_rs::SubmitOptions {
+                budget: Some(budget),
+            },
+        )
+        .await
+        .unwrap();
+    let r = wait_terminal(&o, &sid, &turn.turn_id).await;
+    assert_eq!(r.status, RunStatus::Completed, "{r:?}");
+    assert!(r.error.is_none(), "expected no error at 85%: {r:?}");
+    assert_eq!(r.output.as_deref(), Some("wrapped up nicely"));
+
+    let reqs = gw.agent_requests();
+    assert_eq!(reqs.len(), 2);
+    assert!(
+        !reqs[1].tools.is_empty(),
+        "at 80% budget tools are still provided alongside wrap-up guidance"
+    );
+    let last_msg = reqs[1].messages.last().unwrap();
+    assert_eq!(last_msg.role, ModelRole::User);
+    assert!(
+        last_msg
+            .text
+            .contains("More than 80% of the execution budget for this task has been used"),
+        "expected wrap-up guidance in step 2 request: {}",
+        last_msg.text
+    );
+
+    let h = history(&o, &sid).await;
+    assert!(
+        h.iter()
+            .all(|m| !m.text.contains("More than 80% of the execution budget")),
+        "synthetic wrap-up guidance must not be persisted in transcript: {h:?}"
+    );
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn budget_capped_text_only() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    let (slow, _, _) = Probe::new("slow", Behavior::Sleep(Duration::from_secs(100)));
+    push_call(&gw, "c1", "slow", "work");
+    gw.push_text("partial summary before budget stop");
+
+    let mut cfg = env.config(vec![env.root(&["slow"])]);
+    cfg.runtime.tool_timeout = Duration::from_secs(200);
+    let (o, sid) = root_session(&env, cfg, &gw, vec![slow]).await;
+
+    tokio::time::pause();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let budget = orchestrator_agent_rs::RunBudget {
+        started_at: now,
+        total_deadline_at: now + 3600,
+        active_limit_secs: 100,
+        reserve_secs: 10,
+        max_tokens: None,
+        waited_secs: 0,
+    };
+    let turn = o
+        .submit_with_options(
+            &alice(),
+            &sid,
+            "run until capped".into(),
+            orchestrator_agent_rs::SubmitOptions {
+                budget: Some(budget),
+            },
+        )
+        .await
+        .unwrap();
+    let r = wait_terminal(&o, &sid, &turn.turn_id).await;
+    assert_eq!(r.status, RunStatus::Completed, "{r:?}");
+    assert_eq!(
+        r.output.as_deref(),
+        Some("partial summary before budget stop")
+    );
+    assert!(r.final_message_id.is_some());
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("BUDGET_EXHAUSTED")
+    );
+
+    let reqs = gw.agent_requests();
+    assert_eq!(reqs.len(), 2);
+    assert!(
+        reqs[1].tools.is_empty(),
+        "at 100% budget tools must be stripped for text-only wrap-up"
+    );
     o.shutdown().await.unwrap();
 }

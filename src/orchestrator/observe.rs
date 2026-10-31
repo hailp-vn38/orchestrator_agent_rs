@@ -40,6 +40,11 @@ impl Orchestrator {
             .await
     }
 
+    /// Maximum number of recovery attempts after the original attempt.
+    pub fn max_resume_attempts(&self) -> u32 {
+        self.runtime.max_resume_attempts
+    }
+
     /// Chu kỳ host nên refresh snapshot khi family còn active (`RuntimeConfig::snapshot_refresh`).
     pub fn snapshot_refresh_interval(&self) -> std::time::Duration {
         self.runtime.snapshot_refresh

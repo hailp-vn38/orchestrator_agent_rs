@@ -3,7 +3,7 @@
 use crate::error::{ErrorCode, OrchestratorError};
 use crate::executor::Settled;
 use crate::feed::event;
-use crate::store::{RecoveryPolicy, Resolution, RunRoute, CODE_NO_EFFECT};
+use crate::store::{Resolution, RunRoute, CODE_NO_EFFECT};
 use crate::types::{OperatorContext, VerifiedToolResolution};
 
 use super::{route_of_live, Orchestrator};
@@ -126,13 +126,7 @@ impl Orchestrator {
                 }),
             )
             .await;
-        let route = |agent_id: &str| self.route(agent_id);
-        let replay_safe = |tool: &str| self.replay_safe.contains(tool);
-        let policy = RecoveryPolicy {
-            max_resume_attempt: self.runtime.max_resume_attempts,
-            route: &route,
-            replay_safe: &replay_safe,
-        };
+        let policy = self.recovery.policy();
         match self
             .store
             .recover_after_resolution(session_id, &policy)

@@ -252,9 +252,11 @@ impl ToolContext {
     }
 
     pub fn cancel_reason(&self) -> Option<CancelReason> {
-        self.cancel
-            .reason()
-            .or_else(|| self.cancelled.load(Ordering::Acquire).then_some(CancelReason::User))
+        self.cancel.reason().or_else(|| {
+            self.cancelled
+                .load(Ordering::Acquire)
+                .then_some(CancelReason::User)
+        })
     }
 
     /// Scoped capability để xuất bản và mở các artifact bất biến trong phạm vi cho phép
@@ -432,6 +434,12 @@ pub struct ToolOperationHandle<'a> {
 }
 
 impl ToolOperationHandle<'_> {
+    /// Whether this context supports durable operations. A read failure is never
+    /// evidence that the store is absent.
+    pub fn is_available(&self) -> bool {
+        self.ctx.services.is_some()
+    }
+
     pub fn now_secs(&self) -> i64 {
         if let Some(ToolServices { store, .. }) = &self.ctx.services {
             store.now_secs()

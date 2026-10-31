@@ -1353,7 +1353,10 @@ async fn reproduce_c79757ba() {
     let sid = o.create_session(&alice(), "root").await.unwrap();
 
     tokio::time::pause();
-    let turn = o.submit(&alice(), &sid, "run workflow".into()).await.unwrap();
+    let turn = o
+        .submit(&alice(), &sid, "run workflow".into())
+        .await
+        .unwrap();
 
     // Chờ tới khi root hoàn thành (qua waiting_retry -> resume attempt 1 -> Completed)
     let started = std::time::Instant::now();
@@ -1416,16 +1419,18 @@ async fn child_waiting_parent_stays() {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let mut c = env.sql().await;
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_runs WHERE status = 'waiting_retry'",
-        )
-        .fetch_one(&mut c)
-        .await
-        .unwrap();
+        let waiting: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE status = 'waiting_retry'")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
         if waiting == 1 {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "child never entered waiting_retry");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child never entered waiting_retry"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
@@ -1553,7 +1558,10 @@ async fn cancel_tree_while_child_renders() {
         Behavior::Sleep(Duration::from_secs(600)),
     );
     let gw = ScriptedGateway::new();
-    gw.push_tool_calls("", vec![("s1", "subagent", sub_new("reviewer", "render clip"))]);
+    gw.push_tool_calls(
+        "",
+        vec![("s1", "subagent", sub_new("reviewer", "render clip"))],
+    );
     gw.push_tool_calls("", vec![("p1", "probe", json!({"text": "render"}))]);
 
     let mut cfg = env.config(vec![
@@ -1609,5 +1617,279 @@ async fn cancel_tree_while_child_renders() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     };
     assert_eq!(child_res.status, RunStatus::Cancelled, "{child_res:?}");
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn budget_inherited_with_reserve() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    let (slow_child, _) = Probe::new(
+        "probe",
+        ToolEffect::ReadOnly,
+        Behavior::Sleep(Duration::from_secs(80)),
+    );
+
+    // Root ủy quyền cho child; child chạy tool 80s (chạm đúng 100% ngân sách con = 100 - 20 reserve).
+    gw.push_tool_calls(
+        "",
+        vec![("s1", "subagent", sub_new("reviewer", "do long work"))],
+    );
+    gw.push_tool_calls("", vec![("p1", "probe", json!({"text": "step1"}))]);
+    // Step 2 của child bị ép text-only (capped) vì đã dùng hết 80s active_limit_secs của child.
+    gw.push_text("child partial summary at 80s");
+    // Root nhận kết quả của child ở t=80s, vẫn còn 20s dự trữ để tổng hợp kết quả cuối.
+    gw.push_text("root synthesized child summary within reserve");
+
+    let mut cfg = env.config(vec![
+        env.root(&["subagent"], &[]),
+        env.reviewer(&["probe"], &[]),
+    ]);
+    cfg.runtime.tool_timeout = Duration::from_secs(200);
+    let o = build(cfg, &gw, vec![slow_child]).await;
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+
+    tokio::time::pause();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let budget = orchestrator_agent_rs::RunBudget {
+        started_at: now,
+        total_deadline_at: now + 100,
+        active_limit_secs: 100,
+        reserve_secs: 20,
+        max_tokens: None,
+        waited_secs: 0,
+    };
+    let turn = o
+        .submit_with_options(
+            &alice(),
+            &sid,
+            "delegate with reserve".into(),
+            orchestrator_agent_rs::SubmitOptions {
+                budget: Some(budget),
+            },
+        )
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let r = loop {
+        let res = o.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+        if res.status.is_terminal() {
+            break res;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "budget_inherited_with_reserve stuck: {res:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+
+    assert_eq!(r.status, RunStatus::Completed, "{r:?}");
+    assert!(
+        r.error.is_none(),
+        "root must complete within its 20s reserve without BUDGET_EXHAUSTED: {r:?}"
+    );
+    assert_eq!(
+        r.output.as_deref(),
+        Some("root synthesized child summary within reserve")
+    );
+
+    let l = links(&env, &sid).await;
+    let child_sid = l[0].child_session_id.as_deref().unwrap();
+    let child_turn = l[0].child_turn_id.as_deref().unwrap();
+    let child_res = o.result(&alice(), child_sid, child_turn).await.unwrap();
+    assert_eq!(child_res.status, RunStatus::Completed);
+    assert_eq!(
+        child_res.output.as_deref(),
+        Some("child partial summary at 80s")
+    );
+    assert_eq!(
+        child_res.error.as_ref().map(|e| e.code.as_str()),
+        Some("BUDGET_EXHAUSTED"),
+        "child must have hit its soft budget cap at 80s (parent 100s - 20s reserve)"
+    );
+
+    let mut c = env.sql().await;
+    let child_budget_raw: String =
+        sqlx::query_scalar("SELECT budget_json FROM agent_runs WHERE session_id = ?1")
+            .bind(child_sid)
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+    let child_budget: Value = serde_json::from_str(&child_budget_raw).unwrap();
+    let child_active = child_budget["active_limit_secs"].as_u64().unwrap();
+    assert!(
+        (75..=80).contains(&child_active),
+        "expected child active_limit_secs in 75..=80 (100 - used - 20 reserve), got {child_active}"
+    );
+    assert_eq!(child_budget["total_deadline_at"].as_i64(), Some(now + 80));
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn child_wait_not_counted() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+
+    // Root có active_limit_secs = 100s, total_deadline_at = now + 3600s.
+    // Child bị RateLimited phải chờ 200s (> 100s active_limit_secs của root).
+    gw.push_tool_calls("", vec![("s1", "subagent", sub_new("reviewer", "work"))]);
+    gw.push_error(GatewayError::RateLimited {
+        retry_after_secs: Some(200),
+    });
+    gw.push_text("child finished after rate limit wait");
+    gw.push_text("root finished without losing active budget");
+
+    let mut cfg = env.config(vec![env.root(&["subagent"], &[]), env.reviewer(&[], &[])]);
+    for p in &mut cfg.llm.providers {
+        p.limits.fast_retries = 0;
+    }
+    let o = build(cfg, &gw, vec![]).await;
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+
+    tokio::time::pause();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let budget = orchestrator_agent_rs::RunBudget {
+        started_at: now,
+        total_deadline_at: now + 3600,
+        active_limit_secs: 100,
+        reserve_secs: 20,
+        max_tokens: None,
+        waited_secs: 0,
+    };
+    let turn = o
+        .submit_with_options(
+            &alice(),
+            &sid,
+            "delegate with child wait".into(),
+            orchestrator_agent_rs::SubmitOptions {
+                budget: Some(budget),
+            },
+        )
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let r = loop {
+        let res = o.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+        if res.status.is_terminal() {
+            break res;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "child_wait_not_counted stuck: {res:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+
+    assert_eq!(r.status, RunStatus::Completed, "{r:?}");
+    assert!(
+        r.error.is_none(),
+        "child waiting time must not exhaust root active budget: {r:?}"
+    );
+    assert_eq!(
+        r.output.as_deref(),
+        Some("root finished without losing active budget")
+    );
+
+    let mut c = env.sql().await;
+    let root_budget_raw: String =
+        sqlx::query_scalar("SELECT budget_json FROM agent_runs WHERE id = ?1")
+            .bind(&r.run_id)
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+    let root_budget: Value = serde_json::from_str(&root_budget_raw).unwrap();
+    let waited = root_budget["waited_secs"].as_u64().unwrap();
+    assert!(
+        waited >= 200,
+        "expected root waited_secs >= 200, got {waited}"
+    );
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn budget_hard_stop() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    let (hang, hang_runs) = Probe::new("hang", ToolEffect::ReadOnly, Behavior::UntilCancelled);
+
+    gw.push_tool_calls(
+        "",
+        vec![("s1", "subagent", sub_new("reviewer", "hang job"))],
+    );
+    gw.push_tool_calls("", vec![("h1", "hang", json!({"text": "forever"}))]);
+
+    let mut cfg = env.config(vec![
+        env.root(&["subagent"], &[]),
+        env.reviewer(&["hang"], &[]),
+    ]);
+    cfg.runtime.tool_timeout = Duration::from_secs(1200);
+    cfg.runtime.supervisor_sweep = Duration::from_secs(1);
+    let o = build(cfg, &gw, vec![hang]).await;
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let budget = orchestrator_agent_rs::RunBudget {
+        started_at: now,
+        total_deadline_at: now + 20,
+        active_limit_secs: 20,
+        reserve_secs: 10,
+        max_tokens: None,
+        waited_secs: 0,
+    };
+    let turn = o
+        .submit_with_options(
+            &alice(),
+            &sid,
+            "run until hard stop".into(),
+            orchestrator_agent_rs::SubmitOptions {
+                budget: Some(budget),
+            },
+        )
+        .await
+        .unwrap();
+    while hang_runs.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    tokio::time::pause();
+    let started = std::time::Instant::now();
+    let r = loop {
+        let res = o.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+        if res.status.is_terminal() {
+            break res;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "budget_hard_stop stuck: {res:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    };
+
+    assert_eq!(r.status, RunStatus::Failed, "{r:?}");
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("BUDGET_EXHAUSTED")
+    );
+
+    let l = links(&env, &sid).await;
+    let child_sid = l[0].child_session_id.as_deref().unwrap();
+    let child_turn = l[0].child_turn_id.as_deref().unwrap();
+    let child_res = o.result(&alice(), child_sid, child_turn).await.unwrap();
+    assert_eq!(child_res.status, RunStatus::Failed, "{child_res:?}");
+    assert_eq!(
+        child_res.error.as_ref().map(|e| e.code.as_str()),
+        Some("BUDGET_EXHAUSTED")
+    );
     o.shutdown().await.unwrap();
 }

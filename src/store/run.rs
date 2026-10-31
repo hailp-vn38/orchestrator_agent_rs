@@ -1,10 +1,10 @@
 //! Vòng đời của `agent_runs`: load, usage, steps, kết thúc.
 
-use super::codec::{db, new_id, parse_policy, sanitize_message, text_json, text_of};
+use super::codec::{db, new_id, parse_budget, parse_policy, sanitize_message, text_json, text_of};
 use super::types::RunRecord;
 use super::SessionStore;
 use crate::error::{ErrorCode, OrchestratorError};
-use crate::types::{AgentResult, CallerContext, ResultError, RunStatus};
+use crate::types::{AgentResult, CallerContext, ResultError, RunBudget, RunStatus};
 use sqlx::Row;
 
 impl SessionStore {
@@ -254,6 +254,92 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Đọc `RunBudget` hiện hành của `run_id` (nếu có).
+    pub(crate) async fn run_budget(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RunBudget>, OrchestratorError> {
+        let raw: Option<Option<String>> =
+            sqlx::query_scalar("SELECT budget_json FROM agent_runs WHERE id = ?1")
+                .bind(run_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db("read run budget"))?;
+        Ok(raw.flatten().and_then(|s| parse_budget(Some(s.as_str()))))
+    }
+
+    /// Tổng thời gian thực chạy (seconds) của `(session_id, turn_id)` qua mọi attempt,
+    /// đã trừ `budget.waited_secs` và thời gian child đang ở `waiting_retry`/`waiting_user`.
+    pub(crate) async fn turn_active_secs(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        budget: &RunBudget,
+    ) -> Result<u64, OrchestratorError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(db("acquire connection for active secs"))?;
+        turn_active_secs_on(&mut conn, session_id, turn_id, budget, self.now_secs()).await
+    }
+
+    /// Tổng token (`input_tokens + output_tokens`) đã ghi nhận xuyên suốt mọi attempt của turn.
+    pub(crate) async fn turn_tokens(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<u64, OrchestratorError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(db("acquire connection for turn tokens"))?;
+        turn_tokens_on(&mut conn, session_id, turn_id).await
+    }
+
+    /// Danh sách `root_session_id` có run đang `running` đã vượt quá `deadline + reserve`.
+    pub(crate) async fn expired_budget_root_sessions(
+        &self,
+    ) -> Result<Vec<String>, OrchestratorError> {
+        let rows = sqlx::query(
+            "SELECT r.session_id, r.turn_id, r.budget_json, s.parent_session_id \
+             FROM agent_runs r JOIN sessions s ON s.id = r.session_id \
+             WHERE r.status = 'running' AND r.budget_json IS NOT NULL \
+             ORDER BY (s.parent_session_id IS NOT NULL), r.started_at, r.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db("list running runs with budget"))?;
+        let now = self.now_secs();
+        let mut expired_roots = Vec::new();
+        for row in rows {
+            let parent_sid: Option<String> = row
+                .try_get("parent_session_id")
+                .map_err(db("read parent_session_id"))?;
+            if parent_sid.is_some() {
+                continue;
+            }
+            let session_id: String = row.try_get("session_id").map_err(db("read session_id"))?;
+            let turn_id: String = row.try_get("turn_id").map_err(db("read turn_id"))?;
+            let raw: Option<String> = row.try_get("budget_json").map_err(db("read budget_json"))?;
+            let Some(budget) = parse_budget(raw.as_deref()) else {
+                continue;
+            };
+            let active_secs = self
+                .turn_active_secs(&session_id, &turn_id, &budget)
+                .await?;
+            let hard_active = budget.active_limit_secs.saturating_add(budget.reserve_secs);
+            let hard_total = budget
+                .total_deadline_at
+                .saturating_add(budget.reserve_secs.min(i64::MAX as u64) as i64);
+            if active_secs >= hard_active || now >= hard_total {
+                expired_roots.push(session_id);
+            }
+        }
+        Ok(expired_roots)
+    }
+
     /// Tổng `(steps, input_tokens, output_tokens)` đã ghi nhận của `run_id`.
     pub(crate) async fn run_usage_summary(
         &self,
@@ -282,7 +368,9 @@ impl SessionStore {
         &self,
         run_id: &str,
         text: &str,
+        error_code: Option<&str>,
     ) -> Result<Option<String>, OrchestratorError> {
+        let now = self.now_secs();
         let mut tx = self.pool.begin().await.map_err(db("begin completion"))?;
         let claimed = sqlx::query(
             "UPDATE sessions SET next_sequence = next_sequence + 1, \
@@ -313,12 +401,22 @@ impl SessionStore {
         .execute(&mut *tx)
         .await
         .map_err(db("insert final message"))?;
+        let error_message = error_code.map(|code| {
+            if code == crate::types::CODE_BUDGET_EXHAUSTED {
+                "the execution budget was reached; partial summary saved".to_owned()
+            } else {
+                code.to_owned()
+            }
+        });
         let changed = sqlx::query(
             "UPDATE agent_runs SET status = 'completed', final_message_id = ?1, \
-             steps = steps + 1, finished_at = unixepoch() \
-             WHERE id = ?2 AND status = 'running'",
+             steps = steps + 1, finished_at = ?2, error_code = ?3, error_message = ?4 \
+             WHERE id = ?5 AND status = 'running'",
         )
         .bind(&message_id)
+        .bind(now)
+        .bind(error_code)
+        .bind(error_message)
         .bind(run_id)
         .execute(&mut *tx)
         .await
@@ -344,6 +442,7 @@ impl SessionStore {
         next_attempt_at: Option<i64>,
     ) -> Result<bool, OrchestratorError> {
         debug_assert!(status.is_waiting());
+        let now = self.now_secs();
         let mut tx = self.pool.begin().await.map_err(db("begin suspend"))?;
         let bumped = sqlx::query(
             "UPDATE sessions SET state_revision = state_revision + 1, updated_at = unixepoch() \
@@ -360,14 +459,15 @@ impl SessionStore {
         }
         sqlx::query(
             "UPDATE agent_runs SET status = ?1, error_code = ?2, error_message = ?3, \
-             retry_reason = ?4, next_attempt_at = ?5, finished_at = NULL \
-             WHERE id = ?6 AND status = 'running'",
+             retry_reason = ?4, next_attempt_at = ?5, finished_at = ?6 \
+             WHERE id = ?7 AND status = 'running'",
         )
         .bind(status.as_str())
         .bind(error_code)
         .bind(sanitize_message(error_message))
         .bind(retry_reason)
         .bind(next_attempt_at)
+        .bind(now)
         .bind(run_id)
         .execute(&mut *tx)
         .await
@@ -392,6 +492,7 @@ impl SessionStore {
         error_message: &str,
     ) -> Result<bool, OrchestratorError> {
         debug_assert!(status.is_terminal() && status != RunStatus::Completed);
+        let now = self.now_secs();
         let mut tx = self.pool.begin().await.map_err(db("begin terminal"))?;
         let bumped = sqlx::query(
             "UPDATE sessions SET state_revision = state_revision + 1, updated_at = unixepoch() \
@@ -409,12 +510,13 @@ impl SessionStore {
         }
         sqlx::query(
             "UPDATE agent_runs SET status = ?1, error_code = ?2, error_message = ?3, \
-             next_attempt_at = NULL, finished_at = unixepoch() \
-             WHERE id = ?4 AND status IN ('running', 'waiting_retry', 'waiting_user')",
+             next_attempt_at = NULL, finished_at = COALESCE(finished_at, ?4) \
+             WHERE id = ?5 AND status IN ('running', 'waiting_retry', 'waiting_user')",
         )
         .bind(status.as_str())
         .bind(error_code)
         .bind(sanitize_message(error_message))
+        .bind(now)
         .bind(run_id)
         .execute(&mut *tx)
         .await
@@ -422,8 +524,8 @@ impl SessionStore {
         // `requested` chỉ được giữ cho run `interrupted` (có thể resume); mọi terminal khác
         // đưa chúng về terminal vì run đó sẽ không chạy lại.
         sqlx::query(
-            "UPDATE tool_invocations SET status = ?1, error_code = ?2, finished_at = unixepoch() \
-             WHERE run_id = ?3 AND (status = 'running' OR (status = 'requested' AND ?4))",
+            "UPDATE tool_invocations SET status = ?1, error_code = ?2, finished_at = ?3 \
+             WHERE run_id = ?4 AND (status = 'running' OR (status = 'requested' AND ?5))",
         )
         .bind(if status == RunStatus::Cancelled {
             "cancelled"
@@ -431,6 +533,7 @@ impl SessionStore {
             "interrupted"
         })
         .bind(error_code)
+        .bind(now)
         .bind(run_id)
         .bind(status != RunStatus::Interrupted)
         .execute(&mut *tx)
@@ -537,4 +640,59 @@ impl SessionStore {
             artifacts_next_cursor: None,
         })
     }
+}
+
+pub(super) async fn turn_active_secs_on(
+    conn: &mut sqlx::SqliteConnection,
+    session_id: &str,
+    turn_id: &str,
+    budget: &RunBudget,
+    now: i64,
+) -> Result<u64, OrchestratorError> {
+    let raw_secs: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(MAX(0, COALESCE(finished_at, ?3) - started_at)), 0) \
+         FROM agent_runs WHERE session_id = ?1 AND turn_id = ?2",
+    )
+    .bind(session_id)
+    .bind(turn_id)
+    .bind(now)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(db("sum turn attempt durations"))?;
+    let ongoing_child_wait: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(MAX(0, ?2 - COALESCE(cr.finished_at, cr.started_at))), 0) \
+         FROM tool_invocations ti \
+         JOIN agent_runs pr ON pr.id = ti.run_id AND pr.status = 'running' \
+         JOIN agent_runs cr ON cr.session_id = ti.child_session_id \
+              AND cr.turn_id = ti.child_turn_id \
+              AND cr.status IN ('waiting_retry', 'waiting_user') \
+         WHERE ti.session_id = ?1 AND ti.status IN ('requested', 'running') \
+           AND ti.child_session_id IS NOT NULL",
+    )
+    .bind(session_id)
+    .bind(now)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(db("sum ongoing child wait"))?;
+    let raw = u64::try_from(raw_secs.max(0)).unwrap_or(u64::MAX);
+    let ongoing = u64::try_from(ongoing_child_wait.max(0)).unwrap_or(0);
+    let waited = budget.waited_secs.saturating_add(ongoing);
+    Ok(raw.saturating_sub(waited))
+}
+
+pub(super) async fn turn_tokens_on(
+    conn: &mut sqlx::SqliteConnection,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<u64, OrchestratorError> {
+    let tokens: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) \
+         FROM agent_runs WHERE session_id = ?1 AND turn_id = ?2",
+    )
+    .bind(session_id)
+    .bind(turn_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(db("sum turn tokens"))?;
+    Ok(u64::try_from(tokens.max(0)).unwrap_or(u64::MAX))
 }

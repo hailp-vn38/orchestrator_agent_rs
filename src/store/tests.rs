@@ -56,7 +56,8 @@ async fn migration_runs_from_empty_db_and_is_rerunnable() {
             "llm_attempts",
             "messages",
             "sessions",
-            "tool_invocations"
+            "tool_invocations",
+            "tool_operations"
         ]
     );
     s.close().await;
@@ -78,7 +79,7 @@ async fn final_message_pointer_and_terminal_state_commit_atomically() {
     .execute(&s.pool)
     .await
     .unwrap();
-    assert!(s.complete_run(&run_id, "answer").await.is_err());
+    assert!(s.complete_run(&run_id, "answer", None).await.is_err());
     let assistants: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE role = 'assistant'")
             .fetch_one(&s.pool)
@@ -93,13 +94,17 @@ async fn final_message_pointer_and_terminal_state_commit_atomically() {
         .execute(&s.pool)
         .await
         .unwrap();
-    let mid = s.complete_run(&run_id, "answer").await.unwrap().unwrap();
+    let mid = s
+        .complete_run(&run_id, "answer", None)
+        .await
+        .unwrap()
+        .unwrap();
     let r = s.result(&caller(), &sid, &turn.turn_id).await.unwrap();
     assert_eq!(r.status, RunStatus::Completed);
     assert_eq!(r.final_message_id.as_deref(), Some(mid.as_str()));
     assert_eq!(r.output.as_deref(), Some("answer"));
     // Terminal run không bị ghi đè lần hai.
-    assert_eq!(s.complete_run(&run_id, "again").await.unwrap(), None);
+    assert_eq!(s.complete_run(&run_id, "again", None).await.unwrap(), None);
 }
 
 #[tokio::test]
@@ -216,7 +221,9 @@ async fn child_admission_links_atomically_and_is_idempotent_per_invocation() {
     assert_eq!(count(&s, q, &a.session_id).await, 1);
 
     // Child terminal trước khi parent ghi result: replay vẫn trả đúng turn, wait đúng final.
-    s.complete_run(&child_run, "child final").await.unwrap();
+    s.complete_run(&child_run, "child final", None)
+        .await
+        .unwrap();
     let after = s
         .admit_child_turn(&inv, new_child("rev"), "review this", route)
         .await
@@ -241,7 +248,7 @@ async fn identical_followup_prompt_in_a_new_invocation_is_a_new_logical_turn() {
         .await
         .unwrap();
     let child_run = run_of(&s, &a.session_id).await;
-    s.complete_run(&child_run, "first").await.unwrap();
+    s.complete_run(&child_run, "first", None).await.unwrap();
     let settled = crate::executor::Settled::failure("X", "done");
     assert!(s.settle_invocation(&run, &inv1, &settled).await.unwrap());
 
@@ -319,7 +326,7 @@ async fn resume_requires_same_parent_scope_agent_and_open_session() {
         .admit_child_turn(&inv_a, new_child("rev"), "one", route)
         .await
         .unwrap();
-    s.complete_run(&run_of(&s, &a.session_id).await, "ok")
+    s.complete_run(&run_of(&s, &a.session_id).await, "ok", None)
         .await
         .unwrap();
 
@@ -518,7 +525,7 @@ async fn child_session_rejects_direct_admission_but_stays_readable() {
         .admit_child_turn(&inv, new_child("rev"), "x", route)
         .await
         .unwrap();
-    s.complete_run(&run_of(&s, &a.session_id).await, "ok")
+    s.complete_run(&run_of(&s, &a.session_id).await, "ok", None)
         .await
         .unwrap();
     let e = s
@@ -543,7 +550,7 @@ async fn concurrent_resumes_of_one_child_admit_exactly_one() {
         .admit_child_turn(&inv1, new_child("rev"), "first", route)
         .await
         .unwrap();
-    s.complete_run(&run_of(&s, &a.session_id).await, "ok")
+    s.complete_run(&run_of(&s, &a.session_id).await, "ok", None)
         .await
         .unwrap();
     let settled = crate::executor::Settled::failure("X", "done");

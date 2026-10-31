@@ -12,9 +12,9 @@
 //! sau backoff mũ; quá [`MAX_UNSETTLED_ATTEMPTS`] lần liên tiếp thì runtime chuyển run sang
 //! `interrupted/STORE_UNAVAILABLE` để không gọi lại model vô hạn khi store ghi lỗi kéo dài.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{Notify, RwLock};
@@ -24,10 +24,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::error::{ErrorCode, OrchestratorError};
-use crate::orchestrator::LiveAgentCatalog;
+use crate::orchestrator::RecoveryContext;
 use crate::owner_lock::OwnerLock;
 use crate::runtime::{AgentRuntime, Settlement};
-use crate::store::{RecoveryPolicy, SessionStore};
+use crate::store::SessionStore;
 
 /// Số lần `Unsettled` liên tiếp của một run trước khi bỏ cuộc (mỗi lần có thể là một lần gọi
 /// model). Run bỏ cuộc vẫn phục hồi được ở lần khởi động sau.
@@ -80,9 +80,7 @@ struct Retry {
 struct Shared {
     store: SessionStore,
     runtime: AgentRuntime,
-    catalog: Arc<StdRwLock<LiveAgentCatalog>>,
-    replay_safe: Arc<BTreeSet<String>>,
-    max_resume_attempts: u32,
+    recovery: Arc<RecoveryContext>,
     owned: Mutex<HashMap<String, Owned>>,
     /// Backoff của run `Unsettled` (in-memory; restart dùng recovery bounded thay thế).
     retries: Mutex<HashMap<String, Retry>>,
@@ -118,9 +116,7 @@ impl Supervisor {
     pub(crate) async fn start(
         store: SessionStore,
         runtime: AgentRuntime,
-        catalog: Arc<StdRwLock<LiveAgentCatalog>>,
-        replay_safe: Arc<BTreeSet<String>>,
-        max_resume_attempts: u32,
+        recovery: Arc<RecoveryContext>,
         sweep: Duration,
         max_root_runs: Option<usize>,
         owner_lock: OwnerLock,
@@ -130,9 +126,7 @@ impl Supervisor {
         let shared = Arc::new(Shared {
             store,
             runtime,
-            catalog,
-            replay_safe,
-            max_resume_attempts,
+            recovery,
             owned: Mutex::new(HashMap::new()),
             retries: Mutex::new(HashMap::new()),
             signal,
@@ -320,20 +314,31 @@ impl Shared {
         if self.cancel.is_cancelled() {
             return;
         }
-        let route = |agent_id: &str| {
-            self.catalog
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .route_of_live(agent_id)
+        crate::store::settle_sql(async {
+            self.enforce_budgets().await;
+            let policy = self.recovery.policy();
+            let _ = self.store.resume_due_waiting(&policy).await;
+            self.spawn_unowned(false).await;
+        })
+        .await;
+    }
+
+    /// Quá `deadline + reserve` mà worker chưa dừng: hủy cả family với mã `BUDGET_EXHAUSTED`.
+    async fn enforce_budgets(&self) {
+        let Ok(expired_roots) = self.store.expired_budget_root_sessions().await else {
+            return;
         };
-        let replay_safe = |tool: &str| self.replay_safe.contains(tool);
-        let policy = RecoveryPolicy {
-            max_resume_attempt: self.max_resume_attempts,
-            route: &route,
-            replay_safe: &replay_safe,
-        };
-        let _ = self.store.resume_due_waiting(&policy).await;
-        self.spawn_unowned(false).await;
+        for root_session_id in expired_roots {
+            let Ok(family_runs) = self.store.active_run_family(&root_session_id).await else {
+                continue;
+            };
+            for run_id in family_runs {
+                let _ = self.runtime.hard_stop_budget(&run_id).await;
+                if let Some(owned) = lock(&self.owned).get(&run_id) {
+                    owned.cancel.cancel();
+                }
+            }
+        }
     }
 
     /// Như `reconcile` nhưng cũng chạy khi đã shutdown (để claim còn lại được cancel đúng).

@@ -12,10 +12,11 @@
 
 use sqlx::Row;
 
-use super::codec::{db, new_id, sanitize_message};
+use super::codec::{budget_json, db, new_id, parse_budget, sanitize_message};
 use super::{RunRoute, SessionStore};
 use crate::error::{ErrorCode, OrchestratorError};
 use crate::executor::{Settled, CODE_OUTCOME_UNKNOWN};
+use crate::types::CODE_BUDGET_EXHAUSTED;
 
 pub(crate) const CODE_INTERRUPTED: &str = "INTERRUPTED";
 pub(crate) const CODE_SHUTTING_DOWN: &str = "SHUTTING_DOWN";
@@ -41,7 +42,7 @@ const RECOVERABLE_CODES: &str = "'INTERRUPTED','SHUTTING_DOWN','TOOL_OUTCOME_UNK
 /// Điều kiện của attempt đáng được phục hồi (tham số `r` là alias của `agent_runs`): attempt
 /// mới nhất của turn mới nhất trong session, đã `interrupted` vì lý do phục hồi được, và
 /// session không còn run active (`running`, `waiting_retry`, `waiting_user`).
-fn candidate_filter() -> String {
+pub(super) fn candidate_filter() -> String {
     format!(
         "r.status = 'interrupted' AND r.error_code IN ({RECOVERABLE_CODES}) \
          AND r.resume_attempt = (SELECT MAX(x.resume_attempt) FROM agent_runs x \
@@ -105,6 +106,7 @@ impl SessionStore {
     /// Chuyển `interrupted` (`INTERRUPTED`) và invocation `running` (outcome chưa biết) thành
     /// `interrupted`; invocation `requested` giữ nguyên (chưa từng chạy). Chưa tạo attempt mới.
     pub(crate) async fn mark_stale_runs_interrupted(&self) -> Result<u64, OrchestratorError> {
+        let now = self.now_secs();
         let mut tx = self.pool.begin().await.map_err(db("begin stale scan"))?;
         sqlx::query(
             "UPDATE sessions SET state_revision = state_revision + 1, updated_at = unixepoch() \
@@ -115,19 +117,21 @@ impl SessionStore {
         .map_err(db("bump stale sessions"))?;
         sqlx::query(
             "UPDATE tool_invocations SET status = 'interrupted', error_code = ?1, \
-             finished_at = unixepoch() WHERE status = 'running' \
+             finished_at = ?2 WHERE status = 'running' \
              AND run_id IN (SELECT id FROM agent_runs WHERE status = 'running')",
         )
         .bind(CODE_INTERRUPTED)
+        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(db("interrupt stale invocations"))?;
         let n = sqlx::query(
             "UPDATE agent_runs SET status = 'interrupted', error_code = ?1, \
              error_message = 'the process stopped before the run finished', \
-             finished_at = unixepoch() WHERE status = 'running'",
+             finished_at = ?2 WHERE status = 'running'",
         )
         .bind(CODE_INTERRUPTED)
+        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(db("interrupt stale runs"))?
@@ -194,8 +198,9 @@ impl SessionStore {
         run_id: &str,
         policy: &RecoveryPolicy<'_>,
     ) -> Result<TurnRecovery, OrchestratorError> {
+        let now = self.now_secs();
         let mut tx = self.pool.begin().await.map_err(db("begin recovery"))?;
-        match recover_run_inner(&mut tx, run_id, policy).await {
+        match recover_run_inner(&mut tx, run_id, policy, now).await {
             Ok(outcome) => {
                 tx.commit().await.map_err(db("commit recovery"))?;
                 Ok(outcome)
@@ -262,14 +267,17 @@ impl SessionStore {
         Ok(out)
     }
 
-    /// Danh sách `run_id` của các run `waiting_retry` đã tới hạn (`next_attempt_at <= now_secs()`),
-    /// sắp xếp child trước parent rồi theo `next_attempt_at`.
+    /// Danh sách `run_id` của các run `waiting_retry` đã tới hạn (`next_attempt_at <= now_secs()`)
+    /// hoặc run đang chờ đã quá `budget.total_deadline_at`, sắp xếp child trước parent.
     pub(crate) async fn due_waiting_runs(&self) -> Result<Vec<String>, OrchestratorError> {
         let now = self.now_secs();
         sqlx::query_scalar(
             "SELECT r.id FROM agent_runs r JOIN sessions s ON s.id = r.session_id \
-             WHERE r.status = 'waiting_retry' AND r.next_attempt_at <= ?1 \
-             ORDER BY (s.parent_session_id IS NULL), r.next_attempt_at, r.id",
+             WHERE (r.status = 'waiting_retry' AND r.next_attempt_at <= ?1) \
+                OR (r.status IN ('waiting_retry', 'waiting_user') \
+                    AND r.budget_json IS NOT NULL \
+                    AND CAST(json_extract(r.budget_json, '$.total_deadline_at') AS INTEGER) <= ?1) \
+             ORDER BY (s.parent_session_id IS NULL), COALESCE(r.next_attempt_at, 0), r.id",
         )
         .bind(now)
         .fetch_all(&self.pool)
@@ -277,9 +285,7 @@ impl SessionStore {
         .map_err(db("list due waiting runs"))
     }
 
-    /// Đánh thức mọi run `waiting_retry` đã tới hạn: trong cùng một transaction, CAS
-    /// `waiting_retry -> interrupted` (`error_code = 'RETRY_DUE'`, `next_attempt_at = NULL`,
-    /// giữ `retry_reason`) rồi gọi `recover_run_inner`.
+    /// Đánh thức mọi run `waiting_retry` đã tới hạn (hoặc đã hết `total_deadline_at`).
     pub(crate) async fn resume_due_waiting(
         &self,
         policy: &RecoveryPolicy<'_>,
@@ -289,26 +295,13 @@ impl SessionStore {
         let now = self.now_secs();
         for run_id in due_ids {
             let mut tx = self.pool.begin().await.map_err(db("begin resume due"))?;
-            let changed = sqlx::query(
-                "UPDATE agent_runs SET status = 'interrupted', error_code = ?1, \
-                 next_attempt_at = NULL, finished_at = ?2 \
-                 WHERE id = ?3 AND status = 'waiting_retry'",
-            )
-            .bind(CODE_RETRY_DUE)
-            .bind(now)
-            .bind(&run_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db("mark waiting run retry due"))?
-            .rows_affected();
-            if changed != 1 {
-                let _ = tx.rollback().await;
-                continue;
-            }
-            match recover_run_inner(&mut tx, &run_id, policy).await {
-                Ok(outcome) => {
+            match wake_waiting_run_in_tx(&mut tx, &run_id, policy, now).await {
+                Ok(Some(outcome)) => {
                     tx.commit().await.map_err(db("commit resume due"))?;
                     tally(&mut report, outcome);
+                }
+                Ok(None) => {
+                    let _ = tx.rollback().await;
                 }
                 Err(e) => {
                     let _ = tx.rollback().await;
@@ -355,28 +348,16 @@ impl SessionStore {
                 .begin()
                 .await
                 .map_err(db("begin resume waiting session"))?;
-            let changed = sqlx::query(
-                "UPDATE agent_runs SET status = 'interrupted', error_code = ?1, \
-                 next_attempt_at = NULL, finished_at = ?2 \
-                 WHERE id = ?3 AND status IN ('waiting_retry', 'waiting_user')",
-            )
-            .bind(CODE_RETRY_DUE)
-            .bind(now)
-            .bind(&run_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db("mark waiting session retry due"))?
-            .rows_affected();
-            if changed != 1 {
-                let _ = tx.rollback().await;
-                continue;
-            }
-            match recover_run_inner(&mut tx, &run_id, policy).await {
-                Ok(_outcome) => {
+            match wake_waiting_run_in_tx(&mut tx, &run_id, policy, now).await {
+                Ok(Some(_outcome)) => {
                     tx.commit()
                         .await
                         .map_err(db("commit resume waiting session"))?;
                     resumed = resumed.saturating_add(1);
+                }
+                Ok(None) => {
+                    let _ = tx.rollback().await;
+                    continue;
                 }
                 Err(e) => {
                     let _ = tx.rollback().await;
@@ -420,16 +401,121 @@ fn tally(report: &mut RecoveryReport, outcome: TurnRecovery) {
     }
 }
 
+async fn wake_waiting_run_in_tx(
+    tx: &mut sqlx::SqliteConnection,
+    run_id: &str,
+    policy: &RecoveryPolicy<'_>,
+    now: i64,
+) -> Result<Option<TurnRecovery>, OrchestratorError> {
+    let row = sqlx::query(
+        "UPDATE agent_runs SET status = status \
+         WHERE id = ?1 AND status IN ('waiting_retry', 'waiting_user') \
+         RETURNING session_id, turn_id, started_at, finished_at, budget_json",
+    )
+    .bind(run_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db("lock waiting run"))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let session_id: String = row.try_get("session_id").map_err(db("read session"))?;
+    let turn_id: String = row.try_get("turn_id").map_err(db("read turn"))?;
+    let started_at: i64 = row.try_get("started_at").map_err(db("read started_at"))?;
+    let finished_at: Option<i64> = row.try_get("finished_at").map_err(db("read finished_at"))?;
+    let raw_budget: Option<String> = row.try_get("budget_json").map_err(db("read budget_json"))?;
+
+    let wait_start = finished_at.unwrap_or(started_at);
+    let waited_delta = u64::try_from(now.saturating_sub(wait_start).max(0)).unwrap_or(0);
+    if waited_delta > 0 {
+        let parent_row = sqlx::query(
+            "SELECT pr.id, pr.budget_json FROM tool_invocations ti \
+             JOIN agent_runs pr ON pr.id = ti.run_id \
+             WHERE ti.child_session_id = ?1 AND ti.child_turn_id = ?2 \
+               AND ti.status IN ('requested', 'running', 'interrupted') \
+             LIMIT 1",
+        )
+        .bind(&session_id)
+        .bind(&turn_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db("find parent run for child wait credit"))?;
+        if let Some(parent_row) = parent_row {
+            let parent_run_id: String =
+                parent_row.try_get("id").map_err(db("read parent run id"))?;
+            let parent_budget_raw: Option<String> = parent_row
+                .try_get("budget_json")
+                .map_err(db("read parent budget"))?;
+            if let Some(mut parent_budget) = parse_budget(parent_budget_raw.as_deref()) {
+                parent_budget.waited_secs = parent_budget.waited_secs.saturating_add(waited_delta);
+                sqlx::query("UPDATE agent_runs SET budget_json = ?1 WHERE id = ?2")
+                    .bind(budget_json(&parent_budget))
+                    .bind(&parent_run_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db("credit child wait to parent budget"))?;
+            }
+        }
+    }
+
+    if let Some(budget) = parse_budget(raw_budget.as_deref()) {
+        if now >= budget.total_deadline_at {
+            sqlx::query(
+                "UPDATE agent_runs SET status = 'failed', error_code = ?1, \
+                 error_message = 'the execution budget expired while the run was waiting', \
+                 next_attempt_at = NULL, finished_at = COALESCE(finished_at, ?2) \
+                 WHERE id = ?3",
+            )
+            .bind(CODE_BUDGET_EXHAUSTED)
+            .bind(now)
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db("expire waiting run on budget"))?;
+            sqlx::query(
+                "UPDATE tool_invocations SET status = 'interrupted', error_code = ?1, \
+                 finished_at = ?2 WHERE run_id = ?3 AND status IN ('requested', 'running')",
+            )
+            .bind(CODE_BUDGET_EXHAUSTED)
+            .bind(now)
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db("interrupt invocations on budget expiry"))?;
+            bump_revision(tx, &session_id).await?;
+            return Ok(Some(TurnRecovery::Exhausted));
+        }
+    }
+
+    let changed = sqlx::query(
+        "UPDATE agent_runs SET status = 'interrupted', error_code = ?1, \
+         next_attempt_at = NULL, finished_at = COALESCE(finished_at, ?2) \
+         WHERE id = ?3 AND status IN ('waiting_retry', 'waiting_user')",
+    )
+    .bind(CODE_RETRY_DUE)
+    .bind(now)
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db("mark waiting run retry due"))?
+    .rows_affected();
+    if changed != 1 {
+        return Ok(None);
+    }
+    recover_run_inner(tx, run_id, policy, now).await.map(Some)
+}
+
 async fn recover_run_inner(
     tx: &mut sqlx::SqliteConnection,
     run_id: &str,
     policy: &RecoveryPolicy<'_>,
+    now: i64,
 ) -> Result<TurnRecovery, OrchestratorError> {
     // Ghi no-op đầu tiên để lấy write lock ngay (tránh SQLITE_BUSY_SNAPSHOT).
     let row = sqlx::query(
         "UPDATE agent_runs SET status = status WHERE id = ?1 \
          RETURNING session_id, agent_id, turn_id, resume_attempt, provider_id, model_id, \
-         provider_config_fingerprint, error_code",
+         provider_config_fingerprint, error_code, budget_json",
     )
     .bind(run_id)
     .fetch_optional(&mut *tx)
@@ -460,6 +546,33 @@ async fn recover_run_inner(
         .try_get("provider_config_fingerprint")
         .map_err(db("read fingerprint"))?;
     let current_code: Option<String> = row.try_get("error_code").map_err(db("read code"))?;
+    let raw_budget: Option<String> = row.try_get("budget_json").map_err(db("read budget"))?;
+
+    if let Some(budget) = parse_budget(raw_budget.as_deref()) {
+        if now >= budget.total_deadline_at {
+            sqlx::query(
+                "UPDATE agent_runs SET status = 'failed', error_code = ?1, \
+                 error_message = 'the execution budget expired before recovery' WHERE id = ?2",
+            )
+            .bind(CODE_BUDGET_EXHAUSTED)
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db("mark budget expired before recovery"))?;
+            sqlx::query(
+                "UPDATE tool_invocations SET status = 'interrupted', error_code = ?1, \
+                 finished_at = ?2 WHERE run_id = ?3 AND status IN ('requested', 'running')",
+            )
+            .bind(CODE_BUDGET_EXHAUSTED)
+            .bind(now)
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db("interrupt invocations on budget expiry"))?;
+            bump_revision(tx, &session_id).await?;
+            return Ok(TurnRecovery::Exhausted);
+        }
+    }
 
     let unsettled = load_unsettled(tx, run_id).await?;
     let mut block: Option<(&'static str, &'static str)> = None;
@@ -559,8 +672,8 @@ async fn recover_run_inner(
     let new_run = new_id();
     let inserted = sqlx::query(
         "INSERT INTO agent_runs(id, session_id, agent_id, turn_id, resume_attempt, \
-         provider_id, model_id, provider_config_fingerprint, status) \
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running')",
+         provider_id, model_id, provider_config_fingerprint, status, started_at, budget_json) \
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', ?9, ?10)",
     )
     .bind(&new_run)
     .bind(&session_id)
@@ -570,6 +683,8 @@ async fn recover_run_inner(
     .bind(&route.provider_id)
     .bind(&route.model_id)
     .bind(&route.fingerprint)
+    .bind(now)
+    .bind(raw_budget)
     .execute(&mut *tx)
     .await;
     match inserted {

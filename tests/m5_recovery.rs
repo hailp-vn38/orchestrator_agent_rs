@@ -1626,7 +1626,7 @@ async fn shutdown_drain_expiry_falls_back_to_cooperative_cancel() {
 }
 
 #[tokio::test]
-async fn at41_non_cooperative_tool_keeps_the_owner_guard_and_shutdown_reports_incomplete() {
+async fn at41_forced_shutdown_releases_owner_without_replaying_unknown_mutation() {
     let env = Env::new();
     let (mt, runs) = Probe::new(
         "mt",
@@ -1643,65 +1643,29 @@ async fn at41_non_cooperative_tool_keeps_the_owner_guard_and_shutdown_reports_in
     let t = o.submit(&alice(), &sid, "go".into()).await.unwrap();
     wait_until(|| runs.load(Ordering::SeqCst) == 1).await;
 
-    let err = o.shutdown().await.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::Unavailable);
-    assert!(err.message().contains("incomplete"), "{}", err.message());
-    // Chưa báo stopped: run chưa terminal, owner guard còn giữ → engine khác không acquire được.
-    {
-        let mut c = env.sql().await;
-        assert_eq!(
-            one(
-                &mut c,
-                "SELECT status FROM agent_runs WHERE session_id = ?1",
-                &sid
-            )
-            .await,
-            "running"
-        );
-    }
-    let (mt2, _) = Probe::new("mt", ToolEffect::Mutating, Behavior::Echo);
-    let other = build(
-        env.config(env.agents(&["mt"])),
-        &ScriptedGateway::new(),
-        vec![mt2.clone()],
-    )
-    .await
-    .err()
-    .expect("owner guard must still be held");
-    assert_eq!(other.code(), ErrorCode::StoreAlreadyOwned);
-    // Engine đang shutdown vẫn từ chối admission mới.
-    assert_eq!(
-        o.submit(&alice(), &sid, "x".into())
-            .await
-            .unwrap_err()
-            .code(),
-        ErrorCode::ShuttingDown
-    );
-
-    // Tool kết thúc muộn: retry shutdown thành công, lock được nhả, run interrupted có thể
-    // phục hồi và result của tool đã ghi (không mất, không replay).
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    for _ in 0..40 {
-        if o.shutdown().await.is_ok() {
-            break;
-        }
-    }
-    o.shutdown().await.unwrap();
+    o.shutdown()
+        .await
+        .expect("forced cancellation fits short shutdown grace");
     drop(o);
     let (mt3, mt3_runs) = Probe::new("mt", ToolEffect::Mutating, Behavior::Echo);
-    let gw3 = ScriptedGateway::new();
-    gw3.push_text("resumed after the late finish");
-    let o3 = build(env.config(env.agents(&["mt"])), &gw3, vec![mt3])
-        .await
-        .unwrap();
-    let r = wait_terminal(&o3, &sid, &t.turn_id).await;
-    assert_eq!(r.status, RunStatus::Completed, "{r:?}");
+    let o3 = build(
+        env.config(env.agents(&["mt"])),
+        &ScriptedGateway::new(),
+        vec![mt3],
+    )
+    .await
+    .unwrap();
+    let r = o3.result(&alice(), &sid, &t.turn_id).await.unwrap();
+    assert_eq!(r.status, RunStatus::Interrupted, "{r:?}");
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("TOOL_OUTCOME_UNKNOWN")
+    );
     assert_eq!(
         mt3_runs.load(Ordering::SeqCst),
         0,
-        "late-finished mutation is not replayed"
+        "unknown mutation must not replay"
     );
-    assert_eq!(tool_texts(&history(&o3, &sid).await), ["finished-late"]);
     o3.shutdown().await.unwrap();
 }
 
@@ -2259,14 +2223,13 @@ async fn migration_preserves_runs() {
     o.shutdown().await.unwrap();
 
     let mut conn = env.sql().await;
-    let rowids: Vec<(i64, String)> =
-        sqlx::query("SELECT rowid, id FROM agent_runs ORDER BY rowid")
-            .fetch_all(&mut conn)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|r| (r.get(0), r.get(1)))
-            .collect();
+    let rowids: Vec<(i64, String)> = sqlx::query("SELECT rowid, id FROM agent_runs ORDER BY rowid")
+        .fetch_all(&mut conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
     assert_eq!(
         rowids,
         vec![(1, "r1".to_owned()), (5, "r5".to_owned())],
@@ -2370,9 +2333,18 @@ async fn migration_preserves_runs() {
             .fetch_all(&mut c)
             .await
             .unwrap();
-        assert_eq!(after_runs, before_runs, "real DB runs/rowids changed for {rel}");
-        assert_eq!(after_msgs, before_msgs, "real DB messages changed for {rel}");
-        assert_eq!(after_invs, before_invs, "real DB invocations changed for {rel}");
+        assert_eq!(
+            after_runs, before_runs,
+            "real DB runs/rowids changed for {rel}"
+        );
+        assert_eq!(
+            after_msgs, before_msgs,
+            "real DB messages changed for {rel}"
+        );
+        assert_eq!(
+            after_invs, before_invs,
+            "real DB invocations changed for {rel}"
+        );
         assert!(
             fk.is_empty(),
             "real DB FK check failed for {rel}: {}",
@@ -2392,7 +2364,10 @@ async fn waiting_retry_survives_restart() {
     cfg1.llm.providers[0].limits.fast_retries = 0;
     let o1 = build(cfg1, &gw1, vec![]).await.unwrap();
     let sid = o1.create_session(&alice(), "root").await.unwrap();
-    let turn = o1.submit(&alice(), &sid, "survive restart".into()).await.unwrap();
+    let turn = o1
+        .submit(&alice(), &sid, "survive restart".into())
+        .await
+        .unwrap();
 
     let r_wait = wait_terminal(&o1, &sid, &turn.turn_id).await;
     assert_eq!(r_wait.status, RunStatus::WaitingRetry);
@@ -2462,21 +2437,26 @@ async fn cancel_waiting_run() {
     assert!(r1_cancelled.next_attempt_at.is_none());
 
     // 2. Hủy root khi child đang ở waiting_retry -> cả hai đều Cancelled.
-    let t2 = o.submit(&alice(), &sid, "delegate wait".into()).await.unwrap();
+    let t2 = o
+        .submit(&alice(), &sid, "delegate wait".into())
+        .await
+        .unwrap();
     wait_until(|| gw.call_count() == 3).await;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let child_sid = loop {
         let mut c = env.sql().await;
-        let row: Option<String> = sqlx::query_scalar(
-            "SELECT session_id FROM agent_runs WHERE status = 'waiting_retry'",
-        )
-        .fetch_optional(&mut c)
-        .await
-        .unwrap();
+        let row: Option<String> =
+            sqlx::query_scalar("SELECT session_id FROM agent_runs WHERE status = 'waiting_retry'")
+                .fetch_optional(&mut c)
+                .await
+                .unwrap();
         if let Some(csid) = row {
             break csid;
         }
-        assert!(std::time::Instant::now() < deadline, "child not in waiting_retry");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child not in waiting_retry"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
 
@@ -2507,7 +2487,10 @@ async fn resume_blocked_on_config_change() {
     cfg.llm.providers[0].limits.fast_retries = 0;
     let o1 = build(cfg, &gw, vec![]).await.unwrap();
     let sid = o1.create_session(&alice(), "root").await.unwrap();
-    let turn = o1.submit(&alice(), &sid, "check config".into()).await.unwrap();
+    let turn = o1
+        .submit(&alice(), &sid, "check config".into())
+        .await
+        .unwrap();
 
     let r_wait = wait_terminal(&o1, &sid, &turn.turn_id).await;
     assert_eq!(r_wait.status, RunStatus::WaitingUser);
@@ -2558,16 +2541,16 @@ async fn steps_cap_across_attempts() {
         if res.status.is_terminal() {
             break res;
         }
-        assert!(started.elapsed() < Duration::from_secs(15), "run stuck: {res:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "run stuck: {res:?}"
+        );
         tokio::time::sleep(Duration::from_secs(1)).await;
     };
 
     assert_eq!(r.status, RunStatus::Completed, "{r:?}");
     assert_eq!(r.attempt, 1);
-    assert_eq!(
-        r.output.as_deref(),
-        Some("capped summary across attempts")
-    );
+    assert_eq!(r.output.as_deref(), Some("capped summary across attempts"));
 
     let reqs = gw.requests();
     let last_req = reqs.last().unwrap();
@@ -2576,10 +2559,9 @@ async fn steps_cap_across_attempts() {
         "final request at turn_steps == max_steps must strip tools"
     );
     assert!(
-        last_req
-            .messages
-            .iter()
-            .any(|m| m.text.contains("The step limit for this task has been reached")),
+        last_req.messages.iter().any(|m| m
+            .text
+            .contains("The step limit for this task has been reached")),
         "final request must include STEP_LIMIT_GUIDANCE"
     );
     o.shutdown().await.unwrap();
@@ -2601,10 +2583,14 @@ async fn cancel_video_within_grace() {
     cfg.runtime.tool_timeout = Duration::from_secs(1200);
     let o = build(cfg, &gw, vec![slow_video]).await.unwrap();
     let sid = o.create_session(&alice(), "root").await.unwrap();
-    let turn = o.submit(&alice(), &sid, "render video".into()).await.unwrap();
+    let turn = o
+        .submit(&alice(), &sid, "render video".into())
+        .await
+        .unwrap();
     wait_until(|| runs.load(Ordering::SeqCst) == 1).await;
 
     tokio::time::pause();
+    let virtual_start = tokio::time::Instant::now();
     o.cancel(&alice(), &sid).await.unwrap();
 
     let started = std::time::Instant::now();
@@ -2620,10 +2606,12 @@ async fn cancel_video_within_grace() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     };
     assert_eq!(r.status, RunStatus::Cancelled, "{r:?}");
-    assert_eq!(
-        r.error.as_ref().map(|e| e.code.as_str()),
-        Some("CANCELLED")
+    let virtual_elapsed = virtual_start.elapsed();
+    assert!(
+        virtual_elapsed >= Duration::from_secs(30) && virtual_elapsed <= Duration::from_secs(35),
+        "non-cooperative video must be stopped at the 30s grace boundary: {virtual_elapsed:?}"
     );
+    assert_eq!(r.error.as_ref().map(|e| e.code.as_str()), Some("CANCELLED"));
     o.shutdown().await.unwrap();
 }
 
@@ -2645,7 +2633,10 @@ async fn shutdown_completes_with_slow_tool() {
     cfg.runtime.shutdown_grace = Duration::from_secs(30);
     let o = build(cfg, &gw, vec![slow_tool]).await.unwrap();
     let sid = o.create_session(&alice(), "root").await.unwrap();
-    let turn = o.submit(&alice(), &sid, "render video".into()).await.unwrap();
+    let turn = o
+        .submit(&alice(), &sid, "render video".into())
+        .await
+        .unwrap();
     wait_until(|| runs.load(Ordering::SeqCst) == 1).await;
 
     let _ = turn;
@@ -2815,5 +2806,465 @@ async fn resumable_recovered_not_blocked() {
     );
     assert_eq!(mt_runs.load(Ordering::SeqCst), 0);
 
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn budget_expired_while_waiting() {
+    use orchestrator_agent_rs::test_support::GatewayError;
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    let (probe, _) = Probe::new("probe", ToolEffect::ReadOnly, Behavior::Echo);
+
+    // Step 1: chạy tool tạo kết quả từng phần.
+    gw.push_tool_calls("", vec![("p1", "probe", json!({"text": "partial-work"}))]);
+    // Step 2: gặp lỗi Timeout -> rơi vào waiting_retry (backoff 60s), vượt quá total_deadline_at (now + 30s).
+    gw.push_error(GatewayError::Timeout);
+    gw.push_text("must never be called");
+
+    let mut cfg = env.config(env.agents(&["probe"]));
+    cfg.llm.providers[0].limits.fast_retries = 0;
+    let o = build(cfg, &gw, vec![probe]).await.unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+
+    tokio::time::pause();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let budget = orchestrator_agent_rs::RunBudget {
+        started_at: now,
+        total_deadline_at: now + 30,
+        active_limit_secs: 300,
+        reserve_secs: 10,
+        max_tokens: None,
+        waited_secs: 0,
+    };
+    let turn = o
+        .submit_with_options(
+            &alice(),
+            &sid,
+            "run then expire while waiting".into(),
+            orchestrator_agent_rs::SubmitOptions {
+                budget: Some(budget),
+            },
+        )
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let r = loop {
+        let res = o.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+        if res.status.is_terminal() {
+            break res;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "budget_expired_while_waiting stuck: {res:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+
+    assert_eq!(r.status, RunStatus::Failed, "{r:?}");
+    assert_eq!(r.attempt, 0, "must not create a new attempt after deadline");
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("BUDGET_EXHAUSTED")
+    );
+    assert_eq!(r.partial_output.as_deref(), Some("probe:partial-work"));
+    assert_eq!(gw.call_count(), 2, "no third LLM call after budget expiry");
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn budget_kept_across_attempts() {
+    use orchestrator_agent_rs::test_support::GatewayError;
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    let (slow60, _) = Probe::new(
+        "slow60",
+        ToolEffect::ReadOnly,
+        Behavior::Ignore(Duration::from_secs(60)),
+    );
+    let (slow45, _) = Probe::new(
+        "slow45",
+        ToolEffect::ReadOnly,
+        Behavior::Ignore(Duration::from_secs(45)),
+    );
+
+    // Attempt 0: dùng 60s active time rồi gặp Timeout -> waiting_retry (backoff 60s).
+    gw.push_tool_calls("", vec![("s1", "slow60", json!({"text": "part1"}))]);
+    gw.push_error(GatewayError::Timeout);
+    // Attempt 1 (sau khi resume): dùng thêm 45s active time (tổng 105s >= 100s active_limit_secs).
+    gw.push_tool_calls("", vec![("s2", "slow45", json!({"text": "part2"}))]);
+    // Step kế tiếp của Attempt 1 phải bị ép text-only (capped) vì ngân sách không được cấp lại.
+    gw.push_text("capped summary after resume");
+
+    let mut cfg = env.config(env.agents(&["slow60", "slow45"]));
+    cfg.llm.providers[0].limits.fast_retries = 0;
+    cfg.runtime.tool_timeout = Duration::from_secs(200);
+    let o = build(cfg, &gw, vec![slow60, slow45]).await.unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+
+    tokio::time::pause();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let budget = orchestrator_agent_rs::RunBudget {
+        started_at: now,
+        total_deadline_at: now + 3600,
+        active_limit_secs: 100,
+        reserve_secs: 40,
+        max_tokens: None,
+        waited_secs: 0,
+    };
+    let turn = o
+        .submit_with_options(
+            &alice(),
+            &sid,
+            "keep budget across attempts".into(),
+            orchestrator_agent_rs::SubmitOptions {
+                budget: Some(budget),
+            },
+        )
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let r = loop {
+        let res = o.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+        if res.status.is_terminal() {
+            break res;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "budget_kept_across_attempts stuck: {res:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+
+    assert_eq!(r.status, RunStatus::Completed, "{r:?}");
+    assert_eq!(r.attempt, 1);
+    assert_eq!(r.output.as_deref(), Some("capped summary after resume"));
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("BUDGET_EXHAUSTED")
+    );
+    let reqs = gw.requests();
+    assert!(
+        reqs.last().unwrap().tools.is_empty(),
+        "final step on attempt 1 must have tools stripped due to cumulative active time"
+    );
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn two_hour_random_fault_job() {
+    assert_random_fault_job(false).await;
+}
+
+#[tokio::test]
+async fn random_fault_job_stops_at_budget_limit() {
+    assert_random_fault_job(true).await;
+}
+
+async fn assert_random_fault_job(short_budget: bool) {
+    use orchestrator_agent_rs::test_support::GatewayError;
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    // Mỗi lần gọi tool `work_chunk` tốn 10 phút (600s) giả lập.
+    let (work_chunk, chunk_runs) = Probe::new(
+        "work_chunk",
+        ToolEffect::ReadOnly,
+        Behavior::Ignore(Duration::from_secs(600)),
+    );
+
+    // Sinh kịch bản 2 giờ bằng PRNG tất định với seed cố định:
+    // pha trộn 12 bước gọi tool 10 phút (= 2 giờ chạy thực), lỗi mạng/timeout/rate-limit/stalled
+    // ngẫu nhiên, và tổng hợp kết quả khi chạm trần ngân sách 2 giờ.
+    let mut seed: u64 = 0x2026_1031_CAFE_BEEF;
+    let mut next_rand = || -> u64 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+
+    let mut fault_count = 0usize;
+    for step in 0..12 {
+        let roll = next_rand() % 5;
+        if roll == 0 && fault_count < 3 {
+            fault_count += 1;
+            match fault_count % 3 {
+                0 => gw.push_error(GatewayError::Timeout),
+                1 => gw.push_error(GatewayError::Stalled),
+                _ => gw.push_error(GatewayError::RateLimited {
+                    retry_after_secs: Some(120),
+                }),
+            }
+        }
+        gw.push_with(move |request| {
+            if request.tools.is_empty() {
+                ModelResponse {
+                    text: "two-hour job completed with summary".into(),
+                    finish_reason: "end_turn".into(),
+                    tool_calls: vec![],
+                    usage: None,
+                }
+            } else {
+                ModelResponse {
+                    text: String::new(),
+                    finish_reason: "tool_calls".into(),
+                    tool_calls: vec![orchestrator_agent_rs::test_support::ModelToolCall {
+                        id: format!("w{step}"),
+                        name: "work_chunk".into(),
+                        arguments: json!({"text":format!("chunk-{step}")}),
+                    }],
+                    usage: None,
+                }
+            }
+        });
+    }
+    gw.push_text("two-hour job completed with summary");
+
+    let mut cfg = env.config(env.agents(&["work_chunk"]));
+    cfg.llm.providers[0].limits.fast_retries = 1;
+    cfg.runtime.max_resume_attempts = 8;
+    cfg.runtime.tool_timeout = Duration::from_secs(1800);
+    cfg.runtime.supervisor_sweep = Duration::from_secs(30);
+    let o = build(cfg, &gw, vec![work_chunk]).await.unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+
+    tokio::time::pause();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    // Ngân sách 2 giờ chạy (7200s), tổng 24 giờ (86400s), dự trữ 10 phút (600s).
+    let budget = orchestrator_agent_rs::RunBudget {
+        started_at: now,
+        total_deadline_at: now + 24 * 3600,
+        active_limit_secs: if short_budget { 1200 } else { 2 * 3600 },
+        reserve_secs: 10 * 60,
+        max_tokens: None,
+        waited_secs: 0,
+    };
+    let turn = o
+        .submit_with_options(
+            &alice(),
+            &sid,
+            "run 2h job under random faults".into(),
+            orchestrator_agent_rs::SubmitOptions {
+                budget: Some(budget),
+            },
+        )
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let r = loop {
+        let res = o.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+        if res.status.is_terminal() {
+            break res;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "two_hour_random_fault_job stuck: {res:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    };
+
+    assert_eq!(r.status, RunStatus::Completed, "{r:?}");
+    assert!(
+        r.output
+            .as_deref()
+            .is_some_and(|s| s.contains("two-hour job completed")),
+        "expected final summary output, got: {r:?}"
+    );
+    if short_budget {
+        assert!(chunk_runs.load(Ordering::SeqCst) < 12);
+        assert_eq!(
+            r.error.as_ref().map(|e| e.code.as_str()),
+            Some("BUDGET_EXHAUSTED")
+        );
+    } else {
+        assert!(
+            chunk_runs.load(Ordering::SeqCst) >= 12,
+            "expected 12 ten-minute chunks"
+        );
+    }
+    // Đạt điều kiện: hoàn tất bình thường hoặc dừng có lý do BUDGET_EXHAUSTED (ánh xạ sang TaskStatus::Stopped).
+    if let Some(err) = &r.error {
+        assert_eq!(err.code, "BUDGET_EXHAUSTED");
+    }
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_preserves_resumable_invocation_for_restart() {
+    struct ShutdownVideo {
+        ids: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl HostTool for ShutdownVideo {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "shutdown_video".into(),
+                description: "video".into(),
+                input_schema: json!({"type":"object", "properties":{}, "additionalProperties":false}),
+                effect: ToolEffect::Resumable,
+            }
+        }
+        async fn execute(&self, ctx: ToolContext, _: Value) -> Result<ToolOutcome, ToolError> {
+            self.ids
+                .lock()
+                .unwrap()
+                .push(ctx.scope().invocation_id.clone());
+            if ctx.operation().current().await?.is_none() {
+                ctx.operation().begin(9999999999, "muse").await?;
+                ctx.cancel_token().cancelled().await;
+                return Err(ToolError {
+                    code: "CANCELLED".into(),
+                    message: "shutdown".into(),
+                });
+            }
+            Ok(ToolOutcome {
+                call_id: ctx.scope().tool_call_id.clone(),
+                content: "recovered video".into(),
+                metadata: Value::Null,
+            })
+        }
+    }
+    let env = Env::new();
+    let ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tool: Arc<dyn HostTool> = Arc::new(ShutdownVideo { ids: ids.clone() });
+    let gw = ScriptedGateway::new();
+    gw.push_tool_calls("", vec![("v1", "shutdown_video", json!({}))]);
+    gw.push_text("video completed after restart");
+    let mut cfg = env.config(env.agents(&["shutdown_video"]));
+    cfg.runtime.shutdown_drain = Duration::from_millis(10);
+    let o = build(cfg, &gw, vec![tool.clone()]).await.unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+    let turn = o.submit(&alice(), &sid, "render".into()).await.unwrap();
+    wait_until(|| !ids.lock().unwrap().is_empty()).await;
+    o.shutdown().await.unwrap();
+    let restored = build(env.config(env.agents(&["shutdown_video"])), &gw, vec![tool])
+        .await
+        .unwrap();
+    let result = wait_terminal(&restored, &sid, &turn.turn_id).await;
+    assert_eq!(result.status, RunStatus::Completed, "{result:?}");
+    let seen = ids.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        2,
+        "shutdown must replay the existing invocation"
+    );
+    assert_eq!(seen[0], seen[1], "recovery must keep the invocation ID");
+    restored.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_with_short_grace_does_not_wait_twenty_seconds() {
+    let env = Env::new();
+    let (tool, runs) = Probe::new(
+        "slow",
+        ToolEffect::Mutating,
+        Behavior::Ignore(Duration::from_secs(600)),
+    );
+    let gw = ScriptedGateway::new();
+    gw.push_tool_calls("", vec![("s1", "slow", json!({"text":"render"}))]);
+    let mut cfg = env.config(env.agents(&["slow"]));
+    cfg.runtime.shutdown_drain = Duration::from_millis(10);
+    cfg.runtime.shutdown_grace = Duration::from_secs(1);
+    cfg.runtime.tool_timeout = Duration::from_secs(1200);
+    let o = build(cfg, &gw, vec![tool]).await.unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+    o.submit(&alice(), &sid, "render".into()).await.unwrap();
+    wait_until(|| runs.load(Ordering::SeqCst) == 1).await;
+    tokio::time::pause();
+    o.shutdown()
+        .await
+        .expect("tool cancellation must fit the configured shutdown grace");
+}
+
+struct UncertainVideo {
+    panic: bool,
+}
+#[async_trait::async_trait]
+impl HostTool for UncertainVideo {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "uncertain_video".into(),
+            description: "video".into(),
+            input_schema: json!({"type":"object", "properties":{}, "additionalProperties":false}),
+            effect: ToolEffect::Resumable,
+        }
+    }
+    async fn execute(&self, ctx: ToolContext, _: Value) -> Result<ToolOutcome, ToolError> {
+        ctx.operation().begin(9999999999, "muse").await?;
+        if self.panic {
+            panic!("lost provider connection");
+        }
+        Err(ToolError {
+            code: "TOOL_OUTCOME_UNKNOWN".into(),
+            message: "needs reconciliation".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn interrupted_operation_is_protected_until_reconciled() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    gw.push_tool_calls("", vec![("v1", "uncertain_video", json!({}))]);
+    let o = build(
+        env.config(env.agents(&["uncertain_video"])),
+        &gw,
+        vec![Arc::new(UncertainVideo { panic: false })],
+    )
+    .await
+    .unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+    let turn = o.submit(&alice(), &sid, "render".into()).await.unwrap();
+    assert_eq!(
+        wait_terminal(&o, &sid, &turn.turn_id).await.status,
+        RunStatus::Interrupted
+    );
+    let ops = o.list_tool_operations().await.unwrap();
+    assert_eq!(ops.len(), 1);
+    assert!(
+        ops[0].root_has_active_work,
+        "cleanup must retain a recoverable interrupted turn"
+    );
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn resumable_panic_with_open_operation_does_not_settle_as_failure() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    gw.push_tool_calls("", vec![("v1", "uncertain_video", json!({}))]);
+    gw.push_text("must not continue with a new invocation");
+    let o = build(
+        env.config(env.agents(&["uncertain_video"])),
+        &gw,
+        vec![Arc::new(UncertainVideo { panic: true })],
+    )
+    .await
+    .unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+    let turn = o.submit(&alice(), &sid, "render".into()).await.unwrap();
+    let r = wait_terminal(&o, &sid, &turn.turn_id).await;
+    assert_eq!(r.status, RunStatus::Interrupted, "{r:?}");
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("TOOL_OUTCOME_UNKNOWN")
+    );
+    assert_eq!(
+        gw.call_count(),
+        1,
+        "model must not retry an open operation with a fresh tool call"
+    );
     o.shutdown().await.unwrap();
 }

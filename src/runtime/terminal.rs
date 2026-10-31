@@ -47,17 +47,16 @@ impl AgentRuntime {
         let code = error.code();
         let base_message = error.message();
         let class = error.classify();
-        let run_meta = self.store.load_run(run_id).await.ok().flatten();
+        let run_meta = crate::store::settle_sql(self.store.load_run(run_id))
+            .await
+            .ok()
+            .flatten();
         let step_num = match &run_meta {
-            Some(r) => self
-                .store
-                .turn_steps(&r.session_id, &r.turn_id)
+            Some(r) => crate::store::settle_sql(self.store.turn_steps(&r.session_id, &r.turn_id))
                 .await
                 .ok()
                 .map(|s| s.saturating_add(1)),
-            None => self
-                .store
-                .run_steps(run_id)
+            None => crate::store::settle_sql(self.store.run_steps(run_id))
                 .await
                 .ok()
                 .map(|s| s.saturating_add(1)),
@@ -96,13 +95,12 @@ impl AgentRuntime {
                         .finish(run_id, RunStatus::Failed, CODE_EXHAUSTED, &message)
                         .await;
                 }
-                let retry_idx = self
-                    .store
-                    .turn_retry_attempts(&r.session_id, &r.turn_id)
-                    .await
-                    .unwrap_or(r.resume_attempt) as usize;
-                let base_secs =
-                    DURABLE_BACKOFF_SECS[retry_idx.min(DURABLE_BACKOFF_SECS.len() - 1)];
+                let retry_idx = crate::store::settle_sql(
+                    self.store.turn_retry_attempts(&r.session_id, &r.turn_id),
+                )
+                .await
+                .unwrap_or(r.resume_attempt) as usize;
+                let base_secs = DURABLE_BACKOFF_SECS[retry_idx.min(DURABLE_BACKOFF_SECS.len() - 1)];
                 let wait_secs = match class {
                     FailureClass::Retryable {
                         retry_after: Some(d),
@@ -144,17 +142,20 @@ impl AgentRuntime {
         retry_reason: &str,
         next_attempt_at: Option<i64>,
     ) -> Settlement {
-        match self
-            .store
-            .suspend_run(run_id, status, code, message, retry_reason, next_attempt_at)
-            .await
+        match crate::store::settle_sql(self.store.suspend_run(
+            run_id,
+            status,
+            code,
+            message,
+            retry_reason,
+            next_attempt_at,
+        ))
+        .await
         {
             Ok(committed) => {
                 info!(
                     status = status.as_str(),
-                    code,
-                    next_attempt_at,
-                    "run suspended to waiting state"
+                    code, next_attempt_at, "run suspended to waiting state"
                 );
                 if committed {
                     self.emitter
@@ -184,6 +185,17 @@ impl AgentRuntime {
         .await
     }
 
+    /// Supervisor hủy cứng một run khi quá `deadline + reserve` của ngân sách.
+    pub(crate) async fn hard_stop_budget(&self, run_id: &str) -> Settlement {
+        self.finish(
+            run_id,
+            RunStatus::Failed,
+            crate::types::CODE_BUDGET_EXHAUSTED,
+            "the run exceeded its execution budget and reserve",
+        )
+        .await
+    }
+
     pub(super) async fn finish(
         &self,
         run_id: &str,
@@ -191,10 +203,11 @@ impl AgentRuntime {
         code: &str,
         message: &str,
     ) -> Settlement {
-        match self
-            .store
-            .finish_run_without_final(run_id, status, code, message)
-            .await
+        match crate::store::settle_sql(
+            self.store
+                .finish_run_without_final(run_id, status, code, message),
+        )
+        .await
         {
             Ok(committed) => {
                 info!(

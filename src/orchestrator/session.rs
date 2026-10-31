@@ -11,7 +11,7 @@ use crate::skill::{SkillManager, SkillReloadReport};
 use crate::tool::ToolDescriptor;
 use crate::types::{
     AcceptedTurn, AgentResult, CallerContext, MessageView, Page, PageRequest, RunStatus,
-    SessionPolicy,
+    SessionPolicy, SubmitOptions,
 };
 
 use super::builder::{validate_and_load_agents, ValidatedAgents};
@@ -160,9 +160,11 @@ impl Orchestrator {
                 "agent cannot be used as a root session",
             ));
         }
-        self.store
-            .create_root_session_with(caller, &agent.id, &policy)
-            .await
+        crate::store::settle_sql(
+            self.store
+                .create_root_session_with(caller, &agent.id, &policy),
+        )
+        .await
     }
 
     /// Trả sau khi input + run claim đã commit; không đợi LLM. `SESSION_BUSY` nếu session
@@ -173,6 +175,18 @@ impl Orchestrator {
         session_id: &str,
         text: String,
     ) -> Result<AcceptedTurn, OrchestratorError> {
+        self.submit_with_options(caller, session_id, text, SubmitOptions::default())
+            .await
+    }
+
+    /// Như [`Self::submit`], kèm [`SubmitOptions`] (ví dụ ngân sách `RunBudget`).
+    pub async fn submit_with_options(
+        &self,
+        caller: &CallerContext,
+        session_id: &str,
+        text: String,
+        options: SubmitOptions,
+    ) -> Result<AcceptedTurn, OrchestratorError> {
         // Giữ cổng admission tới khi commit xong: shutdown không đóng giữa chừng và submit sau
         // shutdown bị từ chối trước commit.
         let _gate = self.supervisor.admission().await?;
@@ -182,10 +196,16 @@ impl Orchestrator {
                 "text must not be empty",
             ));
         }
-        let turn = self
-            .store
-            .admit_turn(caller, session_id, &text, |agent_id| self.route(agent_id))
-            .await?;
+        let turn = crate::store::settle_sql(self.store.admit_turn_with_artifacts(
+            caller,
+            session_id,
+            &text,
+            |agent_id| self.route(agent_id),
+            &[],
+            0,
+            options.budget.as_ref(),
+        ))
+        .await?;
         self.supervisor.notify_admitted();
         Ok(turn)
     }
@@ -199,6 +219,28 @@ impl Orchestrator {
         caller: &CallerContext,
         session_id: &str,
         inputs: Vec<crate::artifact::ArtifactInput>,
+        build_text: F,
+    ) -> Result<(AcceptedTurn, Vec<crate::types::ArtifactRef>), OrchestratorError>
+    where
+        F: FnOnce(&[crate::types::ArtifactRef]) -> String,
+    {
+        self.submit_with_artifacts_and_options(
+            caller,
+            session_id,
+            inputs,
+            SubmitOptions::default(),
+            build_text,
+        )
+        .await
+    }
+
+    /// Như [`Self::submit_with_artifacts`], kèm [`SubmitOptions`].
+    pub async fn submit_with_artifacts_and_options<F>(
+        &self,
+        caller: &CallerContext,
+        session_id: &str,
+        inputs: Vec<crate::artifact::ArtifactInput>,
+        options: SubmitOptions,
         build_text: F,
     ) -> Result<(AcceptedTurn, Vec<crate::types::ArtifactRef>), OrchestratorError>
     where
@@ -251,17 +293,16 @@ impl Orchestrator {
             .iter()
             .map(|s| (s.reference.clone(), s.storage_key.clone()))
             .collect();
-        let turn = match self
-            .store
-            .admit_turn_with_artifacts(
-                caller,
-                session_id,
-                &text,
-                |agent_id| self.route(agent_id),
-                &staged_pairs,
-                self.artifacts.workspace_quota_bytes(),
-            )
-            .await
+        let turn = match crate::store::settle_sql(self.store.admit_turn_with_artifacts(
+            caller,
+            session_id,
+            &text,
+            |agent_id| self.route(agent_id),
+            &staged_pairs,
+            self.artifacts.workspace_quota_bytes(),
+            options.budget.as_ref(),
+        ))
+        .await
         {
             Ok(turn) => turn,
             Err(err) => {
@@ -302,9 +343,13 @@ impl Orchestrator {
         page: PageRequest,
     ) -> Result<Page<MessageView>, OrchestratorError> {
         self.ensure_open()?;
-        self.store
-            .history_page(caller, session_id, page, self.runtime.page_size)
-            .await
+        crate::store::settle_sql(self.store.history_page(
+            caller,
+            session_id,
+            page,
+            self.runtime.page_size,
+        ))
+        .await
     }
 
     /// Chặn admission mới; history vẫn đọc được. Run đang chạy không bị hủy. Idempotent.
@@ -314,7 +359,7 @@ impl Orchestrator {
         session_id: &str,
     ) -> Result<(), OrchestratorError> {
         self.ensure_open()?;
-        self.store.archive_session(caller, session_id).await?;
+        crate::store::settle_sql(self.store.archive_session(caller, session_id)).await?;
         self.emitter
             .committed_session(
                 session_id,
@@ -334,18 +379,12 @@ impl Orchestrator {
         session_id: &str,
     ) -> Result<(), OrchestratorError> {
         let _gate = self.supervisor.admission().await?;
-        self.store.check_scope(caller, session_id).await?;
-        let route = |agent_id: &str| self.route(agent_id);
-        let replay_safe = |tool: &str| self.replay_safe.contains(tool);
-        let policy = crate::store::RecoveryPolicy {
-            max_resume_attempt: self.runtime.max_resume_attempts,
-            route: &route,
-            replay_safe: &replay_safe,
-        };
-        let resumed = self
-            .store
-            .resume_waiting_session(session_id, &policy)
-            .await?;
+        let resumed = crate::store::settle_sql(async {
+            self.store.check_scope(caller, session_id).await?;
+            let policy = self.recovery.policy();
+            self.store.resume_waiting_session(session_id, &policy).await
+        })
+        .await?;
         if resumed == 0 {
             return Err(OrchestratorError::new(
                 ErrorCode::InvalidInput,
@@ -366,25 +405,28 @@ impl Orchestrator {
         session_id: &str,
     ) -> Result<(), OrchestratorError> {
         self.ensure_open()?;
-        self.store.check_scope(caller, session_id).await?;
-        // Parent trước child: parent dừng trước nên không ghi kết quả "child bị hủy" giả.
-        for run_id in self.store.active_run_family(session_id).await? {
-            if !self.supervisor.cancel_run(&run_id) {
-                // Claim chưa có worker: ghi terminal trực tiếp; nếu worker vừa spawn thì hủy nốt.
-                self.store
-                    .finish_run_without_final(
-                        &run_id,
-                        RunStatus::Cancelled,
-                        "CANCELLED",
-                        "the run was cancelled",
-                    )
-                    .await?;
-                self.supervisor.cancel_run(&run_id);
-                self.emitter
-                    .run_terminal(&run_id, RunStatus::Cancelled, Some("CANCELLED"))
-                    .await;
+        crate::store::settle_sql(async {
+            self.store.check_scope(caller, session_id).await?;
+            // Parent trước child: parent dừng trước nên không ghi kết quả "child bị hủy" giả.
+            for run_id in self.store.active_run_family(session_id).await? {
+                if !self.supervisor.cancel_run(&run_id) {
+                    // Claim chưa có worker: ghi terminal trực tiếp; nếu worker vừa spawn thì hủy nốt.
+                    self.store
+                        .finish_run_without_final(
+                            &run_id,
+                            RunStatus::Cancelled,
+                            "CANCELLED",
+                            "the run was cancelled",
+                        )
+                        .await?;
+                    self.supervisor.cancel_run(&run_id);
+                    self.emitter
+                        .run_terminal(&run_id, RunStatus::Cancelled, Some("CANCELLED"))
+                        .await;
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 }

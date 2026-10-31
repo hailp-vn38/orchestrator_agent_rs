@@ -22,7 +22,7 @@ use crate::subagent::TaskManager;
 use crate::supervisor::{AdmissionSignal, Supervisor};
 use crate::tool::{validate_descriptor, HostTool, ToolServices};
 
-use super::{route_of, LiveAgentCatalog, Orchestrator, OrchestratorBuilder};
+use super::{route_of, LiveAgentCatalog, Orchestrator, OrchestratorBuilder, RecoveryContext};
 
 pub(super) struct ValidatedAgents {
     pub agents: HashMap<String, AgentDefinition>,
@@ -373,6 +373,11 @@ impl OrchestratorBuilder {
             fast_retries,
             None,
         )));
+        let recovery = Arc::new(RecoveryContext::new(
+            Arc::clone(&catalog),
+            replay_safe,
+            self.config.runtime.max_resume_attempts,
+        ));
         let runtime = AgentRuntime::new(
             store.clone(),
             gateway,
@@ -391,9 +396,7 @@ impl OrchestratorBuilder {
         let supervisor = Supervisor::start(
             store.clone(),
             runtime,
-            Arc::clone(&catalog),
-            Arc::new(replay_safe.clone()),
-            self.config.runtime.max_resume_attempts,
+            Arc::clone(&recovery),
             self.config.runtime.supervisor_sweep,
             self.config.runtime.max_concurrent_root_runs,
             owner_lock,
@@ -417,7 +420,7 @@ impl OrchestratorBuilder {
             artifacts,
             supervisor,
             runtime: self.config.runtime,
-            replay_safe,
+            recovery,
             limits,
             feed,
             emitter,

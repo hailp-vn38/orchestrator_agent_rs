@@ -1,11 +1,12 @@
 //! Admission của turn (Root) và child turn (delegation depth 1).
 
 use super::artifact::PublishError;
-use super::codec::{db, new_id, parse_policy, policy_json, text_json};
+use super::codec::{budget_json, db, new_id, parse_budget, parse_policy, policy_json, text_json};
+use super::run::{turn_active_secs_on, turn_tokens_on};
 use super::types::{ChildAdmission, ChildAdmitError, ChildTarget, RunRoute};
 use super::SessionStore;
 use crate::error::{ErrorCode, OrchestratorError};
-use crate::types::{AcceptedTurn, ArtifactRef, CallerContext, SessionPolicy};
+use crate::types::{AcceptedTurn, ArtifactRef, CallerContext, RunBudget, SessionPolicy};
 use sqlx::Row;
 
 enum AdmitInTxError {
@@ -16,6 +17,7 @@ enum AdmitInTxError {
 impl SessionStore {
     /// Một transaction ngắn: cấp sequence, claim run `running` (partial unique index) và
     /// persist user message. Chỉ trả `AcceptedTurn` sau commit; không gọi LLM ở đây.
+    #[cfg(test)]
     pub(crate) async fn admit_turn(
         &self,
         caller: &CallerContext,
@@ -23,12 +25,13 @@ impl SessionStore {
         text: &str,
         resolve: impl Fn(&str) -> Option<RunRoute>,
     ) -> Result<AcceptedTurn, OrchestratorError> {
-        self.admit_turn_with_artifacts(caller, session_id, text, resolve, &[], 0)
+        self.admit_turn_with_artifacts(caller, session_id, text, resolve, &[], 0, None)
             .await
     }
 
     /// Admit turn và đồng thời INSERT danh sách `staged` artifacts vào đúng `(session_id, turn_id)`
     /// vừa cấp phát trong cùng một write transaction SQLite.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn admit_turn_with_artifacts(
         &self,
         caller: &CallerContext,
@@ -37,10 +40,14 @@ impl SessionStore {
         resolve: impl Fn(&str) -> Option<RunRoute>,
         staged: &[(ArtifactRef, String)],
         workspace_quota_bytes: u64,
+        budget: Option<&RunBudget>,
     ) -> Result<AcceptedTurn, OrchestratorError> {
+        let now = self.now_secs();
         let mut tx = self.pool.begin().await.map_err(db("begin admission"))?;
         let (turn, _run_id) =
-            match Self::admit_turn_in_tx(&mut tx, caller, session_id, text, resolve).await {
+            match Self::admit_turn_in_tx(&mut tx, caller, session_id, text, resolve, now, budget)
+                .await
+            {
                 Ok(pair) => pair,
                 Err(AdmitInTxError::Rejected) => {
                     let _ = tx.rollback().await;
@@ -103,6 +110,8 @@ impl SessionStore {
         session_id: &str,
         text: &str,
         resolve: impl Fn(&str) -> Option<RunRoute>,
+        now: i64,
+        budget: Option<&RunBudget>,
     ) -> Result<(AcceptedTurn, String), AdmitInTxError> {
         let claimed = sqlx::query(
             "UPDATE sessions SET next_sequence = next_sequence + 1, \
@@ -146,10 +155,12 @@ impl SessionStore {
 
         let run_id = new_id();
         let turn_id = new_id();
+        let run_started_at = budget.map_or(now, |b| b.started_at);
+        let serialized_budget = budget.map(budget_json);
         let inserted = sqlx::query(
             "INSERT INTO agent_runs(id, session_id, agent_id, turn_id, resume_attempt, \
-             provider_id, model_id, provider_config_fingerprint, status) \
-             VALUES(?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, 'running')",
+             provider_id, model_id, provider_config_fingerprint, status, started_at, budget_json) \
+             VALUES(?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, 'running', ?8, ?9)",
         )
         .bind(&run_id)
         .bind(session_id)
@@ -158,6 +169,8 @@ impl SessionStore {
         .bind(&route.provider_id)
         .bind(&route.model_id)
         .bind(&route.fingerprint)
+        .bind(run_started_at)
+        .bind(serialized_budget)
         .execute(&mut **tx)
         .await;
         match inserted {
@@ -204,12 +217,13 @@ impl SessionStore {
         prompt: &str,
         resolve: impl Fn(&str) -> Option<RunRoute>,
     ) -> Result<ChildAdmission, ChildAdmitError> {
+        let now = self.now_secs();
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(db("begin child admission"))?;
-        match admit_child_inner(&mut tx, parent_invocation_id, target, prompt, resolve).await {
+        match admit_child_inner(&mut tx, parent_invocation_id, target, prompt, resolve, now).await {
             Ok(admission) => {
                 tx.commit().await.map_err(db("commit child admission"))?;
                 Ok(admission)
@@ -250,6 +264,7 @@ pub(super) async fn admit_child_inner(
     target: ChildTarget<'_>,
     prompt: &str,
     resolve: impl Fn(&str) -> Option<RunRoute>,
+    now: i64,
 ) -> Result<ChildAdmission, ChildAdmitError> {
     let link = sqlx::query(
         "UPDATE tool_invocations SET status = status WHERE id = ?1 \
@@ -282,15 +297,50 @@ pub(super) async fn admit_child_inner(
         });
     }
 
-    let running: Option<i64> =
-        sqlx::query_scalar("SELECT 1 FROM agent_runs WHERE id = ?1 AND status = 'running'")
-            .bind(&run_id)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(db("check parent run"))?;
-    if running.is_none() {
+    let parent_run = sqlx::query(
+        "SELECT turn_id, budget_json FROM agent_runs WHERE id = ?1 AND status = 'running'",
+    )
+    .bind(&run_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(db("check parent run"))?;
+    let Some(parent_run) = parent_run else {
         return Err(ChildAdmitError::ParentUnavailable);
-    }
+    };
+    let parent_turn_id: String = parent_run
+        .try_get("turn_id")
+        .map_err(db("read parent turn"))?;
+    let parent_budget_raw: Option<String> = parent_run
+        .try_get("budget_json")
+        .map_err(db("read parent budget"))?;
+    let child_budget_json = if let Some(parent_budget) = parse_budget(parent_budget_raw.as_deref())
+    {
+        let used_active = turn_active_secs_on(
+            &mut *conn,
+            &parent_session,
+            &parent_turn_id,
+            &parent_budget,
+            now,
+        )
+        .await?;
+        let used_tokens = turn_tokens_on(&mut *conn, &parent_session, &parent_turn_id).await?;
+        let remaining_active = parent_budget.active_limit_secs.saturating_sub(used_active);
+        let child_budget = RunBudget {
+            started_at: now,
+            total_deadline_at: parent_budget
+                .total_deadline_at
+                .saturating_sub(parent_budget.reserve_secs.min(i64::MAX as u64) as i64),
+            active_limit_secs: remaining_active.saturating_sub(parent_budget.reserve_secs),
+            reserve_secs: parent_budget.reserve_secs,
+            max_tokens: parent_budget
+                .max_tokens
+                .map(|m| m.saturating_sub(used_tokens)),
+            waited_secs: 0,
+        };
+        Some(budget_json(&child_budget))
+    } else {
+        None
+    };
     let parent = sqlx::query(
         "SELECT parent_session_id, owner_id, workspace_id, permissions_json \
          FROM sessions WHERE id = ?1",
@@ -397,8 +447,8 @@ pub(super) async fn admit_child_inner(
     let turn_id = new_id();
     let inserted = sqlx::query(
         "INSERT INTO agent_runs(id, session_id, agent_id, turn_id, resume_attempt, \
-         provider_id, model_id, provider_config_fingerprint, status) \
-         VALUES(?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, 'running')",
+         provider_id, model_id, provider_config_fingerprint, status, started_at, budget_json) \
+         VALUES(?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, 'running', ?8, ?9)",
     )
     .bind(new_id())
     .bind(&child_session)
@@ -407,6 +457,8 @@ pub(super) async fn admit_child_inner(
     .bind(&route.provider_id)
     .bind(&route.model_id)
     .bind(&route.fingerprint)
+    .bind(now)
+    .bind(child_budget_json)
     .execute(&mut *conn)
     .await;
     match inserted {
