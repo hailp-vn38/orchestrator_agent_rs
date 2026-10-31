@@ -72,6 +72,14 @@ impl SessionStore {
         .execute(&mut *tx)
         .await
         .map_err(db("delete llm attempts"))?;
+        sqlx::query(&format!(
+            "DELETE FROM tool_operations WHERE invocation_id IN \
+             (SELECT id FROM tool_invocations WHERE session_id IN {FAMILY})"
+        ))
+        .bind(root_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db("delete tool operations"))?;
         for table in ["tool_invocations", "messages", "agent_runs"] {
             sqlx::query(&format!("DELETE FROM {table} WHERE session_id IN {FAMILY}"))
                 .bind(root_id)

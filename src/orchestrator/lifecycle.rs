@@ -174,4 +174,30 @@ impl Orchestrator {
         let def = guard.get_agent(agent_id)?;
         route_of_live(def, &guard.fingerprints)
     }
+
+    /// Liệt kê mọi bản ghi `tool_operations` để khôi phục `job_sessions` hoặc dọn dẹp.
+    pub async fn list_tool_operations(
+        &self,
+    ) -> Result<Vec<crate::tool::ToolOperationSummary>, OrchestratorError> {
+        self.ensure_open()?;
+        self.store.list_tool_operations().await
+    }
+
+    /// Đánh dấu `remote_deleted_at` cho mọi `tool_operations` có cùng `remote_session_id`.
+    pub async fn mark_remote_session_deleted(
+        &self,
+        remote_session_id: &str,
+    ) -> Result<u64, OrchestratorError> {
+        self.ensure_open()?;
+        self.store
+            .mark_remote_session_deleted(remote_session_id)
+            .await
+    }
+
+    /// Quét các `tool_operations` quá `deadline_at` (`expired`) hoặc có invocation đã kết thúc
+    /// (`failed`).
+    pub async fn sweep_stale_tool_operations(&self) -> Result<u64, OrchestratorError> {
+        self.ensure_open()?;
+        self.store.sweep_stale_tool_operations().await
+    }
 }

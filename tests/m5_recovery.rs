@@ -2664,3 +2664,156 @@ async fn shutdown_completes_with_slow_tool() {
         "interrupted"
     );
 }
+
+#[tokio::test]
+async fn resumable_recovered_not_blocked() {
+    struct ResumableProbe {
+        seen_invocation_ids: Arc<std::sync::Mutex<Vec<String>>>,
+        seen_op_statuses: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HostTool for ResumableProbe {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "resumable_tool".into(),
+                description: "resumable probe".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"],
+                    "additionalProperties": false
+                }),
+                effect: ToolEffect::Resumable,
+            }
+        }
+
+        async fn execute(&self, ctx: ToolContext, args: Value) -> Result<ToolOutcome, ToolError> {
+            self.seen_invocation_ids
+                .lock()
+                .unwrap()
+                .push(ctx.scope().invocation_id.clone());
+            let cur = ctx.operation().current().await?;
+            self.seen_op_statuses
+                .lock()
+                .unwrap()
+                .push(cur.as_ref().map(|op| op.status.as_str().to_string()));
+            if cur.is_none() {
+                ctx.operation().begin(9999999999, "muse").await?;
+            }
+            ctx.operation()
+                .advance(orchestrator_agent_rs::OperationUpdate {
+                    status: Some(orchestrator_agent_rs::ToolOperationStatus::Committed),
+                    result_json: Some(json!({"ok": true}).to_string()),
+                    ..Default::default()
+                })
+                .await?;
+            let text = args["text"].as_str().unwrap_or_default();
+            Ok(ToolOutcome {
+                call_id: ctx.scope().tool_call_id.clone(),
+                content: format!("resumed:{text}"),
+                metadata: Value::Null,
+            })
+        }
+    }
+
+    let env = Env::new();
+    let seen_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_statuses = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let res_tool: Arc<dyn HostTool> = Arc::new(ResumableProbe {
+        seen_invocation_ids: seen_ids.clone(),
+        seen_op_statuses: seen_statuses.clone(),
+    });
+    let (mt_tool, mt_runs) = Probe::new("mt", ToolEffect::Mutating, Behavior::Echo);
+
+    let (sid_res, fp) = fresh_session(
+        &env,
+        vec![res_tool.clone(), mt_tool.clone()],
+        &["resumable_tool", "mt"],
+    )
+    .await;
+    let sid_mt = {
+        let gw = ScriptedGateway::new();
+        let o = build(
+            env.config(env.agents(&["resumable_tool", "mt"])),
+            &gw,
+            vec![res_tool.clone(), mt_tool.clone()],
+        )
+        .await
+        .unwrap();
+        let sid = o.create_session(&alice(), "root").await.unwrap();
+        o.shutdown().await.unwrap();
+        sid
+    };
+
+    {
+        let mut c = env.sql().await;
+        // Session 1: invocation đang `running` với tool Resumable + dòng `tool_operations` ở `running`.
+        let mut s1 = Seed::new(&mut c, &sid_res);
+        s1.user("render video").await;
+        s1.run("r-res-0", "turn-res", 0, &fp, "running", None).await;
+        let a1 = s1
+            .assistant_calls("r-res-0", &[("call-res", "resumable_tool")])
+            .await;
+        s1.invocation(
+            "r-res-0",
+            &a1,
+            "inv-res-1",
+            "call-res",
+            "resumable_tool",
+            "running",
+        )
+        .await;
+        s1.finish().await;
+        sqlx::query(
+            "INSERT INTO tool_operations(id, invocation_id, provider_ref, status, deadline_at) \
+             VALUES('op-res-1', 'inv-res-1', 'muse', 'running', 9999999999)",
+        )
+        .execute(&mut c)
+        .await
+        .unwrap();
+
+        // Session 2: invocation đang `running` với tool Mutating.
+        let mut s2 = Seed::new(&mut c, &sid_mt);
+        s2.user("mutate state").await;
+        s2.run("r-mt-0", "turn-mt", 0, &fp, "running", None).await;
+        let a2 = s2.assistant_calls("r-mt-0", &[("call-mt", "mt")]).await;
+        s2.invocation("r-mt-0", &a2, "inv-mt-1", "call-mt", "mt", "running")
+            .await;
+        s2.finish().await;
+    }
+
+    let gw = ScriptedGateway::new();
+    gw.push_text("video resumed and finished");
+    let o = build(
+        env.config(env.agents(&["resumable_tool", "mt"])),
+        &gw,
+        vec![res_tool, mt_tool],
+    )
+    .await
+    .unwrap();
+
+    // Resumable được tự động phục hồi và gọi lại với cùng `inv-res-1`.
+    let r_res = wait_terminal(&o, &sid_res, "turn-res").await;
+    assert_eq!(r_res.status, RunStatus::Completed, "{r_res:?}");
+    assert_eq!(r_res.attempt, 1);
+    assert_eq!(
+        seen_ids.lock().unwrap().as_slice(),
+        &["inv-res-1".to_string()]
+    );
+    assert_eq!(
+        seen_statuses.lock().unwrap().as_slice(),
+        &[Some("running".to_string())]
+    );
+
+    // Mutating vẫn bị chặn với `TOOL_OUTCOME_UNKNOWN`.
+    let r_mt = o.result(&alice(), &sid_mt, "turn-mt").await.unwrap();
+    assert_eq!(r_mt.status, RunStatus::Interrupted);
+    assert_eq!(
+        r_mt.error.as_ref().map(|e| e.code.as_str()),
+        Some("TOOL_OUTCOME_UNKNOWN")
+    );
+    assert_eq!(mt_runs.load(Ordering::SeqCst), 0);
+
+    o.shutdown().await.unwrap();
+}

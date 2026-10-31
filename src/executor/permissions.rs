@@ -48,7 +48,12 @@ impl Effective {
 pub(crate) fn replay_safe_names(tools: &BTreeMap<String, Arc<dyn HostTool>>) -> BTreeSet<String> {
     let mut names: BTreeSet<String> = tools
         .iter()
-        .filter(|(_, t)| t.descriptor().effect == ToolEffect::ReadOnly)
+        .filter(|(_, t)| {
+            matches!(
+                t.descriptor().effect,
+                ToolEffect::ReadOnly | ToolEffect::Resumable
+            )
+        })
         .map(|(name, _)| name.clone())
         .collect();
     names.insert(SKILL_TOOL.to_owned());

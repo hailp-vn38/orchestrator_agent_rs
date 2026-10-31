@@ -25,6 +25,96 @@ pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &["subagent", "skill", "artifact
 pub enum ToolEffect {
     ReadOnly,
     Mutating,
+    Resumable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOperationStatus {
+    Submitting,
+    Running,
+    Downloading,
+    Committed,
+    Cancelled,
+    Failed,
+    Expired,
+}
+
+impl ToolOperationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Submitting => "submitting",
+            Self::Running => "running",
+            Self::Downloading => "downloading",
+            Self::Committed => "committed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "submitting" => Some(Self::Submitting),
+            "running" => Some(Self::Running),
+            "downloading" => Some(Self::Downloading),
+            "committed" => Some(Self::Committed),
+            "cancelled" => Some(Self::Cancelled),
+            "failed" => Some(Self::Failed),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::Submitting | Self::Running | Self::Downloading)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolOperation {
+    pub id: String,
+    pub invocation_id: String,
+    pub provider_ref: Option<String>,
+    pub account_key: Option<String>,
+    pub remote_session_id: Option<String>,
+    pub continuation_key: Option<String>,
+    pub batch_index: u32,
+    pub repairs_used: u32,
+    pub batch_paths_json: Option<String>,
+    pub user_turns_before: Option<u32>,
+    pub request_json: Option<String>,
+    pub status: ToolOperationStatus,
+    pub artifact_ids_json: Option<String>,
+    pub result_json: Option<String>,
+    pub remote_deleted_at: Option<i64>,
+    pub last_activity_at: i64,
+    pub deadline_at: i64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OperationUpdate {
+    pub status: Option<ToolOperationStatus>,
+    pub provider_ref: Option<String>,
+    pub account_key: Option<String>,
+    pub remote_session_id: Option<String>,
+    pub continuation_key: Option<String>,
+    pub batch_index: Option<u32>,
+    pub repairs_used: Option<u32>,
+    pub batch_paths_json: Option<String>,
+    pub user_turns_before: Option<u32>,
+    pub request_json: Option<String>,
+    pub artifact_ids_json: Option<String>,
+    pub result_json: Option<String>,
+    pub remote_deleted_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolOperationSummary {
+    pub operation: ToolOperation,
+    pub invocation_status: String,
+    pub root_session_id: String,
+    pub root_has_active_work: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +269,11 @@ impl ToolContext {
         ToolCheckpoint { ctx: self }
     }
 
+    /// Chỉ đọc và ghi bản ghi `tool_operations` của đúng invocation hiện tại.
+    pub fn operation(&self) -> ToolOperationHandle<'_> {
+        ToolOperationHandle { ctx: self }
+    }
+
     /// Progress ephemeral, best-effort, không chặn và không ghi SQLite. Bị cắt ở
     /// `MAX_PROGRESS_BYTES`, bị throttle theo `RuntimeConfig::progress_min_interval` và đi vào
     /// event feed (`tool.progress`, secret đã cấu hình bị che) cùng tracing.
@@ -327,6 +422,61 @@ impl ToolCheckpoint<'_> {
                 .await;
         }
         Ok(())
+    }
+}
+
+/// Handle đọc/ghi bản ghi `tool_operations` gắn với [`ToolContext`].
+#[derive(Debug, Clone, Copy)]
+pub struct ToolOperationHandle<'a> {
+    ctx: &'a ToolContext,
+}
+
+impl ToolOperationHandle<'_> {
+    pub fn now_secs(&self) -> i64 {
+        if let Some(ToolServices { store, .. }) = &self.ctx.services {
+            store.now_secs()
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        }
+    }
+
+    pub async fn current(&self) -> Result<Option<ToolOperation>, ToolError> {
+        let Some(ToolServices { store, .. }) = &self.ctx.services else {
+            return Err(ToolError {
+                code: CODE_ARTIFACT_UNAVAILABLE.into(),
+                message: "operation store is not available in this context".into(),
+            });
+        };
+        store.current_operation(&self.ctx.scope).await
+    }
+
+    pub async fn begin(
+        &self,
+        deadline_at: i64,
+        provider_ref: &str,
+    ) -> Result<ToolOperation, ToolError> {
+        let Some(ToolServices { store, .. }) = &self.ctx.services else {
+            return Err(ToolError {
+                code: CODE_ARTIFACT_UNAVAILABLE.into(),
+                message: "operation store is not available in this context".into(),
+            });
+        };
+        store
+            .begin_operation(&self.ctx.scope, deadline_at, provider_ref)
+            .await
+    }
+
+    pub async fn advance(&self, update: OperationUpdate) -> Result<(), ToolError> {
+        let Some(ToolServices { store, .. }) = &self.ctx.services else {
+            return Err(ToolError {
+                code: CODE_ARTIFACT_UNAVAILABLE.into(),
+                message: "operation store is not available in this context".into(),
+            });
+        };
+        store.advance_operation(&self.ctx.scope, &update).await
     }
 }
 

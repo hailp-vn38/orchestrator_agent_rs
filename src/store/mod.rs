@@ -17,6 +17,7 @@ mod recovery;
 mod run;
 mod session;
 mod tool_checkpoint;
+mod tool_operation;
 mod transcript;
 mod types;
 

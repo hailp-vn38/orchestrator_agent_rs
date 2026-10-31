@@ -176,7 +176,12 @@ impl ToolExecutor {
                 }
                 Dispatch::Settled(self.settle(Ok(outcome)))
             }
-            Ok(HostOutcome::Finished(Ok(Err(err)))) => Dispatch::Settled(self.settle(Err(err))),
+            Ok(HostOutcome::Finished(Ok(Err(err)))) => {
+                if effect == ToolEffect::Resumable && err.code == CODE_OUTCOME_UNKNOWN {
+                    return Dispatch::Unknown(CODE_OUTCOME_UNKNOWN);
+                }
+                Dispatch::Settled(self.settle(Err(err)))
+            }
             Ok(HostOutcome::CancelGraceElapsed) => Dispatch::Cancelled,
             Err(_) => self.abnormal(effect, CODE_TIMEOUT, "the tool exceeded its time limit"),
             Ok(HostOutcome::Finished(Err(_panic))) => {
@@ -219,10 +224,12 @@ impl ToolExecutor {
         Ok(())
     }
 
-    /// Timeout/panic: tool ReadOnly có thể báo lỗi kỹ thuật; tool Mutating có outcome unknown.
+    /// Timeout/panic: tool ReadOnly/Resumable có thể báo lỗi kỹ thuật; tool Mutating có outcome unknown.
     fn abnormal(&self, effect: ToolEffect, code: &str, message: &str) -> Dispatch {
         match effect {
-            ToolEffect::ReadOnly => Dispatch::Settled(Settled::failure(code, message)),
+            ToolEffect::ReadOnly | ToolEffect::Resumable => {
+                Dispatch::Settled(Settled::failure(code, message))
+            }
             ToolEffect::Mutating => Dispatch::Unknown(CODE_OUTCOME_UNKNOWN),
         }
     }
