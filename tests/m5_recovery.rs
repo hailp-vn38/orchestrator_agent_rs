@@ -2584,3 +2584,83 @@ async fn steps_cap_across_attempts() {
     );
     o.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn cancel_video_within_grace() {
+    let env = Env::new();
+    let (slow_video, runs) = Probe::new(
+        "video_create",
+        ToolEffect::Mutating,
+        Behavior::Ignore(Duration::from_secs(600)),
+    );
+    let gw = ScriptedGateway::new();
+    gw.push_tool_calls("", vec![("v1", "video_create", json!({"text": "render"}))]);
+    gw.push_text("never");
+
+    let mut cfg = env.config(env.agents(&["video_create"]));
+    cfg.runtime.tool_timeout = Duration::from_secs(1200);
+    let o = build(cfg, &gw, vec![slow_video]).await.unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+    let turn = o.submit(&alice(), &sid, "render video".into()).await.unwrap();
+    wait_until(|| runs.load(Ordering::SeqCst) == 1).await;
+
+    tokio::time::pause();
+    o.cancel(&alice(), &sid).await.unwrap();
+
+    let started = std::time::Instant::now();
+    let r = loop {
+        let res = o.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+        if res.status.is_terminal() {
+            break res;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cancel_video_within_grace stuck: {res:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+    assert_eq!(r.status, RunStatus::Cancelled, "{r:?}");
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("CANCELLED")
+    );
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_completes_with_slow_tool() {
+    let env = Env::new();
+    let (slow_tool, runs) = Probe::new(
+        "video_create",
+        ToolEffect::Mutating,
+        Behavior::Ignore(Duration::from_secs(600)),
+    );
+    let gw = ScriptedGateway::new();
+    gw.push_tool_calls("", vec![("v1", "video_create", json!({"text": "render"}))]);
+    gw.push_text("never");
+
+    let mut cfg = env.config(env.agents(&["video_create"]));
+    cfg.runtime.tool_timeout = Duration::from_secs(1200);
+    cfg.runtime.shutdown_drain = Duration::from_millis(50);
+    cfg.runtime.shutdown_grace = Duration::from_secs(30);
+    let o = build(cfg, &gw, vec![slow_tool]).await.unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+    let turn = o.submit(&alice(), &sid, "render video".into()).await.unwrap();
+    wait_until(|| runs.load(Ordering::SeqCst) == 1).await;
+
+    let _ = turn;
+    tokio::time::pause();
+    o.shutdown()
+        .await
+        .expect("shutdown must complete within grace when slow tool is force-dropped at 20s");
+    let mut c = env.sql().await;
+    assert_eq!(
+        one(
+            &mut c,
+            "SELECT status FROM agent_runs WHERE session_id = ?1",
+            &sid
+        )
+        .await,
+        "interrupted"
+    );
+}

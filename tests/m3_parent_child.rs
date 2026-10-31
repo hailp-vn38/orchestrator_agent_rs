@@ -1543,3 +1543,71 @@ async fn child_exhausted_structured() {
     );
     o.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn cancel_tree_while_child_renders() {
+    let env = Env::new();
+    let (slow_render, runs) = Probe::new(
+        "probe",
+        ToolEffect::Mutating,
+        Behavior::Sleep(Duration::from_secs(600)),
+    );
+    let gw = ScriptedGateway::new();
+    gw.push_tool_calls("", vec![("s1", "subagent", sub_new("reviewer", "render clip"))]);
+    gw.push_tool_calls("", vec![("p1", "probe", json!({"text": "render"}))]);
+
+    let mut cfg = env.config(vec![
+        env.root(&["subagent"], &[]),
+        env.reviewer(&["probe"], &[]),
+    ]);
+    cfg.runtime.tool_timeout = Duration::from_secs(1200);
+    let o = build(cfg, &gw, vec![slow_render]).await;
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+    let turn = o.submit(&alice(), &sid, "go".into()).await.unwrap();
+    while runs.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    tokio::time::pause();
+    o.cancel(&alice(), &sid).await.unwrap();
+
+    let started = std::time::Instant::now();
+    let r = loop {
+        let res = o.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+        if res.status.is_terminal() {
+            break res;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cancel_tree_while_child_renders parent stuck: {res:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+    assert_eq!(r.status, RunStatus::Cancelled, "{r:?}");
+
+    let mut c = env.sql().await;
+    let row = sqlx::query(
+        "SELECT child_session_id, child_turn_id FROM tool_invocations \
+         WHERE session_id = ?1 AND tool_name = 'subagent'",
+    )
+    .bind(&sid)
+    .fetch_one(&mut c)
+    .await
+    .unwrap();
+    let child_sid: String = row.get("child_session_id");
+    let child_turn: String = row.get("child_turn_id");
+
+    let child_res = loop {
+        let res = o.result(&alice(), &child_sid, &child_turn).await.unwrap();
+        if res.status.is_terminal() {
+            break res;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cancel_tree_while_child_renders child stuck: {res:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+    assert_eq!(child_res.status, RunStatus::Cancelled, "{child_res:?}");
+    o.shutdown().await.unwrap();
+}

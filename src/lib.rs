@@ -55,8 +55,8 @@ pub use orchestrator::{Orchestrator, OrchestratorBuilder, MAX_SUBMIT_ARTIFACTS};
 pub use secret::SecretString;
 pub use skill::{valid_skill_id, SkillDocument, SkillDocumentError, SkillReloadReport};
 pub use tool::{
-    HostTool, ToolArtifacts, ToolCheckpoint, ToolContext, ToolDescriptor, ToolEffect, ToolError,
-    ToolOutcome, ToolScope,
+    CancelReason, CancelSignal, HostTool, ToolArtifacts, ToolCheckpoint, ToolContext,
+    ToolDescriptor, ToolEffect, ToolError, ToolOutcome, ToolScope,
 };
 pub use types::{
     AcceptedTurn, AgentResult, ArtifactRef, ArtifactRole, CallerContext, FamilyArtifact,

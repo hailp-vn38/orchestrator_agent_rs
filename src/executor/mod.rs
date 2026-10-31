@@ -12,6 +12,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 mod dispatch;
 mod outcome;
@@ -48,6 +49,7 @@ pub(crate) struct ToolLimits {
     pub hard_cap_bytes: usize,
     /// Khoảng tối thiểu giữa hai `tool.progress` của một invocation.
     pub progress_interval: Duration,
+    pub shutdown_grace: Duration,
 }
 
 /// Kết quả đã chốt của một invocation, sẵn sàng để runtime commit.
@@ -102,6 +104,7 @@ pub(crate) struct ToolExecutor {
     limits: ToolLimits,
     feed: ExecutionFeed,
     services: ToolServices,
+    shutdown: CancellationToken,
 }
 
 impl ToolExecutor {
@@ -112,6 +115,7 @@ impl ToolExecutor {
         limits: ToolLimits,
         feed: ExecutionFeed,
         services: ToolServices,
+        shutdown: CancellationToken,
     ) -> Self {
         Self {
             tools,
@@ -120,6 +124,7 @@ impl ToolExecutor {
             limits,
             feed,
             services,
+            shutdown,
         }
     }
 

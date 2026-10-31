@@ -6,13 +6,19 @@ use super::{
 use crate::feed::ProgressSink;
 use crate::skill::{render, SkillManager};
 use crate::subagent::Delegation;
-use crate::tool::{HostTool, ToolContext, ToolEffect, ToolError, ToolOutcome, ToolScope};
+use crate::tool::{
+    CancelSignal, HostTool, ToolContext, ToolEffect, ToolError, ToolOutcome, ToolScope,
+};
 use futures::FutureExt;
 use serde_json::{json, Value};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+const USER_CANCEL_GRACE: Duration = Duration::from_secs(30);
+const SHUTDOWN_CANCEL_GRACE_MAX: Duration = Duration::from_secs(20);
 
 impl ToolExecutor {
     /// Chạy một invocation đã `prepare`. Cancel là hợp tác: tool nhận cờ `is_cancelled` và tự
@@ -125,36 +131,57 @@ impl ToolExecutor {
         cancel: &CancellationToken,
     ) -> Dispatch {
         let cancelled = Arc::new(AtomicBool::new(cancel.is_cancelled()));
+        let cancel_signal = CancelSignal::new(cancel.clone(), self.shutdown.clone());
         let progress = ProgressSink::new(&self.feed, &scope, self.limits.progress_interval);
         let context = ToolContext::new(
             scope.clone(),
             Arc::clone(&cancelled),
+            cancel_signal,
             Some(progress),
             Some(self.services.clone()),
         );
         let guarded = AssertUnwindSafe(tool.execute(context, args)).catch_unwind();
+        let shutdown_token = self.shutdown.clone();
+        let shutdown_grace = self.limits.shutdown_grace;
         let watcher = async {
             cancel.cancelled().await;
             cancelled.store(true, Ordering::Release);
-            std::future::pending::<()>().await;
+            let grace = if shutdown_token.is_cancelled() {
+                shutdown_grace
+                    .checked_sub(Duration::from_secs(5))
+                    .filter(|d| !d.is_zero())
+                    .map_or(SHUTDOWN_CANCEL_GRACE_MAX, |d| {
+                        d.min(SHUTDOWN_CANCEL_GRACE_MAX)
+                    })
+            } else {
+                USER_CANCEL_GRACE
+            };
+            tokio::time::sleep(grace).await;
         };
         let limit = tool.timeout().unwrap_or(self.limits.timeout);
+        enum HostOutcome {
+            Finished(Result<Result<ToolOutcome, ToolError>, Box<dyn std::any::Any + Send>>),
+            CancelGraceElapsed,
+        }
         let timed = tokio::time::timeout(limit, async {
             tokio::select! {
-                r = guarded => r,
-                () = watcher => unreachable!("the cancel watcher never completes"),
+                r = guarded => HostOutcome::Finished(r),
+                () = watcher => HostOutcome::CancelGraceElapsed,
             }
         });
         match timed.await {
-            Ok(Ok(Ok(outcome))) => {
+            Ok(HostOutcome::Finished(Ok(Ok(outcome)))) => {
                 if let Err(err) = self.verify_outcome_artifacts(&scope, &outcome).await {
                     return Dispatch::Settled(self.settle(Err(err)));
                 }
                 Dispatch::Settled(self.settle(Ok(outcome)))
             }
-            Ok(Ok(Err(err))) => Dispatch::Settled(self.settle(Err(err))),
+            Ok(HostOutcome::Finished(Ok(Err(err)))) => Dispatch::Settled(self.settle(Err(err))),
+            Ok(HostOutcome::CancelGraceElapsed) => Dispatch::Cancelled,
             Err(_) => self.abnormal(effect, CODE_TIMEOUT, "the tool exceeded its time limit"),
-            Ok(Err(_panic)) => self.abnormal(effect, CODE_PANICKED, "the tool panicked"),
+            Ok(HostOutcome::Finished(Err(_panic))) => {
+                self.abnormal(effect, CODE_PANICKED, "the tool panicked")
+            }
         }
     }
 

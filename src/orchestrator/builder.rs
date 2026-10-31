@@ -288,6 +288,7 @@ impl OrchestratorBuilder {
             model_cap_bytes: self.config.runtime.tool_output_cap_bytes,
             hard_cap_bytes: self.config.runtime.tool_result_hard_cap_bytes,
             progress_interval: self.config.runtime.progress_min_interval,
+            shutdown_grace: self.config.runtime.shutdown_grace,
         };
 
         // API key đã cấu hình bị che trong mọi text ephemeral của feed (không bao giờ phát đi).
@@ -338,6 +339,7 @@ impl OrchestratorBuilder {
             signal.clone(),
             emitter.clone(),
         );
+        let shutdown = CancellationToken::new();
         let executor = ToolExecutor::new(
             tools.clone(),
             Arc::clone(&skills),
@@ -349,6 +351,7 @@ impl OrchestratorBuilder {
                 store: store.clone(),
                 emitter: emitter.clone(),
             },
+            shutdown.clone(),
         );
 
         let has_provider_runtime = self.provider_runtime.is_some();
@@ -370,7 +373,6 @@ impl OrchestratorBuilder {
             fast_retries,
             None,
         )));
-        let shutdown = CancellationToken::new();
         let runtime = AgentRuntime::new(
             store.clone(),
             gateway,

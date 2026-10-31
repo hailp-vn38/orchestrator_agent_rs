@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 use crate::artifact::{
     ArtifactInput, ArtifactReader, ArtifactStore, ArtifactWriteScope, CODE_ARTIFACT_UNAVAILABLE,
@@ -68,11 +69,51 @@ pub(crate) struct ToolServices {
     pub emitter: Emitter,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    User,
+    Shutdown,
+}
+
+/// Token của worker là con của token shutdown, nên đọc token shutdown trước để biết lý do.
+#[derive(Debug, Clone)]
+pub struct CancelSignal {
+    token: CancellationToken,
+    shutdown: CancellationToken,
+}
+
+impl CancelSignal {
+    pub fn new(token: CancellationToken, shutdown: CancellationToken) -> Self {
+        Self { token, shutdown }
+    }
+
+    pub fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+
+    pub fn reason(&self) -> Option<CancelReason> {
+        if self.shutdown.is_cancelled() {
+            Some(CancelReason::Shutdown)
+        } else if self.token.is_cancelled() {
+            Some(CancelReason::User)
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for CancelSignal {
+    fn default() -> Self {
+        Self::new(CancellationToken::new(), CancellationToken::new())
+    }
+}
+
 /// Capability có phạm vi do runtime mint; host không tự dựng được ngoài test của crate.
 #[derive(Clone)]
 pub struct ToolContext {
     scope: ToolScope,
     cancelled: Arc<AtomicBool>,
+    cancel: CancelSignal,
     progress: Option<ProgressSink>,
     services: Option<ToolServices>,
 }
@@ -81,7 +122,7 @@ impl fmt::Debug for ToolContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ToolContext")
             .field("scope", &self.scope)
-            .field("cancelled", &self.cancelled.load(Ordering::Relaxed))
+            .field("cancelled", &self.is_cancelled())
             .finish()
     }
 }
@@ -90,12 +131,14 @@ impl ToolContext {
     pub(crate) fn new(
         scope: ToolScope,
         cancelled: Arc<AtomicBool>,
+        cancel: CancelSignal,
         progress: Option<ProgressSink>,
         services: Option<ToolServices>,
     ) -> Self {
         Self {
             scope,
             cancelled,
+            cancel,
             progress,
             services,
         }
@@ -107,7 +150,21 @@ impl ToolContext {
 
     /// Hủy hợp tác; tool tự quyết định dừng.
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.cancelled.load(Ordering::Acquire) || self.cancel.token().is_cancelled()
+    }
+
+    pub fn cancel_signal(&self) -> &CancelSignal {
+        &self.cancel
+    }
+
+    pub fn cancel_token(&self) -> &CancellationToken {
+        self.cancel.token()
+    }
+
+    pub fn cancel_reason(&self) -> Option<CancelReason> {
+        self.cancel
+            .reason()
+            .or_else(|| self.cancelled.load(Ordering::Acquire).then_some(CancelReason::User))
     }
 
     /// Scoped capability để xuất bản và mở các artifact bất biến trong phạm vi cho phép
