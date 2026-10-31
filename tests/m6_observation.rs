@@ -580,7 +580,7 @@ async fn st12_st13_stream_error_before_finished_runs_no_tool_and_marks_the_previ
                 name: "probe".into(),
             },
         ],
-        GatewayError::Transport,
+        GatewayError::InvalidRequest,
     );
     let (probe, runs) = Probe::new("probe", ToolEffect::Mutating, Behavior::Echo);
     let (o, sid) = single(&env, &gw, Some(probe)).await;

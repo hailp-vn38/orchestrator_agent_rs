@@ -53,6 +53,7 @@ async fn migration_runs_from_empty_db_and_is_rerunnable() {
         [
             "agent_runs",
             "artifacts",
+            "llm_attempts",
             "messages",
             "sessions",
             "tool_invocations"

@@ -199,13 +199,16 @@ async fn build(
 }
 
 async fn wait_terminal(o: &Orchestrator, s: &str, t: &str) -> AgentResult {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let started = std::time::Instant::now();
     loop {
         let r = o.result(&alice(), s, t).await.unwrap();
         if r.status != RunStatus::Running {
             return r;
         }
-        assert!(tokio::time::Instant::now() < deadline, "run stuck: {r:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "run stuck: {r:?}"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -1446,7 +1449,10 @@ async fn cancelling_only_the_child_returns_a_technical_result_to_the_parent() {
     let r = wait_terminal(&o, &sid, &t.turn_id).await;
     assert_eq!(r.status, RunStatus::Completed, "{:?}", r.error);
     let texts = tool_texts(&history(&o, &sid).await);
-    assert!(texts[0].contains("CHILD_CANCELLED"), "{texts:?}");
+    assert!(
+        texts[0].contains("stop_reason=\"CANCELLED\"") && texts[0].contains("retryable=\"false\""),
+        "{texts:?}"
+    );
     o.shutdown().await.unwrap();
 }
 
@@ -1873,13 +1879,16 @@ async fn resolving_a_child_the_parent_already_gave_up_on_does_not_resume_it() {
     let r = wait_terminal(&o, &sid, &t.turn_id).await;
     assert_eq!(r.status, RunStatus::Completed, "{:?}", r.error);
     let parent_tool_msg = &tool_texts(&history(&o, &sid).await)[0];
-    assert!(parent_tool_msg.contains("CHILD_FAILED"), "{parent_tool_msg}");
     assert!(
-        parent_tool_msg.contains("omit session_id to start a new subagent session"),
+        parent_tool_msg.contains("state=\"failed\""),
         "{parent_tool_msg}"
     );
     assert!(
-        !parent_tool_msg.contains("can be resumed with session_id"),
+        parent_tool_msg.contains("stop_reason=\"TOOL_OUTCOME_UNKNOWN\""),
+        "{parent_tool_msg}"
+    );
+    assert!(
+        parent_tool_msg.contains("retryable=\"false\""),
         "{parent_tool_msg}"
     );
 
@@ -2130,5 +2139,448 @@ async fn at25_managed_run_continues_after_the_submitting_reader_is_gone() {
         Some("finished while nobody was watching")
     );
     assert_eq!(history(&o, &sid).await.len(), 2);
+    o.shutdown().await.unwrap();
+}
+
+// ───────────────────────── Phase 2: Durable Retry & Waiting States ─────────────────────────
+
+#[tokio::test]
+async fn migration_preserves_runs() {
+    use orchestrator_agent_rs::test_support::GatewayError;
+
+    // 1. Dựng DB ở schema 0005 (chạy thủ công 0001..0005) có đủ sessions, agent_runs (kèm khoảng
+    // trống rowid), messages và tool_invocations, rồi mở Orchestrator để chạy 0006.
+    let env = Env::new();
+    std::fs::create_dir_all(env.store()).unwrap();
+    let db_path = env.store().join("orchestrator.db");
+    {
+        let opts = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&opts).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            )",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        let migrations: &[(i64, &str, &str)] = &[
+            (1, "init", include_str!("../migrations/0001_init.sql")),
+            (
+                2,
+                "session permissions",
+                include_str!("../migrations/0002_session_permissions.sql"),
+            ),
+            (
+                3,
+                "invocation resolution",
+                include_str!("../migrations/0003_invocation_resolution.sql"),
+            ),
+            (
+                4,
+                "message turn",
+                include_str!("../migrations/0004_message_turn.sql"),
+            ),
+            (
+                5,
+                "llm attempts",
+                include_str!("../migrations/0005_llm_attempts.sql"),
+            ),
+        ];
+        use sha2::{Digest, Sha384};
+        for &(ver, desc, sql) in migrations {
+            sqlx::raw_sql(sql).execute(&mut conn).await.unwrap();
+            let checksum = Sha384::digest(sql.as_bytes()).to_vec();
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations(version, description, success, checksum, execution_time) \
+                 VALUES(?1, ?2, 1, ?3, 1)",
+            )
+            .bind(ver)
+            .bind(desc)
+            .bind(checksum)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+
+        sqlx::query(
+            "INSERT INTO sessions(id, owner_id, workspace_id, agent_id, status, next_sequence) \
+             VALUES('s1', 'alice', 'ws1', 'root', 'open', 4)",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        for (rowid, rid, tid) in [(1i64, "r1", "t1"), (5i64, "r5", "t2")] {
+            sqlx::query(
+                "INSERT INTO agent_runs(rowid, id, session_id, agent_id, turn_id, resume_attempt, \
+                 provider_id, model_id, provider_config_fingerprint, status, finished_at) \
+                 VALUES(?1, ?2, 's1', 'root', ?3, 0, 'fake', 'model-x', 'fp', 'completed', 100)",
+            )
+            .bind(rowid)
+            .bind(rid)
+            .bind(tid)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO messages(id, session_id, sequence, role, content_json, turn_id, run_id) \
+             VALUES('m1', 's1', 1, 'user', '{\"text\":\"hi\"}', 't1', 'r1'), \
+                   ('m2', 's1', 2, 'assistant', '{\"text\":\"ok\"}', 't1', 'r1')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_invocations(id, session_id, run_id, assistant_message_id, \
+             tool_call_id, tool_name, arguments_json, status, finished_at) \
+             VALUES('inv1', 's1', 'r1', 'm2', 'c1', 'echo', '{}', 'completed', 100)",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        conn.close().await.unwrap();
+    }
+
+    let gw = ScriptedGateway::new();
+    let _ = GatewayError::Timeout;
+    let o = build(env.config(env.agents(&[])), &gw, vec![])
+        .await
+        .unwrap();
+    o.shutdown().await.unwrap();
+
+    let mut conn = env.sql().await;
+    let rowids: Vec<(i64, String)> =
+        sqlx::query("SELECT rowid, id FROM agent_runs ORDER BY rowid")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+    assert_eq!(
+        rowids,
+        vec![(1, "r1".to_owned()), (5, "r5".to_owned())],
+        "rowid must be preserved across 0006 rebuild"
+    );
+    let msg_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    let inv_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tool_invocations")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(msg_count, 2);
+    assert_eq!(inv_count, 1);
+    let fk_violations = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        fk_violations.is_empty(),
+        "FK check failed: {}",
+        fk_violations.len()
+    );
+    conn.close().await.unwrap();
+
+    // 2. Chạy thêm trên bản sao orchestrator.db thật trong repo (nếu có).
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for rel in [
+        "../../data/orchestrator-store/jobs/orchestrator.db",
+        "../../data/orchestrator-store/orchestrator.db",
+    ] {
+        let src_db = manifest_dir.join(rel);
+        if !src_db.exists() {
+            continue;
+        }
+        let copy_env = Env::new();
+        std::fs::create_dir_all(copy_env.store()).unwrap();
+        let dst_db = copy_env.store().join("orchestrator.db");
+        {
+            let src_opts = SqliteConnectOptions::new()
+                .filename(&src_db)
+                .read_only(true);
+            let mut src_conn = SqliteConnection::connect_with(&src_opts).await.unwrap();
+            sqlx::query("VACUUM INTO ?1")
+                .bind(dst_db.to_str().unwrap())
+                .execute(&mut src_conn)
+                .await
+                .unwrap();
+            src_conn.close().await.unwrap();
+        }
+        let (before_runs, before_msgs, before_invs) = {
+            let mut c = copy_env.sql().await;
+            let runs: Vec<(i64, String)> =
+                sqlx::query("SELECT rowid, id FROM agent_runs ORDER BY rowid")
+                    .fetch_all(&mut c)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| (r.get(0), r.get(1)))
+                    .collect();
+            let msgs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            let invs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tool_invocations")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            // Đánh dấu những run đang running (nếu có) về completed để khi mở Orchestrator không spawn recovery.
+            sqlx::query("UPDATE agent_runs SET status = 'completed', finished_at = 1 WHERE status = 'running'")
+                .execute(&mut c)
+                .await
+                .unwrap();
+            c.close().await.unwrap();
+            (runs, msgs, invs)
+        };
+        let o_real = build(copy_env.config(copy_env.agents(&[])), &gw, vec![])
+            .await
+            .unwrap();
+        o_real.shutdown().await.unwrap();
+
+        let mut c = copy_env.sql().await;
+        let after_runs: Vec<(i64, String)> =
+            sqlx::query("SELECT rowid, id FROM agent_runs ORDER BY rowid")
+                .fetch_all(&mut c)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.get(0), r.get(1)))
+                .collect();
+        let after_msgs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+        let after_invs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tool_invocations")
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+        let fk = sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(after_runs, before_runs, "real DB runs/rowids changed for {rel}");
+        assert_eq!(after_msgs, before_msgs, "real DB messages changed for {rel}");
+        assert_eq!(after_invs, before_invs, "real DB invocations changed for {rel}");
+        assert!(
+            fk.is_empty(),
+            "real DB FK check failed for {rel}: {}",
+            fk.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn waiting_retry_survives_restart() {
+    use orchestrator_agent_rs::test_support::GatewayError;
+    let env = Env::new();
+    let gw1 = ScriptedGateway::new();
+    gw1.push_error(GatewayError::Timeout);
+
+    let mut cfg1 = env.config(env.agents(&[]));
+    cfg1.llm.providers[0].limits.fast_retries = 0;
+    let o1 = build(cfg1, &gw1, vec![]).await.unwrap();
+    let sid = o1.create_session(&alice(), "root").await.unwrap();
+    let turn = o1.submit(&alice(), &sid, "survive restart".into()).await.unwrap();
+
+    let r_wait = wait_terminal(&o1, &sid, &turn.turn_id).await;
+    assert_eq!(r_wait.status, RunStatus::WaitingRetry);
+    let expected_next_at = r_wait.next_attempt_at.expect("next_attempt_at must be set");
+    assert_eq!(r_wait.retry_reason.as_deref(), Some("PROVIDER_TIMEOUT"));
+    o1.shutdown().await.unwrap();
+
+    // Mở lại process (o2): mark_stale_runs_interrupted không được biến waiting_retry thành interrupted;
+    // next_attempt_at phải giữ nguyên cho tới khi đến giờ.
+    let gw2 = ScriptedGateway::new();
+    gw2.push_text("completed on schedule after restart");
+    let mut cfg2 = env.config(env.agents(&[]));
+    cfg2.llm.providers[0].limits.fast_retries = 0;
+    let o2 = build(cfg2, &gw2, vec![]).await.unwrap();
+
+    let r_after_reopen = o2.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+    assert_eq!(r_after_reopen.status, RunStatus::WaitingRetry);
+    assert_eq!(r_after_reopen.next_attempt_at, Some(expected_next_at));
+
+    // Tua clock vượt qua lịch chờ 60s để supervisor tự resume.
+    tokio::time::pause();
+    let started = std::time::Instant::now();
+    let r_done = loop {
+        let res = o2.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+        if res.status.is_terminal() {
+            break res;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "waiting_retry did not resume after due time: {res:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+    assert_eq!(r_done.status, RunStatus::Completed);
+    assert_eq!(
+        r_done.output.as_deref(),
+        Some("completed on schedule after restart")
+    );
+    assert_eq!(r_done.attempt, 1);
+    assert!(r_done.next_attempt_at.is_none());
+    o2.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancel_waiting_run() {
+    use orchestrator_agent_rs::test_support::GatewayError;
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    // Turn 1: root tự rơi vào waiting_retry (không có worker trong bộ nhớ).
+    gw.push_error(GatewayError::Timeout);
+    // Turn 2: root gọi subagent, subagent rơi vào waiting_retry -> hủy root phải hủy cả child đang chờ.
+    gw.push_tool_calls("", vec![("c1", "subagent", sub_new("child job"))]);
+    gw.push_error(GatewayError::Timeout);
+
+    let mut cfg = env.config(env.agents(&["subagent"]));
+    cfg.llm.providers[0].limits.fast_retries = 0;
+    let o = build(cfg, &gw, vec![]).await.unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+
+    // 1. Hủy root đang ở waiting_retry (không còn worker).
+    let t1 = o.submit(&alice(), &sid, "root wait".into()).await.unwrap();
+    let r1 = wait_terminal(&o, &sid, &t1.turn_id).await;
+    assert_eq!(r1.status, RunStatus::WaitingRetry);
+    o.cancel(&alice(), &sid).await.unwrap();
+    let r1_cancelled = o.result(&alice(), &sid, &t1.turn_id).await.unwrap();
+    assert_eq!(r1_cancelled.status, RunStatus::Cancelled);
+    assert!(r1_cancelled.next_attempt_at.is_none());
+
+    // 2. Hủy root khi child đang ở waiting_retry -> cả hai đều Cancelled.
+    let t2 = o.submit(&alice(), &sid, "delegate wait".into()).await.unwrap();
+    wait_until(|| gw.call_count() == 3).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let child_sid = loop {
+        let mut c = env.sql().await;
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT session_id FROM agent_runs WHERE status = 'waiting_retry'",
+        )
+        .fetch_optional(&mut c)
+        .await
+        .unwrap();
+        if let Some(csid) = row {
+            break csid;
+        }
+        assert!(std::time::Instant::now() < deadline, "child not in waiting_retry");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    o.cancel(&alice(), &sid).await.unwrap();
+    let r2_cancelled = wait_terminal(&o, &sid, &t2.turn_id).await;
+    assert_eq!(r2_cancelled.status, RunStatus::Cancelled);
+
+    let mut c = env.sql().await;
+    let child_status: String =
+        sqlx::query_scalar("SELECT status FROM agent_runs WHERE session_id = ?1")
+            .bind(&child_sid)
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+    assert_eq!(child_status, "cancelled");
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn resume_blocked_on_config_change() {
+    use orchestrator_agent_rs::test_support::GatewayError;
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    gw.push_error(GatewayError::Auth);
+    gw.push_text("should not run");
+
+    let mut cfg = env.config(env.agents(&[]));
+    cfg.llm.providers[0].limits.fast_retries = 0;
+    let o1 = build(cfg, &gw, vec![]).await.unwrap();
+    let sid = o1.create_session(&alice(), "root").await.unwrap();
+    let turn = o1.submit(&alice(), &sid, "check config".into()).await.unwrap();
+
+    let r_wait = wait_terminal(&o1, &sid, &turn.turn_id).await;
+    assert_eq!(r_wait.status, RunStatus::WaitingUser);
+    o1.shutdown().await.unwrap();
+
+    // Đổi routing (model-x -> model-z) rồi mở lại và gọi resume_waiting -> phải chặn với PROVIDER_CONFIG_CHANGED.
+    let mut cfg2 = env.config(vec![env.root("model-z", &[]), env.reviewer(&[])]);
+    cfg2.llm.providers[0].limits.fast_retries = 0;
+    let o2 = build(cfg2, &gw, vec![]).await.unwrap();
+    o2.resume_waiting(&alice(), &sid).await.unwrap();
+
+    let r_blocked = o2.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+    assert_eq!(r_blocked.status, RunStatus::Interrupted);
+    assert_eq!(
+        r_blocked.error.as_ref().map(|e| e.code.as_str()),
+        Some("PROVIDER_CONFIG_CHANGED")
+    );
+    o2.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn steps_cap_across_attempts() {
+    use orchestrator_agent_rs::test_support::GatewayError;
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    let (echo, _) = Probe::new("echo", ToolEffect::ReadOnly, Behavior::Echo);
+
+    // Attempt 0: chạy 2 tool steps rồi ở step 3 gặp Timeout -> waiting_retry
+    gw.push_tool_calls("", vec![("e1", "echo", json!({"text": "1"}))]);
+    gw.push_tool_calls("", vec![("e2", "echo", json!({"text": "2"}))]);
+    gw.push_error(GatewayError::Timeout);
+    // Attempt 1 (sau khi resume): chạy thêm 1 tool step (tổng turn_steps = 3 == max_steps)
+    gw.push_tool_calls("", vec![("e3", "echo", json!({"text": "3"}))]);
+    // Step kế phải bị ép capped (không truyền tools, có STEP_LIMIT_GUIDANCE)
+    gw.push_text("capped summary across attempts");
+
+    let root = env.root("model-x", &["echo"]).with_steps(3);
+    let mut cfg = env.config(vec![root, env.reviewer(&[])]);
+    cfg.llm.providers[0].limits.fast_retries = 0;
+    let o = build(cfg, &gw, vec![echo]).await.unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+
+    tokio::time::pause();
+    let turn = o.submit(&alice(), &sid, "run capped".into()).await.unwrap();
+    let started = std::time::Instant::now();
+    let r = loop {
+        let res = o.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+        if res.status.is_terminal() {
+            break res;
+        }
+        assert!(started.elapsed() < Duration::from_secs(15), "run stuck: {res:?}");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+
+    assert_eq!(r.status, RunStatus::Completed, "{r:?}");
+    assert_eq!(r.attempt, 1);
+    assert_eq!(
+        r.output.as_deref(),
+        Some("capped summary across attempts")
+    );
+
+    let reqs = gw.requests();
+    let last_req = reqs.last().unwrap();
+    assert!(
+        last_req.tools.is_empty(),
+        "final request at turn_steps == max_steps must strip tools"
+    );
+    assert!(
+        last_req
+            .messages
+            .iter()
+            .any(|m| m.text.contains("The step limit for this task has been reached")),
+        "final request must include STEP_LIMIT_GUIDANCE"
+    );
     o.shutdown().await.unwrap();
 }

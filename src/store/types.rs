@@ -16,6 +16,7 @@ pub(crate) struct RunRecord {
     pub run_id: String,
     pub session_id: String,
     pub turn_id: String,
+    pub resume_attempt: u32,
     pub agent_id: String,
     pub provider_id: String,
     pub model_id: String,

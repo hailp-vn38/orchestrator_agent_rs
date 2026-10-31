@@ -6,7 +6,7 @@ use llm::{FunctionCall, ToolCall};
 
 use super::collect::{collect, strip_thinking_blocks, RawStream};
 use super::convert::to_chat_messages;
-use super::error::{map_error, GatewayError};
+use super::error::{map_error, FailureClass, GatewayError};
 use super::types::{
     ModelMessage, ModelParams, ModelRequest, ModelResponse, ModelRole, ModelToolCall, ModelUsage,
     ReasoningEffort, StreamEvent,
@@ -180,7 +180,9 @@ fn error_mapping_never_exposes_raw_text() {
     );
     assert_eq!(
         map_error(&r("API returned error status: 429 Too Many")),
-        GatewayError::Provider
+        GatewayError::RateLimited {
+            retry_after_secs: None
+        }
     );
     for e in [
         GatewayError::Auth,
@@ -621,6 +623,7 @@ mod watchdog_tests {
             first_byte: Duration::from_secs(60),
             idle: Duration::from_secs(60),
             max_total: Duration::from_secs(600),
+            fast_retries: 2,
         };
         let (gw, req) = build_gw(
             limits,
@@ -644,6 +647,7 @@ mod watchdog_tests {
             first_byte: Duration::from_secs(60),
             idle: Duration::from_secs(45),
             max_total: Duration::from_secs(600),
+            fast_retries: 2,
         };
         let (gw, req) = build_gw(
             limits,
@@ -666,6 +670,7 @@ mod watchdog_tests {
             first_byte: Duration::from_secs(40),
             idle: Duration::from_secs(90),
             max_total: Duration::from_secs(600),
+            fast_retries: 2,
         };
         let (gw, req) = build_gw(limits, Scenario::NeverFirstByte);
         let start = Instant::now();
@@ -683,6 +688,7 @@ mod watchdog_tests {
             first_byte: Duration::from_secs(60),
             idle: Duration::from_secs(60),
             max_total: Duration::from_secs(180),
+            fast_retries: 2,
         };
         let (gw, req) = build_gw(
             limits,
@@ -705,6 +711,7 @@ mod watchdog_tests {
             first_byte: Duration::from_secs(60),
             idle: Duration::from_secs(60),
             max_total: Duration::from_secs(600),
+            fast_retries: 2,
         };
         let (gw, req) = build_gw(
             limits,
@@ -729,4 +736,51 @@ mod watchdog_tests {
             "thinking chunks must emit Activity to downstream sink"
         );
     }
+}
+
+#[test]
+fn gateway_error_class_matches_spec_table() {
+    use std::time::Duration;
+    for err in [
+        GatewayError::Stalled,
+        GatewayError::Timeout,
+        GatewayError::Transport,
+        GatewayError::Provider,
+        GatewayError::Protocol,
+    ] {
+        assert_eq!(
+            err.classify(),
+            FailureClass::Retryable { retry_after: None }
+        );
+    }
+    assert_eq!(
+        GatewayError::RateLimited {
+            retry_after_secs: Some(45)
+        }
+        .classify(),
+        FailureClass::Retryable {
+            retry_after: Some(Duration::from_secs(45))
+        }
+    );
+    assert_eq!(
+        GatewayError::RateLimited {
+            retry_after_secs: None
+        }
+        .code(),
+        "PROVIDER_RATE_LIMITED"
+    );
+    assert_eq!(
+        GatewayError::RequestLimitExceeded.classify(),
+        FailureClass::RetryOnceThenSplit
+    );
+    assert_eq!(GatewayError::Auth.classify(), FailureClass::NeedsUser);
+    assert_eq!(
+        GatewayError::NotConfigured.classify(),
+        FailureClass::Permanent
+    );
+    assert_eq!(
+        GatewayError::InvalidRequest.classify(),
+        FailureClass::Permanent
+    );
+    assert_eq!(GatewayError::Cancelled.classify(), FailureClass::Cancelled);
 }

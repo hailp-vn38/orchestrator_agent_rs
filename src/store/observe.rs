@@ -188,7 +188,8 @@ async fn latest_run(
 ) -> Result<Option<RunSnapshot>, OrchestratorError> {
     let row = sqlx::query(
         "SELECT id, turn_id, resume_attempt, status, steps, input_tokens, output_tokens, \
-         error_code, error_message FROM agent_runs WHERE session_id = ?1 \
+         error_code, error_message, next_attempt_at, retry_reason \
+         FROM agent_runs WHERE session_id = ?1 \
          ORDER BY rowid DESC LIMIT 1",
     )
     .bind(session_id)
@@ -203,6 +204,8 @@ async fn latest_run(
     let steps: i64 = row.try_get("steps").map_err(db("read run"))?;
     let input: i64 = row.try_get("input_tokens").map_err(db("read run"))?;
     let output: i64 = row.try_get("output_tokens").map_err(db("read run"))?;
+    let next_attempt_at: Option<i64> = row.try_get("next_attempt_at").map_err(db("read run"))?;
+    let retry_reason: Option<String> = row.try_get("retry_reason").map_err(db("read run"))?;
     Ok(Some(RunSnapshot {
         run_id: row.try_get("id").map_err(db("read run"))?,
         turn_id: row.try_get("turn_id").map_err(db("read run"))?,
@@ -216,6 +219,8 @@ async fn latest_run(
             code,
             message: message.unwrap_or_default(),
         }),
+        next_attempt_at,
+        retry_reason,
     }))
 }
 

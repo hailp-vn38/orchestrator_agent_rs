@@ -22,7 +22,38 @@ const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 
 impl SessionStore {
     /// Mở DB (WAL, FK, busy timeout) và chạy migration từ DB trống/đã có.
+    /// Chạy migration trên connection riêng với `foreign_keys(false)` để hỗ trợ table-rebuild
+    /// trong transaction của `sqlx::migrate!`, kiểm tra `PRAGMA foreign_key_check` rỗng rồi mới
+    /// mở pool làm việc với `foreign_keys(true)`.
     pub(crate) async fn open(path: &Path) -> Result<Self, OrchestratorError> {
+        let mig_options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(false)
+            .busy_timeout(BUSY_TIMEOUT);
+        let mig_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+            .connect_with(mig_options)
+            .await
+            .map_err(db("open migration pool"))?;
+        sqlx::migrate!("./migrations")
+            .run(&mig_pool)
+            .await
+            .map_err(|e| OrchestratorError::storage("migrate", &e))?;
+        let fk_rows = sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&mig_pool)
+            .await
+            .map_err(db("foreign_key_check"))?;
+        mig_pool.close().await;
+        if !fk_rows.is_empty() {
+            return Err(OrchestratorError::new(
+                ErrorCode::Unavailable,
+                "database foreign_key_check failed after migration",
+            ));
+        }
+
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
@@ -35,11 +66,27 @@ impl SessionStore {
             .connect_with(options)
             .await
             .map_err(db("open pool"))?;
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .map_err(|e| OrchestratorError::storage("migrate", &e))?;
-        Ok(Self { pool })
+        let sys_base_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Ok(Self {
+            pool,
+            sys_base_secs,
+            tok_base: tokio::time::Instant::now(),
+        })
+    }
+
+    /// Unix epoch seconds hiện tại, tương thích cả giờ hệ thống và `tokio::time::advance` trong test.
+    pub(crate) fn now_secs(&self) -> i64 {
+        let sys_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let tok_now = self
+            .sys_base_secs
+            .saturating_add(self.tok_base.elapsed().as_secs() as i64);
+        sys_now.max(tok_now)
     }
 
     pub(crate) async fn close(&self) {

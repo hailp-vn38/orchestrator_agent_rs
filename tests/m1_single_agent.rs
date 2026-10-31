@@ -86,13 +86,16 @@ fn alice() -> CallerContext {
 }
 
 async fn wait_terminal(o: &Orchestrator, c: &CallerContext, s: &str, t: &str) -> AgentResult {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let started = std::time::Instant::now();
     loop {
         let r = o.result(c, s, t).await.unwrap();
         if r.status != RunStatus::Running {
             return r;
         }
-        assert!(tokio::time::Instant::now() < deadline, "run stuck: {r:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "run stuck: {r:?}"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -678,8 +681,8 @@ async fn unauthorized_access_is_denied_on_every_operation() {
 async fn provider_failure_ends_run_with_sanitized_code_and_frees_the_session() {
     let env = Env::new();
     let gw = ScriptedGateway::new();
+    gw.push_error(GatewayError::InvalidRequest);
     gw.push_error(GatewayError::Auth);
-    gw.push_error(GatewayError::Timeout);
     let o = env.build(&gw).await;
     let sid = o.create_session(&alice(), "root").await.unwrap();
 
@@ -688,13 +691,15 @@ async fn provider_failure_ends_run_with_sanitized_code_and_frees_the_session() {
     assert_eq!(r1.status, RunStatus::Failed);
     assert_eq!(r1.output, None);
     let e = r1.error.unwrap();
-    assert_eq!(e.code, "PROVIDER_AUTH_FAILED");
+    assert_eq!(e.code, "PROVIDER_INVALID_REQUEST");
     assert!(!e.message.contains("sk-"));
 
     let t2 = o.submit(&alice(), &sid, "y".into()).await.unwrap();
     let r2 = wait_terminal(&o, &alice(), &sid, &t2.turn_id).await;
-    assert_eq!(r2.status, RunStatus::TimedOut);
-    assert_eq!(r2.error.unwrap().code, "PROVIDER_TIMEOUT");
+    assert_eq!(r2.status, RunStatus::WaitingUser);
+    let e2 = r2.error.unwrap();
+    assert_eq!(e2.code, "PROVIDER_AUTH_FAILED");
+    assert!(!e2.message.contains("sk-"));
 
     // Lỗi không tạo assistant message; history chỉ có input của user.
     let hist = history_texts(&o, &alice(), &sid).await;
@@ -719,7 +724,7 @@ async fn build_creates_store_with_owner_lock_and_clean_install_schema() {
         .unwrap();
     assert_eq!(mode, "wal");
     let idx: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_one_running_run_per_session'",
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_one_active_run_per_session'",
     )
     .fetch_one(&mut conn)
     .await
@@ -876,7 +881,13 @@ async fn llm_attempt_recorded() {
     let gw = ScriptedGateway::new();
     gw.push_stream_text(&["hello ", "world"]);
     gw.push_error(GatewayError::Stalled);
-    let o = env.build(&gw).await;
+    let mut cfg = env.config();
+    cfg.llm.providers[0].limits.fast_retries = 0;
+    let o = Orchestrator::builder(cfg)
+        .with_gateway(gw.clone())
+        .build()
+        .await
+        .unwrap();
 
     let sid = o.create_session(&alice(), "root").await.unwrap();
     let t1 = o.submit(&alice(), &sid, "turn 1".into()).await.unwrap();
@@ -885,7 +896,7 @@ async fn llm_attempt_recorded() {
 
     let t2 = o.submit(&alice(), &sid, "turn 2".into()).await.unwrap();
     let r2 = wait_terminal(&o, &alice(), &sid, &t2.turn_id).await;
-    assert_eq!(r2.status, RunStatus::TimedOut);
+    assert_eq!(r2.status, RunStatus::WaitingRetry);
 
     o.shutdown().await.unwrap();
 
@@ -922,4 +933,107 @@ async fn llm_attempt_recorded() {
     assert!(fb2.is_none());
     assert_eq!(chars2, 0);
     assert_eq!(outcome2, "PROVIDER_STALLED");
+}
+
+#[tokio::test]
+async fn fast_retry_then_success() {
+    use sqlx::Row;
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    gw.push_error(GatewayError::Timeout);
+    gw.push_error(GatewayError::Transport);
+    gw.push_text("recovered on third try");
+    let o = env.build(&gw).await;
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+
+    tokio::time::pause();
+    let t = o.submit(&alice(), &sid, "hello".into()).await.unwrap();
+    let r = wait_terminal(&o, &alice(), &sid, &t.turn_id).await;
+    assert_eq!(r.status, RunStatus::Completed);
+    assert_eq!(r.output.as_deref(), Some("recovered on third try"));
+    assert_eq!(r.attempt, 0, "must complete within the same run attempt");
+    assert_eq!(gw.call_count(), 3);
+    o.shutdown().await.unwrap();
+
+    let mut conn = env.sql().await;
+    let outcomes: Vec<String> =
+        sqlx::query("SELECT outcome FROM llm_attempts ORDER BY rowid")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect();
+    assert_eq!(
+        outcomes,
+        ["PROVIDER_TIMEOUT", "PROVIDER_UNAVAILABLE", "completed"]
+    );
+}
+
+#[tokio::test]
+async fn fast_retry_cancelled() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    gw.push_error(GatewayError::Timeout);
+    gw.push_text("should not be reached");
+    let o = env.build(&gw).await;
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+
+    let t = o.submit(&alice(), &sid, "cancel me".into()).await.unwrap();
+    wait_until(|| gw.call_count() == 1).await;
+    // Lúc này worker đang trong sleep 5s của vòng fast retry đầu tiên.
+    o.cancel(&alice(), &sid).await.unwrap();
+    let r = wait_terminal(&o, &alice(), &sid, &t.turn_id).await;
+    assert_eq!(r.status, RunStatus::Cancelled);
+    assert_eq!(gw.call_count(), 1, "cancel during sleep must abort fast retry");
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn split_guidance_after_two_limits() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    gw.push_error(GatewayError::RequestLimitExceeded);
+    gw.push_error(GatewayError::RequestLimitExceeded);
+    gw.push_text("concise summary");
+    let o = env.build(&gw).await;
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+
+    tokio::time::pause();
+    let t = o.submit(&alice(), &sid, "write a huge report".into()).await.unwrap();
+    let r = wait_terminal(&o, &alice(), &sid, &t.turn_id).await;
+    assert_eq!(r.status, RunStatus::Completed);
+    assert_eq!(r.output.as_deref(), Some("concise summary"));
+
+    let reqs = gw.requests();
+    assert_eq!(reqs.len(), 3);
+    assert!(
+        !reqs[0]
+            .messages
+            .iter()
+            .any(|m| m.text.contains("Break the remaining work into smaller steps")),
+        "attempt 1 must not have split guidance"
+    );
+    assert!(
+        !reqs[1]
+            .messages
+            .iter()
+            .any(|m| m.text.contains("Break the remaining work into smaller steps")),
+        "attempt 2 must not have split guidance yet"
+    );
+    assert!(
+        reqs[2]
+            .messages
+            .iter()
+            .any(|m| m.text.contains("Break the remaining work into smaller steps")),
+        "attempt 3 must include SPLIT_OUTPUT_GUIDANCE"
+    );
+
+    let hist = history_texts(&o, &alice(), &sid).await;
+    assert!(
+        hist.iter()
+            .all(|(_, text)| !text.contains("Break the remaining work into smaller steps")),
+        "guidance must not be persisted into session transcript: {hist:?}"
+    );
+    o.shutdown().await.unwrap();
 }

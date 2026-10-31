@@ -61,6 +61,10 @@ impl Orchestrator {
             .iter()
             .map(|p| (p.id.trim().to_string(), p.routing_fingerprint()))
             .collect();
+        let new_fast_retries: BTreeMap<String, u8> = providers
+            .iter()
+            .map(|p| (p.id.trim().to_string(), p.limits.fast_retries))
+            .collect();
         let registered_tools: HashSet<String> = self.tools.keys().cloned().collect();
         let current_skills = self
             .skills
@@ -87,7 +91,12 @@ impl Orchestrator {
         self.prompt
             .replace(prompts.iter().map(|(id, p)| (id.as_str(), p.as_str())));
         self.tasks.replace(&new_agents, new_routes);
-        *catalog_guard = LiveAgentCatalog::new(new_agents, new_fingerprints, Some(&catalog_guard));
+        *catalog_guard = LiveAgentCatalog::new(
+            new_agents,
+            new_fingerprints,
+            new_fast_retries,
+            Some(&catalog_guard),
+        );
         Ok(())
     }
 
@@ -314,6 +323,36 @@ impl Orchestrator {
                 serde_json::json!({ "reason": "archived" }),
             )
             .await;
+        Ok(())
+    }
+
+    /// Tiếp tục ngay một session (hoặc child đang được nó chờ) đang ở trạng thái
+    /// `waiting_retry` hoặc `waiting_user`.
+    pub async fn resume_waiting(
+        &self,
+        caller: &CallerContext,
+        session_id: &str,
+    ) -> Result<(), OrchestratorError> {
+        let _gate = self.supervisor.admission().await?;
+        self.store.check_scope(caller, session_id).await?;
+        let route = |agent_id: &str| self.route(agent_id);
+        let replay_safe = |tool: &str| self.replay_safe.contains(tool);
+        let policy = crate::store::RecoveryPolicy {
+            max_resume_attempt: self.runtime.max_resume_attempts,
+            route: &route,
+            replay_safe: &replay_safe,
+        };
+        let resumed = self
+            .store
+            .resume_waiting_session(session_id, &policy)
+            .await?;
+        if resumed == 0 {
+            return Err(OrchestratorError::new(
+                ErrorCode::InvalidInput,
+                "the session is not waiting to be resumed",
+            ));
+        }
+        self.supervisor.notify_admitted();
         Ok(())
     }
 

@@ -154,26 +154,38 @@ impl OrchestratorBuilder {
 
         self.config.validate_local()?;
         // (provider_id -> fingerprint) từ runtime của server hoặc từ `LlmConfig`.
-        let fingerprints: BTreeMap<String, String> = match &self.provider_runtime {
-            Some(runtime) => {
-                if !self.config.llm.providers.is_empty() {
-                    return Err(OrchestratorError::config(
-                        ConfigReason::ProviderRuntimeConflict,
-                        "llm.providers must be empty when a provider runtime is used",
-                    ));
+        let (fingerprints, fast_retries): (BTreeMap<String, String>, BTreeMap<String, u8>) =
+            match &self.provider_runtime {
+                Some(runtime) => {
+                    if !self.config.llm.providers.is_empty() {
+                        return Err(OrchestratorError::config(
+                            ConfigReason::ProviderRuntimeConflict,
+                            "llm.providers must be empty when a provider runtime is used",
+                        ));
+                    }
+                    let fps = runtime_fingerprints(&runtime.providers())?;
+                    let retries = fps.keys().map(|id| (id.clone(), 2u8)).collect();
+                    (fps, retries)
                 }
-                runtime_fingerprints(&runtime.providers())?
-            }
-            None => {
-                self.config.llm.validate()?;
-                self.config
-                    .llm
-                    .providers
-                    .iter()
-                    .map(|p| (p.id.trim().to_string(), p.routing_fingerprint()))
-                    .collect()
-            }
-        };
+                None => {
+                    self.config.llm.validate()?;
+                    let fps = self
+                        .config
+                        .llm
+                        .providers
+                        .iter()
+                        .map(|p| (p.id.trim().to_string(), p.routing_fingerprint()))
+                        .collect();
+                    let retries = self
+                        .config
+                        .llm
+                        .providers
+                        .iter()
+                        .map(|p| (p.id.trim().to_string(), p.limits.fast_retries))
+                        .collect();
+                    (fps, retries)
+                }
+            };
 
         let mut tools: BTreeMap<String, Arc<dyn HostTool>> = BTreeMap::new();
         for tool in self.tools {
@@ -355,6 +367,7 @@ impl OrchestratorBuilder {
         let catalog = Arc::new(RwLock::new(LiveAgentCatalog::new(
             agents,
             fingerprints,
+            fast_retries,
             None,
         )));
         let shutdown = CancellationToken::new();
@@ -368,6 +381,7 @@ impl OrchestratorBuilder {
                 limit_tokens: self.config.runtime.context_limit_tokens,
                 threshold_percent: self.config.runtime.compaction_threshold_percent,
                 keep_recent: self.config.runtime.compaction_keep_recent,
+                max_resume_attempts: self.config.runtime.max_resume_attempts,
             },
             shutdown.clone(),
             emitter.clone(),
@@ -375,12 +389,16 @@ impl OrchestratorBuilder {
         let supervisor = Supervisor::start(
             store.clone(),
             runtime,
+            Arc::clone(&catalog),
+            Arc::new(replay_safe.clone()),
+            self.config.runtime.max_resume_attempts,
             self.config.runtime.supervisor_sweep,
             self.config.runtime.max_concurrent_root_runs,
             owner_lock,
             signal,
             shutdown,
-        );
+        )
+        .await;
 
         Ok(Orchestrator {
             base_version,

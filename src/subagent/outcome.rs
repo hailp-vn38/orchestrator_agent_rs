@@ -1,5 +1,5 @@
 //! Chuyển lỗi admission và kết quả terminal của child thành tool outcome.
-use super::Delegation;
+use super::{ChildFailure, Delegation};
 use crate::store::ChildAdmitError;
 use crate::tool::{ToolError, ToolOutcome, ToolScope};
 use crate::types::{AgentResult, RunStatus};
@@ -47,40 +47,15 @@ pub(super) fn admit_failure(error: ChildAdmitError) -> Delegation {
 }
 
 /// Chuyển attempt terminal của child thành outcome của parent invocation.
-pub(super) fn outcome_of(scope: &ToolScope, result: AgentResult) -> Result<ToolOutcome, ToolError> {
+pub(super) fn outcome_of(scope: &ToolScope, result: AgentResult) -> Delegation {
     let sid = &result.session_id;
-    let child_code = result.error.as_ref().map_or("", |e| e.code.as_str());
-    let child_msg = result
-        .error
-        .as_ref()
-        .map_or("", |e| e.message.trim());
-    let is_blocked = matches!(child_code, "TOOL_OUTCOME_UNKNOWN" | "RECOVERY_BLOCKED");
-    let error = |code: &str, why: &str| {
-        let guidance = if is_blocked {
-            "that session is blocked by an unresolved mutating tool call and cannot be resumed \
-             until an operator resolves it; omit session_id to start a new subagent session if \
-             needed"
-        } else {
-            "its history is kept and it can be resumed with session_id"
-        };
-        let detail_suffix = match (child_code.is_empty(), child_msg.is_empty()) {
-            (true, true) => String::new(),
-            (false, true) => format!(" ({child_code})"),
-            (true, false) => format!(" ({child_msg})"),
-            (false, false) => format!(" ({child_code}: {child_msg})"),
-        };
-        Err(ToolError {
-            code: code.into(),
-            message: format!("subagent session {sid} {why}{detail_suffix}; {guidance}"),
-        })
-    };
     match result.status {
         RunStatus::Completed => {
             // Thiếu/rỗng final text (kể cả final pointer không đọc được) => placeholder.
             let text = result.output.as_deref().filter(|t| !t.trim().is_empty());
             let empty_text = text.is_none();
             let output = text.unwrap_or(EMPTY_TEXT_PLACEHOLDER);
-            Ok(ToolOutcome {
+            Delegation::Done(Ok(ToolOutcome {
                 call_id: scope.tool_call_id.clone(),
                 content: format!(
                     "<subagent sessionID=\"{sid}\" state=\"completed\">\n{output}\n</subagent>"
@@ -91,20 +66,46 @@ pub(super) fn outcome_of(scope: &ToolScope, result: AgentResult) -> Result<ToolO
                     "status": "completed",
                     "empty_text": empty_text,
                 }),
-            })
+            }))
         }
-        RunStatus::TimedOut => error("PROVIDER_TIMEOUT", "timed out waiting for the provider"),
-        RunStatus::Cancelled => error("CHILD_CANCELLED", "was cancelled"),
-        RunStatus::Failed | RunStatus::Interrupted | RunStatus::Running => {
-            let model_problem = matches!(
-                result.error.as_ref().map(|e| e.code.as_str()),
-                Some("MODEL_NOT_CONFIGURED" | "PROVIDER_AUTH_FAILED")
-            );
-            if model_problem {
-                error("MODEL_UNAVAILABLE", "could not use its model")
-            } else {
-                error("CHILD_FAILED", "did not complete")
-            }
+        RunStatus::TimedOut
+        | RunStatus::Cancelled
+        | RunStatus::Failed
+        | RunStatus::Interrupted
+        | RunStatus::Running
+        | RunStatus::WaitingRetry
+        | RunStatus::WaitingUser => {
+            let stop_reason = result
+                .error
+                .as_ref()
+                .map(|e| e.code.trim())
+                .filter(|c| !c.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| match result.status {
+                    RunStatus::Cancelled => "CANCELLED".into(),
+                    RunStatus::TimedOut => "PROVIDER_TIMEOUT".into(),
+                    _ => "CHILD_FAILED".into(),
+                });
+            let retryable = result.status != RunStatus::Cancelled
+                && !matches!(
+                    stop_reason.as_str(),
+                    "TOOL_OUTCOME_UNKNOWN"
+                        | "RECOVERY_BLOCKED"
+                        | "BUDGET_EXHAUSTED"
+                        | "MODEL_NOT_CONFIGURED"
+                        | "PROVIDER_INVALID_REQUEST"
+                        | "PROVIDER_AUTH_FAILED"
+                        | "PROVIDER_CONFIG_CHANGED"
+                        | "CANCELLED"
+                        | "CHILD_CANCELLED"
+                );
+            Delegation::Failed(ChildFailure {
+                session_id: result.session_id,
+                status: result.status,
+                stop_reason,
+                retryable,
+                partial_result: result.partial_output,
+            })
         }
     }
 }

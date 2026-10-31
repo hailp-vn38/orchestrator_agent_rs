@@ -476,7 +476,7 @@ async fn at35_gateway_error_persists_no_invocation_and_runs_no_tool() {
     let env = Env::new();
     let gw = ScriptedGateway::new();
     let (t, runs) = Probe::new("echo_tool", ToolEffect::ReadOnly, Behavior::Echo);
-    gw.push_error(orchestrator_agent_rs::test_support::GatewayError::Provider);
+    gw.push_error(orchestrator_agent_rs::test_support::GatewayError::InvalidRequest);
     let (o, sid) = one_session(&env, &gw, vec![t], env.agent(&["echo_tool"], &[])).await;
     let r = run_turn(&o, &sid, "go").await;
     assert_eq!(r.status, RunStatus::Failed);
@@ -655,7 +655,7 @@ async fn at43_provider_call_ids_are_not_global_keys() {
     );
     let (o, sid) = one_session(&env, &gw, vec![t], env.agent(&["echo_tool"], &[])).await;
     let r = run_turn(&o, &sid, "go").await;
-    assert_eq!(r.status, RunStatus::Failed);
+    assert_eq!(r.status, RunStatus::WaitingRetry);
     assert_eq!(
         r.error.as_ref().map(|e| e.code.as_str()),
         Some("PROVIDER_PROTOCOL_ERROR")

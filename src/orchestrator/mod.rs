@@ -36,12 +36,14 @@ mod tests;
 pub(crate) struct LiveAgentCatalog {
     pub agents: HashMap<&'static str, &'static AgentDefinition>,
     pub fingerprints: BTreeMap<&'static str, &'static str>,
+    pub fast_retries: BTreeMap<&'static str, u8>,
 }
 
 impl LiveAgentCatalog {
     pub(crate) fn new(
         agents: HashMap<String, AgentDefinition>,
         fingerprints: BTreeMap<String, String>,
+        fast_retries: BTreeMap<String, u8>,
         prev: Option<&Self>,
     ) -> Self {
         let mut next_agents = HashMap::with_capacity(agents.len());
@@ -58,26 +60,42 @@ impl LiveAgentCatalog {
             }
         }
         let mut next_fps = BTreeMap::new();
+        let mut next_retries = BTreeMap::new();
         for (id, fp) in fingerprints {
-            match prev.and_then(|p| p.fingerprints.get_key_value(id.as_str())) {
-                Some((&prev_id, &prev_fp)) if prev_fp == fp => {
-                    next_fps.insert(prev_id, prev_fp);
-                }
-                _ => {
-                    let leaked_id: &'static str = Box::leak(id.into_boxed_str());
-                    let leaked_fp: &'static str = Box::leak(fp.into_boxed_str());
-                    next_fps.insert(leaked_id, leaked_fp);
-                }
-            }
+            let retries = fast_retries.get(&id).copied().unwrap_or(2);
+            let leaked_id: &'static str =
+                match prev.and_then(|p| p.fingerprints.get_key_value(id.as_str())) {
+                    Some((&prev_id, &prev_fp)) if prev_fp == fp => {
+                        next_fps.insert(prev_id, prev_fp);
+                        prev_id
+                    }
+                    _ => {
+                        let leaked_id: &'static str = Box::leak(id.into_boxed_str());
+                        let leaked_fp: &'static str = Box::leak(fp.into_boxed_str());
+                        next_fps.insert(leaked_id, leaked_fp);
+                        leaked_id
+                    }
+                };
+            next_retries.insert(leaked_id, retries);
         }
         Self {
             agents: next_agents,
             fingerprints: next_fps,
+            fast_retries: next_retries,
         }
     }
 
     pub(crate) fn get_agent(&self, id: &str) -> Option<&'static AgentDefinition> {
         self.agents.get(id).copied()
+    }
+
+    pub(crate) fn fast_retries_for(&self, provider_id: &str) -> u8 {
+        self.fast_retries.get(provider_id).copied().unwrap_or(2)
+    }
+
+    pub(crate) fn route_of_live(&self, agent_id: &str) -> Option<RunRoute> {
+        let def = self.get_agent(agent_id)?;
+        route_of_live(def, &self.fingerprints)
     }
 }
 

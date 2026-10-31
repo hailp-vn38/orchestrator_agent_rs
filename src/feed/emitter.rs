@@ -59,6 +59,28 @@ impl Emitter {
         });
     }
 
+    pub(crate) async fn run_waiting(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        error_code: &str,
+        retry_reason: &str,
+        next_attempt_at: Option<i64>,
+    ) {
+        self.committed_run(
+            run_id,
+            event::RUN_WAITING,
+            json!({
+                "status": status.as_str(),
+                "error_code": error_code,
+                "reason": retry_reason,
+                "retry_reason": retry_reason,
+                "next_attempt_at": next_attempt_at,
+            }),
+        )
+        .await;
+    }
+
     /// Sau khi run đã commit terminal: event cho invocation bị đóng cùng transaction (nếu có),
     /// rồi event terminal của run. Gọi **chỉ** khi commit thành công.
     pub(crate) async fn run_terminal(

@@ -12,6 +12,7 @@
 //! (Root tự đánh giá), `completed` chỉ là execution status.
 
 use crate::tool::{ToolError, ToolOutcome};
+use crate::types::RunStatus;
 
 mod input;
 mod manager;
@@ -25,10 +26,22 @@ pub(crate) use manager::TaskManager;
 /// Tên built-in tool ủy quyền cho subagent.
 pub(crate) const SUBAGENT_TOOL: &str = "subagent";
 
+/// Kết quả lỗi có cấu trúc khi child turn kết thúc ở trạng thái không-completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChildFailure {
+    pub session_id: String,
+    pub status: RunStatus,
+    pub stop_reason: String,
+    pub retryable: bool,
+    pub partial_result: Option<String>,
+}
+
 /// Kết quả của một lần ủy quyền.
 pub(crate) enum Delegation {
-    /// Outcome để runtime ghi thành tool-result (thành công hoặc ToolError kỹ thuật).
+    /// Outcome để runtime ghi thành tool-result (thành công hoặc ToolError kỹ thuật trước khi chạy).
     Done(Result<ToolOutcome, ToolError>),
+    /// Child turn kết thúc ở trạng thái không-completed: trả kết quả có cấu trúc.
+    Failed(ChildFailure),
     /// Parent bị hủy hợp tác (shutdown) khi đang admit/đợi: không có result để ghi.
     Cancelled,
 }

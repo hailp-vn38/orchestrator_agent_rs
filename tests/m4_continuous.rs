@@ -617,7 +617,7 @@ async fn at35_tool_call_ready_then_stream_error_runs_nothing_and_persists_nothin
                 name: "echo".into(),
             },
         ],
-        GatewayError::Transport,
+        GatewayError::InvalidRequest,
     );
     let (o, sid) = root_session(&env, env.config(vec![env.root(&["echo"])]), &gw, vec![echo]).await;
 
@@ -901,4 +901,116 @@ async fn a_zero_agent_context_limit_is_rejected_at_build() {
         e.reason().map(|r| r.as_str()),
         Some("INVALID_RUNTIME_CONFIG")
     );
+}
+
+#[tokio::test]
+async fn root_slot_released() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+
+    // Hai root đầu gọi subagent; mỗi child gặp lỗi Auth -> rơi vào waiting_user.
+    // Root thứ ba chỉ cần trả lời text ngay.
+    gw.push_tool_calls(
+        "",
+        vec![(
+            "r1",
+            "subagent",
+            json!({ "agent": "worker", "description": "d1", "prompt": "work 1" }),
+        )],
+    );
+    gw.push_error(GatewayError::Auth);
+    gw.push_tool_calls(
+        "",
+        vec![(
+            "r2",
+            "subagent",
+            json!({ "agent": "worker", "description": "d2", "prompt": "work 2" }),
+        )],
+    );
+    gw.push_error(GatewayError::Auth);
+    gw.push_text("third root finished without waiting");
+
+    let mut cfg = env.config(vec![env.root(&["subagent"]), env.worker(&[])]);
+    cfg.runtime.max_concurrent_root_runs = Some(2);
+    cfg.llm.providers[0].limits.fast_retries = 0;
+    let o = build(cfg, &gw, vec![]).await;
+
+    let s1 = o.create_session(&alice(), "root").await.unwrap();
+    let s2 = o.create_session(&alice(), "root").await.unwrap();
+    let s3 = o.create_session(&alice(), "root").await.unwrap();
+
+    let _t1 = o.submit(&alice(), &s1, "first".into()).await.unwrap();
+    // Chờ child thứ nhất vào waiting_user để thứ tự kịch bản gateway hoàn toàn tất định.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while env
+        .scalar("SELECT COUNT(*) FROM agent_runs WHERE status = 'waiting_user'")
+        .await
+        < 1
+    {
+        assert!(std::time::Instant::now() < deadline, "child 1 not waiting");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let _t2 = o.submit(&alice(), &s2, "second".into()).await.unwrap();
+    while env
+        .scalar("SELECT COUNT(*) FROM agent_runs WHERE status = 'waiting_user'")
+        .await
+        < 2
+    {
+        assert!(std::time::Instant::now() < deadline, "child 2 not waiting");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Dù cả s1 và s2 vẫn đang 'running' (đợi con đang chờ), slot của chúng được coi là parked,
+    // nên s3 vẫn được chạy và hoàn thành với giới hạn max_concurrent_root_runs = 2.
+    let r3 = run_turn(&o, &s3, "third").await;
+    assert_eq!(r3.status, RunStatus::Completed);
+    assert_eq!(
+        r3.output.as_deref(),
+        Some("third root finished without waiting")
+    );
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn followup_during_waiting() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    gw.push_error(GatewayError::Auth);
+    gw.push_text("first turn completed after resume");
+    gw.push_text("followup turn completed");
+
+    let mut cfg = env.config(vec![env.root(&[])]);
+    cfg.llm.providers[0].limits.fast_retries = 0;
+    let (o, sid) = root_session(&env, cfg, &gw, vec![]).await;
+
+    let t1 = o.submit(&alice(), &sid, "turn 1".into()).await.unwrap();
+    let r1_waiting = wait_terminal(&o, &sid, &t1.turn_id).await;
+    assert_eq!(r1_waiting.status, RunStatus::WaitingUser);
+
+    // Trong lúc đang ở trạng thái chờ, submit trực tiếp nhận SESSION_BUSY từ unique index.
+    let busy = o.submit(&alice(), &sid, "followup".into()).await.unwrap_err();
+    assert_eq!(busy.code(), orchestrator_agent_rs::ErrorCode::SessionBusy);
+
+    // Khi resume_waiting chạy xong turn 1, follow-up submit chạy tiếp bình thường.
+    o.resume_waiting(&alice(), &sid).await.unwrap();
+    let started = std::time::Instant::now();
+    let r1_done = loop {
+        let res = o.result(&alice(), &sid, &t1.turn_id).await.unwrap();
+        if res.status.is_terminal() {
+            break res;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "turn 1 stuck");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(r1_done.status, RunStatus::Completed);
+    assert_eq!(
+        r1_done.output.as_deref(),
+        Some("first turn completed after resume")
+    );
+
+    let r2 = run_turn(&o, &sid, "followup").await;
+    assert_eq!(r2.status, RunStatus::Completed);
+    assert_eq!(r2.output.as_deref(), Some("followup turn completed"));
+    o.shutdown().await.unwrap();
 }

@@ -46,6 +46,10 @@ use model::RunSnapshot;
 const STEP_LIMIT_GUIDANCE: &str = "The step limit for this task has been reached. Tools are \
 no longer available. Reply with text only: summarize the work completed so far and list the \
 remaining work, without calling any tool.";
+/// Hướng dẫn gửi cho model khi cùng một bước LLM chạm `RequestLimitExceeded` từ 2 lần trở lên.
+const SPLIT_OUTPUT_GUIDANCE: &str = "The previous response exceeded the single-request time \
+limit. Break the remaining work into smaller steps: use tools to save intermediate results \
+or reply with the next self-contained part first.";
 /// Text lưu khi model chạm cap mà không trả text nào.
 const STEP_LIMIT_FALLBACK: &str = "The step limit was reached before the task was finished; \
 no progress summary was produced.";
@@ -56,6 +60,7 @@ pub(crate) struct ContextPolicy {
     pub limit_tokens: usize,
     pub threshold_percent: u8,
     pub keep_recent: usize,
+    pub max_resume_attempts: u32,
 }
 
 impl ContextPolicy {
@@ -214,7 +219,11 @@ impl AgentRuntime {
             }
 
             // Tới cap: request text-only, response là kết quả của run (không tạo run mới).
-            let capped = match (snapshot.agent.steps, self.store.run_steps(run_id).await) {
+            // Tính tổng steps trên toàn bộ turn (xuyên suốt các attempt).
+            let capped = match (
+                snapshot.agent.steps,
+                self.store.turn_steps(&run.session_id, &run.turn_id).await,
+            ) {
                 (Some(limit), Ok(done)) => done >= limit,
                 (_, Err(_)) => return Settlement::Unsettled,
                 _ => false,

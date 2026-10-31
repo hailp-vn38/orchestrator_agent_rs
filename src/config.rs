@@ -243,6 +243,8 @@ pub struct RequestLimits {
     pub first_byte: Duration,
     pub idle: Duration,
     pub max_total: Duration,
+    /// Số lần thử lại nhanh trong cùng một bước LLM (mặc định: 2; profile `Agentic`: 1).
+    pub fast_retries: u8,
 }
 
 impl RequestLimits {
@@ -252,6 +254,7 @@ impl RequestLimits {
             first_byte: limit,
             idle: limit,
             max_total: limit,
+            fast_retries: 2,
         }
     }
 }

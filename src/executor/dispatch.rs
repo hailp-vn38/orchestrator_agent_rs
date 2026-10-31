@@ -87,6 +87,29 @@ impl ToolExecutor {
                     .await
                 {
                     Delegation::Done(result) => Dispatch::Settled(self.settle(result)),
+                    Delegation::Failed(failure) => {
+                        let body = failure.partial_result.as_deref().unwrap_or("");
+                        let raw_text = format!(
+                            "<subagent sessionID=\"{}\" state=\"failed\" retryable=\"{}\" stop_reason=\"{}\">\n{}\n</subagent>",
+                            failure.session_id, failure.retryable, failure.stop_reason, body
+                        );
+                        let model_text =
+                            super::truncate_utf8(&raw_text, self.limits.model_cap_bytes);
+                        let result_json = json!({
+                            "session_id": failure.session_id,
+                            "status": failure.status.as_str(),
+                            "stop_reason": failure.stop_reason,
+                            "retryable": failure.retryable,
+                            "partial_result": failure.partial_result,
+                        })
+                        .to_string();
+                        Dispatch::Settled(Settled {
+                            failed: true,
+                            model_text,
+                            result_json,
+                            error_code: Some(failure.stop_reason),
+                        })
+                    }
                     Delegation::Cancelled => Dispatch::Cancelled,
                 }
             }

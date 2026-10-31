@@ -12,9 +12,9 @@
 //! sau backoff mũ; quá [`MAX_UNSETTLED_ATTEMPTS`] lần liên tiếp thì runtime chuyển run sang
 //! `interrupted/STORE_UNAVAILABLE` để không gọi lại model vô hạn khi store ghi lỗi kéo dài.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock as StdRwLock};
 use std::time::Duration;
 
 use tokio::sync::{Notify, RwLock};
@@ -24,9 +24,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::error::{ErrorCode, OrchestratorError};
+use crate::orchestrator::LiveAgentCatalog;
 use crate::owner_lock::OwnerLock;
 use crate::runtime::{AgentRuntime, Settlement};
-use crate::store::SessionStore;
+use crate::store::{RecoveryPolicy, SessionStore};
 
 /// Số lần `Unsettled` liên tiếp của một run trước khi bỏ cuộc (mỗi lần có thể là một lần gọi
 /// model). Run bỏ cuộc vẫn phục hồi được ở lần khởi động sau.
@@ -79,6 +80,9 @@ struct Retry {
 struct Shared {
     store: SessionStore,
     runtime: AgentRuntime,
+    catalog: Arc<StdRwLock<LiveAgentCatalog>>,
+    replay_safe: Arc<BTreeSet<String>>,
+    max_resume_attempts: u32,
     owned: Mutex<HashMap<String, Owned>>,
     /// Backoff của run `Unsettled` (in-memory; restart dùng recovery bounded thay thế).
     retries: Mutex<HashMap<String, Retry>>,
@@ -110,9 +114,13 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 impl Supervisor {
     /// Phải gọi trong Tokio runtime của host; không tạo runtime.
-    pub(crate) fn start(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start(
         store: SessionStore,
         runtime: AgentRuntime,
+        catalog: Arc<StdRwLock<LiveAgentCatalog>>,
+        replay_safe: Arc<BTreeSet<String>>,
+        max_resume_attempts: u32,
         sweep: Duration,
         max_root_runs: Option<usize>,
         owner_lock: OwnerLock,
@@ -122,6 +130,9 @@ impl Supervisor {
         let shared = Arc::new(Shared {
             store,
             runtime,
+            catalog,
+            replay_safe,
+            max_resume_attempts,
             owned: Mutex::new(HashMap::new()),
             retries: Mutex::new(HashMap::new()),
             signal,
@@ -131,6 +142,7 @@ impl Supervisor {
             max_root_runs,
             owner_lock: Mutex::new(Some(owner_lock)),
         });
+        shared.reconcile().await;
         let handle = tokio::spawn(Arc::clone(&shared).run_loop());
         Self {
             shared,
@@ -270,7 +282,6 @@ impl Shared {
     }
 
     async fn run_loop(self: Arc<Self>) {
-        self.reconcile().await;
         let mut tick = tokio::time::interval_at(Instant::now() + self.sweep, self.sweep);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -308,6 +319,19 @@ impl Shared {
         if self.cancel.is_cancelled() {
             return;
         }
+        let route = |agent_id: &str| {
+            self.catalog
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .route_of_live(agent_id)
+        };
+        let replay_safe = |tool: &str| self.replay_safe.contains(tool);
+        let policy = RecoveryPolicy {
+            max_resume_attempt: self.max_resume_attempts,
+            route: &route,
+            replay_safe: &replay_safe,
+        };
+        let _ = self.store.resume_due_waiting(&policy).await;
         self.spawn_unowned(false).await;
     }
 
@@ -322,6 +346,11 @@ impl Shared {
                 return;
             }
         };
+        let parked_roots = self
+            .store
+            .roots_parked_on_waiting_child()
+            .await
+            .unwrap_or_default();
         let now = Instant::now();
         let mut owned = lock(&self.owned);
         let mut retries = lock(&self.retries);
@@ -329,7 +358,10 @@ impl Shared {
         retries.retain(|id, _| claims.iter().any(|(c, _)| c == id));
         // Handle đã kết thúc mà chưa tự xóa (vd. worker panic) không còn là owner hợp lệ.
         owned.retain(|_, o| !o.handle.is_finished());
-        let mut active_roots = owned.values().filter(|o| o.root).count();
+        let mut active_roots = owned
+            .iter()
+            .filter(|(id, o)| o.root && !parked_roots.contains(*id))
+            .count();
         for (id, is_child) in claims {
             if owned.contains_key(&id) {
                 continue;

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use llm::error::LLMError;
 
 /// Lỗi gateway đã sanitize: văn bản thô của provider bị bỏ (có thể echo secret).
@@ -11,10 +13,20 @@ pub enum GatewayError {
     Timeout,
     Stalled,
     RequestLimitExceeded,
+    RateLimited { retry_after_secs: Option<u64> },
     Cancelled,
     Protocol,
     /// Provider từ chối vì prompt vượt context window trước khi sinh output.
     ContextOverflow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureClass {
+    Retryable { retry_after: Option<Duration> },
+    RetryOnceThenSplit,
+    NeedsUser,
+    Permanent,
+    Cancelled,
 }
 
 impl GatewayError {
@@ -28,6 +40,7 @@ impl GatewayError {
             Self::Timeout => "PROVIDER_TIMEOUT",
             Self::Stalled => "PROVIDER_STALLED",
             Self::RequestLimitExceeded => "REQUEST_LIMIT_EXCEEDED",
+            Self::RateLimited { .. } => "PROVIDER_RATE_LIMITED",
             Self::Cancelled => "CANCELLED",
             Self::Protocol => "PROVIDER_PROTOCOL_ERROR",
             Self::ContextOverflow => "CONTEXT_LIMIT",
@@ -44,10 +57,32 @@ impl GatewayError {
             Self::Transport => "could not reach the provider",
             Self::Timeout => "the provider request timed out",
             Self::Stalled => "the provider stream stalled without activity",
-            Self::RequestLimitExceeded => "the provider request exceeded the maximum total duration",
+            Self::RequestLimitExceeded => {
+                "the provider request exceeded the maximum total duration"
+            }
+            Self::RateLimited { .. } => "the provider rate limited the request",
             Self::Cancelled => "the request was cancelled",
             Self::Protocol => "the provider returned an unexpected response",
             Self::ContextOverflow => "the conversation exceeds the model context limit",
+        }
+    }
+
+    pub(crate) fn classify(self) -> FailureClass {
+        match self {
+            Self::Stalled
+            | Self::Timeout
+            | Self::Transport
+            | Self::Provider
+            | Self::Protocol => FailureClass::Retryable { retry_after: None },
+            Self::RateLimited { retry_after_secs } => FailureClass::Retryable {
+                retry_after: retry_after_secs.map(Duration::from_secs),
+            },
+            Self::RequestLimitExceeded => FailureClass::RetryOnceThenSplit,
+            Self::Auth => FailureClass::NeedsUser,
+            Self::NotConfigured | Self::InvalidRequest | Self::ContextOverflow => {
+                FailureClass::Permanent
+            }
+            Self::Cancelled => FailureClass::Cancelled,
         }
     }
 }
@@ -71,7 +106,10 @@ pub(crate) fn map_error(e: &LLMError) -> GatewayError {
             }
             Some(401) | Some(403) => GatewayError::Auth,
             Some(400) | Some(404) | Some(413) | Some(422) => GatewayError::InvalidRequest,
-            Some(429) | Some(500..=599) => GatewayError::Provider,
+            Some(429) => GatewayError::RateLimited {
+                retry_after_secs: None,
+            },
+            Some(500..=599) => GatewayError::Provider,
             _ => GatewayError::Protocol,
         },
         LLMError::JsonError(_) | LLMError::Generic(_) => GatewayError::Protocol,

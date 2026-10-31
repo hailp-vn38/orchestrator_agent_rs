@@ -269,6 +269,6 @@ impl TaskManager {
             // Child dừng vì shutdown chung: parent cũng bị interrupted, không ghi result giả.
             return Delegation::Cancelled;
         }
-        Delegation::Done(outcome_of(scope, result))
+        outcome_of(scope, result)
     }
 }

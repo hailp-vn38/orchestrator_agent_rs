@@ -78,6 +78,8 @@ pub enum VerifiedToolResolution {
 #[non_exhaustive]
 pub enum RunStatus {
     Running,
+    WaitingRetry,
+    WaitingUser,
     Completed,
     Failed,
     Cancelled,
@@ -89,6 +91,8 @@ impl RunStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::WaitingRetry => "waiting_retry",
+            Self::WaitingUser => "waiting_user",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -100,6 +104,8 @@ impl RunStatus {
     pub(crate) fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "running" => Self::Running,
+            "waiting_retry" => Self::WaitingRetry,
+            "waiting_user" => Self::WaitingUser,
             "completed" => Self::Completed,
             "failed" => Self::Failed,
             "cancelled" => Self::Cancelled,
@@ -110,7 +116,11 @@ impl RunStatus {
     }
 
     pub fn is_terminal(self) -> bool {
-        self != Self::Running
+        !matches!(self, Self::Running | Self::WaitingRetry | Self::WaitingUser)
+    }
+
+    pub fn is_waiting(self) -> bool {
+        matches!(self, Self::WaitingRetry | Self::WaitingUser)
     }
 }
 
@@ -192,8 +202,12 @@ pub struct AgentResult {
     /// Chỉ có khi attempt mới nhất đã commit `final_message_id`; không lấy assistant
     /// text cuối của session hay của attempt trước.
     pub output: Option<String>,
+    /// Văn bản assistant đã commit gần nhất trong cùng `(session_id, turn_id)` khi chưa có `output`.
+    pub partial_output: Option<String>,
     pub final_message_id: Option<String>,
     pub error: Option<ResultError>,
+    pub next_attempt_at: Option<i64>,
+    pub retry_reason: Option<String>,
     /// Trang đầu giới hạn các artifact đã commit của turn (docs/18 §18.7).
     pub artifact_preview: Vec<ArtifactRef>,
     /// Cursor opaque để đọc trang artifact tiếp theo qua `Orchestrator::list_artifacts`.
@@ -385,6 +399,8 @@ pub struct RunSnapshot {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub error: Option<ResultError>,
+    pub next_attempt_at: Option<i64>,
+    pub retry_reason: Option<String>,
 }
 
 impl RunSnapshot {
@@ -441,11 +457,11 @@ pub struct FamilySnapshot {
 }
 
 impl FamilySnapshot {
-    /// Còn run `Running` trong family: host phải refresh snapshot định kỳ (kể cả khi stream
-    /// còn sống) để bắt terminal commit bị mất publication. Hết active thì dừng refresh.
+    /// Còn run chưa terminal (`Running | WaitingRetry | WaitingUser`) trong family: host phải
+    /// refresh snapshot định kỳ để bắt terminal commit hoặc tiến trình retry.
     pub fn has_active_work(&self) -> bool {
         self.sessions()
-            .any(|s| matches!(&s.latest_run, Some(r) if r.status == RunStatus::Running))
+            .any(|s| matches!(&s.latest_run, Some(r) if !r.status.is_terminal()))
     }
 
     /// Root rồi tới các Child.
@@ -523,6 +539,8 @@ pub struct RunSummary {
     pub finished_at: Option<i64>,
     pub final_message_id: Option<String>,
     pub error: Option<ResultError>,
+    pub next_attempt_at: Option<i64>,
+    pub retry_reason: Option<String>,
 }
 
 impl RunSummary {

@@ -27,7 +27,8 @@ pub(crate) use artifact::{PublishError, PublishScope, StoredArtifact};
 pub(crate) use codec::new_id;
 pub(crate) use observe::EventInfo;
 pub(crate) use recovery::{
-    RecoveryPolicy, Resolution, CODE_NO_EFFECT, CODE_SHUTTING_DOWN, CODE_STORE_UNAVAILABLE,
+    RecoveryPolicy, Resolution, CODE_EXHAUSTED, CODE_NO_EFFECT, CODE_SHUTTING_DOWN,
+    CODE_STORE_UNAVAILABLE,
 };
 pub(crate) use types::{
     Checkpoint, ChildAdmission, ChildAdmitError, ChildTarget, Context, NewCheckpoint,
@@ -40,4 +41,6 @@ pub(crate) const DB_FILE: &str = "orchestrator.db";
 #[derive(Clone)]
 pub(crate) struct SessionStore {
     pool: SqlitePool,
+    sys_base_secs: i64,
+    tok_base: tokio::time::Instant,
 }

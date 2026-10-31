@@ -1,5 +1,6 @@
 //! Tên event dùng chung cho publisher, fault hook và test.
 pub(crate) const RUN_STARTED: &str = "run.started";
+pub(crate) const RUN_WAITING: &str = "run.waiting";
 pub(crate) const RUN_COMPLETED: &str = "run.completed";
 pub(crate) const RUN_FAILED: &str = "run.failed";
 pub(crate) const RUN_CANCELLED: &str = "run.cancelled";

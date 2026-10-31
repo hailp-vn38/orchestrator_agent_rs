@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::json;
 
@@ -12,13 +13,17 @@ use crate::agent::AgentDefinition;
 use crate::compaction::estimate_tokens;
 use crate::feed::{chunks, event};
 use crate::gateway::{
-    GatewayError, ModelMessage, ModelRequest, ModelResponse, ModelRole, ModelTool, StreamEvent,
+    FailureClass, GatewayError, ModelMessage, ModelRequest, ModelResponse, ModelRole, ModelTool,
+    StreamEvent,
 };
 use crate::prompt::context_messages;
 use crate::skill::SkillManager;
 use crate::store::{new_id, RunRecord};
 
-use super::{AgentRuntime, Settlement, STEP_LIMIT_GUIDANCE};
+use super::{AgentRuntime, Settlement, SPLIT_OUTPUT_GUIDANCE, STEP_LIMIT_GUIDANCE};
+
+const FAST_RETRY_BACKOFF: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(30)];
+const FAST_RETRY_MAX_WAIT: Duration = Duration::from_secs(30);
 
 pub(super) struct RunSnapshot {
     pub agent: AgentDefinition,
@@ -70,31 +75,75 @@ impl AgentRuntime {
                     .ok_or(Settlement::Unsettled)?;
             }
         }
-        let mut retried = false;
+        let max_fast_retries = self
+            .catalog
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .fast_retries_for(&run.provider_id)
+            .min(FAST_RETRY_BACKOFF.len() as u8) as usize;
+        let mut fast_attempt = 0usize;
+        let mut overflow_retried = false;
         loop {
             let step_id = new_id();
-            match self.stream_step(run, &request, cancel, &step_id).await {
+            let err = match self.stream_step(run, &request, cancel, &step_id).await {
                 Ok(response) => {
                     self.record_usage(run_id, &response).await;
                     return Ok((response, step_id));
                 }
-                Err(GatewayError::ContextOverflow) if !retried => {
-                    retried = true;
+                Err(GatewayError::ContextOverflow) if !overflow_retried => {
+                    overflow_retried = true;
                     match self.compact(run, snapshot.agent.llm, cancel).await {
                         Ok(true) => {
                             request = self
                                 .step_request(run, snapshot, capped)
                                 .await
                                 .ok_or(Settlement::Unsettled)?;
+                            continue;
                         }
                         Ok(false) => {
-                            return Err(self.fail(run_id, GatewayError::ContextOverflow).await)
+                            return Err(self.fail(run_id, GatewayError::ContextOverflow).await);
                         }
-                        Err(e) => return Err(self.fail(run_id, e).await),
+                        Err(e) => {
+                            // Lỗi tạm thời khi compact được phép retry nhanh và retry lại compact.
+                            overflow_retried = false;
+                            e
+                        }
                     }
                 }
-                Err(e) => return Err(self.fail(run_id, e).await),
+                Err(e) => e,
+            };
+
+            let delay = match err.classify() {
+                FailureClass::Retryable { retry_after } if fast_attempt < max_fast_retries => {
+                    if retry_after.is_some_and(|d| d > FAST_RETRY_MAX_WAIT) {
+                        None
+                    } else {
+                        let base = FAST_RETRY_BACKOFF[fast_attempt];
+                        Some(retry_after.map_or(base, |d| d.max(base)))
+                    }
+                }
+                FailureClass::RetryOnceThenSplit if fast_attempt < max_fast_retries => {
+                    Some(FAST_RETRY_BACKOFF[fast_attempt])
+                }
+                _ => None,
+            };
+
+            if let Some(delay) = delay {
+                fast_attempt += 1;
+                tokio::select! {
+                    () = cancel.cancelled() => {
+                        return Err(self.fail(run_id, GatewayError::Cancelled).await);
+                    }
+                    () = tokio::time::sleep(delay) => {}
+                }
+                request = self
+                    .step_request(run, snapshot, capped)
+                    .await
+                    .ok_or(Settlement::Unsettled)?;
+                continue;
             }
+
+            return Err(self.fail(run_id, err).await);
         }
     }
 
@@ -189,7 +238,7 @@ impl AgentRuntime {
         };
         let step_num = self
             .store
-            .run_steps(run_id)
+            .turn_steps(&run.session_id, &run.turn_id)
             .await
             .unwrap_or(0)
             .saturating_add(1);
@@ -226,7 +275,8 @@ impl AgentRuntime {
         result
     }
 
-    /// Request của step; khi `capped` bỏ mọi tool và thêm hướng dẫn text-only.
+    /// Request của step; khi `capped` bỏ mọi tool và thêm hướng dẫn text-only; khi cùng bước đã
+    /// bị `RequestLimitExceeded` >= 2 lần trong turn thì đính kèm `SPLIT_OUTPUT_GUIDANCE`.
     pub(super) async fn step_request(
         &self,
         run: &RunRecord,
@@ -234,11 +284,26 @@ impl AgentRuntime {
         capped: bool,
     ) -> Option<ModelRequest> {
         let mut request = self.build_request(run, snapshot).await?;
+        let step_num = self
+            .store
+            .turn_steps(&run.session_id, &run.turn_id)
+            .await
+            .ok()?
+            .saturating_add(1);
+        let limit_exceeded = self
+            .store
+            .turn_step_limit_exceeded_count(&run.session_id, &run.turn_id, step_num)
+            .await
+            .unwrap_or(0);
         if capped {
             request.tools.clear();
             request
                 .messages
                 .push(ModelMessage::text(ModelRole::User, STEP_LIMIT_GUIDANCE));
+        } else if limit_exceeded >= 2 {
+            request
+                .messages
+                .push(ModelMessage::text(ModelRole::User, SPLIT_OUTPUT_GUIDANCE));
         }
         Some(request)
     }

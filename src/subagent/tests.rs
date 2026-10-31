@@ -49,11 +49,14 @@ fn result(status: RunStatus, output: Option<&str>, code: Option<&str>) -> AgentR
         input_tokens: 0,
         output_tokens: 0,
         output: output.map(str::to_owned),
+        partial_output: None,
         final_message_id: output.map(|_| "m".into()),
         error: code.map(|c| crate::types::ResultError {
             code: c.into(),
             message: "m".into(),
         }),
+        next_attempt_at: None,
+        retry_reason: None,
         artifact_preview: Vec::new(),
         artifacts_next_cursor: None,
     }
@@ -62,7 +65,11 @@ fn result(status: RunStatus, output: Option<&str>, code: Option<&str>) -> AgentR
 #[test]
 fn missing_or_blank_final_text_becomes_a_placeholder_not_a_panic() {
     for output in [None, Some(""), Some("  \n ")] {
-        let out = outcome_of(&scope(), result(RunStatus::Completed, output, None)).unwrap();
+        let Delegation::Done(Ok(out)) =
+            outcome_of(&scope(), result(RunStatus::Completed, output, None))
+        else {
+            panic!("expected Delegation::Done(Ok)");
+        };
         assert!(
             out.content.contains(EMPTY_TEXT_PLACEHOLDER),
             "{}",
@@ -70,7 +77,11 @@ fn missing_or_blank_final_text_becomes_a_placeholder_not_a_panic() {
         );
         assert_eq!(out.metadata["empty_text"], json!(true));
     }
-    let out = outcome_of(&scope(), result(RunStatus::Completed, Some("real"), None)).unwrap();
+    let Delegation::Done(Ok(out)) =
+        outcome_of(&scope(), result(RunStatus::Completed, Some("real"), None))
+    else {
+        panic!("expected Delegation::Done(Ok)");
+    };
     assert_eq!(
         out.content,
         "<subagent sessionID=\"child\" state=\"completed\">\nreal\n</subagent>"
@@ -80,36 +91,32 @@ fn missing_or_blank_final_text_becomes_a_placeholder_not_a_panic() {
 
 #[test]
 fn non_completed_children_map_to_stable_tool_error_codes() {
-    let code = |status, child_code| {
-        outcome_of(&scope(), result(status, None, child_code))
-            .unwrap_err()
-            .code
+    let check = |status, child_code| match outcome_of(&scope(), result(status, None, child_code)) {
+        Delegation::Failed(f) => (f.stop_reason, f.retryable),
+        _ => panic!("expected Delegation::Failed"),
     };
     assert_eq!(
-        code(RunStatus::TimedOut, Some("PROVIDER_TIMEOUT")),
-        "PROVIDER_TIMEOUT"
-    );
-    assert_eq!(code(RunStatus::Cancelled, None), "CHILD_CANCELLED");
-    assert_eq!(
-        code(RunStatus::Failed, Some("PROVIDER_UNAVAILABLE")),
-        "CHILD_FAILED"
+        check(RunStatus::TimedOut, Some("PROVIDER_TIMEOUT")),
+        ("PROVIDER_TIMEOUT".into(), true)
     );
     assert_eq!(
-        code(RunStatus::Interrupted, Some("TOOL_OUTCOME_UNKNOWN")),
-        "CHILD_FAILED"
+        check(RunStatus::Cancelled, None),
+        ("CANCELLED".into(), false)
     );
     assert_eq!(
-        code(RunStatus::Failed, Some("PROVIDER_AUTH_FAILED")),
-        "MODEL_UNAVAILABLE"
+        check(RunStatus::Failed, Some("RECOVERY_ATTEMPTS_EXHAUSTED")),
+        ("RECOVERY_ATTEMPTS_EXHAUSTED".into(), true)
     );
     assert_eq!(
-        code(RunStatus::Failed, Some("MODEL_NOT_CONFIGURED")),
-        "MODEL_UNAVAILABLE"
+        check(RunStatus::Interrupted, Some("TOOL_OUTCOME_UNKNOWN")),
+        ("TOOL_OUTCOME_UNKNOWN".into(), false)
     );
-    let e = outcome_of(&scope(), result(RunStatus::Failed, None, Some("X"))).unwrap_err();
-    assert!(
-        e.message.contains("child") && e.message.contains("session_id"),
-        "{}",
-        e.message
+    assert_eq!(
+        check(RunStatus::Failed, Some("PROVIDER_INVALID_REQUEST")),
+        ("PROVIDER_INVALID_REQUEST".into(), false)
+    );
+    assert_eq!(
+        check(RunStatus::Failed, Some("MODEL_NOT_CONFIGURED")),
+        ("MODEL_NOT_CONFIGURED".into(), false)
     );
 }

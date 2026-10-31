@@ -20,6 +20,7 @@ mod watchdog;
 
 pub use client::ClientGateway;
 pub use collect::strip_thinking_blocks;
+pub(crate) use error::FailureClass;
 pub use error::GatewayError;
 pub(crate) use runtime::RuntimeGateway;
 pub use runtime::{ProviderRuntime, RuntimeProvider};

@@ -207,13 +207,16 @@ async fn build(
 }
 
 async fn wait_terminal(o: &Orchestrator, who: &CallerContext, s: &str, t: &str) -> AgentResult {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let started = std::time::Instant::now();
     loop {
         let r = o.result(who, s, t).await.unwrap();
         if r.status != RunStatus::Running {
             return r;
         }
-        assert!(tokio::time::Instant::now() < deadline, "run stuck: {r:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "run stuck: {r:?}"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -1113,23 +1116,10 @@ async fn child_failures_become_tool_errors_with_the_child_session_id() {
     let env = Env::new();
     let gw = ScriptedGateway::new();
     gw.push_tool_calls("", vec![("c1", "subagent", sub_new("reviewer", "a"))]);
-    gw.push_error(GatewayError::Provider);
+    gw.push_error(GatewayError::InvalidRequest);
     gw.push_with(|req| {
         // Root resume đúng child vừa lỗi (history còn, session dùng lại được).
-        let text = req
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == ModelRole::Tool)
-            .unwrap()
-            .text
-            .clone();
-        let sid = text
-            .split("subagent session ")
-            .nth(1)
-            .and_then(|s| s.split_whitespace().next())
-            .expect("child session id in the error")
-            .to_owned();
+        let sid = session_id_in(req);
         tool_call_response("c2", sub_resume("reviewer", &sid, "retry"))
     });
     gw.push_text("recovered");
@@ -1139,7 +1129,7 @@ async fn child_failures_become_tool_errors_with_the_child_session_id() {
     assert_eq!(r.status, RunStatus::Completed, "{:?}", r.error);
     let t = tool_texts(&history(&o, &sid).await);
     assert!(
-        t[0].contains("CHILD_FAILED") && t[0].contains("PROVIDER_UNAVAILABLE"),
+        t[0].contains("state=\"failed\"") && t[0].contains("PROVIDER_INVALID_REQUEST"),
         "{}",
         t[0]
     );
@@ -1156,16 +1146,16 @@ async fn child_timeout_and_auth_errors_map_to_stable_codes() {
     let env = Env::new();
     let gw = ScriptedGateway::new();
     gw.push_tool_calls("", vec![("c1", "subagent", sub_new("reviewer", "a"))]);
-    gw.push_error(GatewayError::Timeout);
+    gw.push_error(GatewayError::InvalidRequest);
     gw.push_tool_calls("", vec![("c2", "subagent", sub_new("reviewer", "b"))]);
-    gw.push_error(GatewayError::Auth);
+    gw.push_error(GatewayError::NotConfigured);
     gw.push_text("done");
     let (o, sid) = root_with_reviewer(&env, &gw, &["subagent"], &[], vec![]).await;
     let r = run_turn(&o, &sid, "go").await;
     assert_eq!(r.status, RunStatus::Completed, "{:?}", r.error);
     let t = tool_texts(&history(&o, &sid).await);
-    assert!(t[0].contains("PROVIDER_TIMEOUT"), "{}", t[0]);
-    assert!(t[1].contains("MODEL_UNAVAILABLE"), "{}", t[1]);
+    assert!(t[0].contains("PROVIDER_INVALID_REQUEST"), "{}", t[0]);
+    assert!(t[1].contains("MODEL_NOT_CONFIGURED"), "{}", t[1]);
 }
 
 // ─────────────────────────── Shutdown / cancel ───────────────────────────
@@ -1333,4 +1323,223 @@ async fn delete_session_is_busy_while_a_run_is_active() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     o.delete_session(&alice(), &sid).await.unwrap();
+}
+
+#[tokio::test]
+async fn reproduce_c79757ba() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    let (echo, echo_runs) = Probe::new("echo", ToolEffect::ReadOnly, Behavior::Echo);
+
+    // Step 1 của root: gọi echo tool
+    gw.push_tool_calls("", vec![("e1", "echo", json!({"text": "prep"}))]);
+    // Step 2 của root: gọi subagent reviewer
+    gw.push_tool_calls("", vec![("c1", "subagent", sub_new("reviewer", "analyze"))]);
+    // Step 1 của child: trả kết quả
+    gw.push_text("child analysis complete");
+    // Step 3 của root (tổng hợp): timeout hết fast_retries -> chuyển sang waiting_retry
+    gw.push_error(GatewayError::Timeout);
+    // Khi root được resume từ waiting_retry ở attempt 1: dùng lại kết quả con trong transcript
+    gw.push_text("final synthesis from child analysis");
+
+    let mut cfg = env.config(vec![
+        env.root(&["echo", "subagent"], &[]),
+        env.reviewer(&[], &[]),
+    ]);
+    for p in &mut cfg.llm.providers {
+        p.limits.fast_retries = 0;
+    }
+    let o = build(cfg, &gw, vec![echo]).await;
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+
+    tokio::time::pause();
+    let turn = o.submit(&alice(), &sid, "run workflow".into()).await.unwrap();
+
+    // Chờ tới khi root hoàn thành (qua waiting_retry -> resume attempt 1 -> Completed)
+    let started = std::time::Instant::now();
+    let r = loop {
+        let res = o.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+        if res.status.is_terminal() {
+            break res;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "root did not finish: {res:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+
+    assert_eq!(r.status, RunStatus::Completed, "{r:?}");
+    assert_eq!(
+        r.output.as_deref(),
+        Some("final synthesis from child analysis")
+    );
+    assert_eq!(r.attempt, 1, "root must have resumed on attempt 1");
+    assert_eq!(echo_runs.load(Ordering::SeqCst), 1, "echo tool ran once");
+
+    let l = links(&env, &sid).await;
+    assert_eq!(l.len(), 1);
+    let child_sid = l[0].child_session_id.as_deref().unwrap();
+    let child_runs = scalar_i64(
+        &env,
+        "SELECT COUNT(*) FROM agent_runs WHERE session_id = ?1",
+        child_sid,
+    )
+    .await;
+    assert_eq!(child_runs, 1, "child subagent must have executed only once");
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn child_waiting_parent_stays() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+
+    // Root gọi subagent
+    gw.push_tool_calls("", vec![("c1", "subagent", sub_new("reviewer", "do work"))]);
+    // Child gặp lỗi tạm thời -> chuyển sang waiting_retry
+    gw.push_error(GatewayError::Timeout);
+    // Sau khi child đến hạn retry -> child hoàn thành
+    gw.push_text("child succeeded after retry");
+    // Root nhận kết quả bình thường và kết thúc
+    gw.push_text("root finished with child output");
+
+    let mut cfg = env.config(vec![env.root(&["subagent"], &[]), env.reviewer(&[], &[])]);
+    for p in &mut cfg.llm.providers {
+        p.limits.fast_retries = 0;
+    }
+    let o = build(cfg, &gw, vec![]).await;
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+    let turn = o.submit(&alice(), &sid, "go".into()).await.unwrap();
+
+    // Chờ tới khi child rơi vào waiting_retry (chưa pause clock nên backoff 60s chưa đến hạn).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut c = env.sql().await;
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_runs WHERE status = 'waiting_retry'",
+        )
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+        if waiting == 1 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "child never entered waiting_retry");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Lúc con đang waiting_retry: cha vẫn đang running, không nhận lỗi và không gọi thêm model.
+    let parent_res = o.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+    assert_eq!(parent_res.status, RunStatus::Running);
+    assert_eq!(
+        gw.call_count(),
+        2,
+        "only 1 root call + 1 child call while child is waiting"
+    );
+    let l = links(&env, &sid).await;
+    assert_eq!(l[0].status, "running");
+
+    // Bật pause clock để tua qua thời gian chờ 60s của child.
+    tokio::time::pause();
+    let started = std::time::Instant::now();
+    let final_res = loop {
+        let res = o.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+        if res.status.is_terminal() {
+            break res;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "root stuck waiting for child: {res:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+
+    assert_eq!(final_res.status, RunStatus::Completed, "{final_res:?}");
+    assert_eq!(
+        final_res.output.as_deref(),
+        Some("root finished with child output")
+    );
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn child_exhausted_structured() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    let (probe, _) = Probe::new("probe", ToolEffect::ReadOnly, Behavior::Echo);
+
+    // Root gọi subagent
+    gw.push_tool_calls("", vec![("c1", "subagent", sub_new("reviewer", "collect"))]);
+    // Child step 1 gọi tool probe thành công (tạo partial output trong turn của child)
+    gw.push_tool_calls("", vec![("p1", "probe", json!({"text": "partial-chunk"}))]);
+    // Child step 2 (attempt 0) gặp lỗi tạm thời -> waiting_retry
+    gw.push_error(GatewayError::Timeout);
+    // Child attempt 1 gặp lỗi tạm thời lần nữa -> vượt max_resume_attempts = 1 -> RECOVERY_ATTEMPTS_EXHAUSTED
+    gw.push_error(GatewayError::Timeout);
+    // Root nhận structured subagent failure và kết thúc
+    gw.push_text("root handled exhausted child");
+
+    let mut cfg = env.config(vec![
+        env.root(&["subagent"], &[]),
+        env.reviewer(&["probe"], &[]),
+    ]);
+    cfg.runtime.max_resume_attempts = 1;
+    for p in &mut cfg.llm.providers {
+        p.limits.fast_retries = 0;
+    }
+    let o = build(cfg, &gw, vec![probe]).await;
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+
+    tokio::time::pause();
+    let turn = o.submit(&alice(), &sid, "go".into()).await.unwrap();
+    let started = std::time::Instant::now();
+    let r = loop {
+        let res = o.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+        if res.status.is_terminal() {
+            break res;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "run stuck: {res:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+
+    assert_eq!(r.status, RunStatus::Completed, "{r:?}");
+    let tool_msg = &tool_texts(&history(&o, &sid).await)[0];
+    assert!(tool_msg.contains("state=\"failed\""), "{tool_msg}");
+    assert!(tool_msg.contains("retryable=\"true\""), "{tool_msg}");
+    assert!(
+        tool_msg.contains("stop_reason=\"RECOVERY_ATTEMPTS_EXHAUSTED\""),
+        "{tool_msg}"
+    );
+    assert!(tool_msg.contains("probe:partial-chunk"), "{tool_msg}");
+
+    let mut c = env.sql().await;
+    let row = sqlx::query(
+        "SELECT child_session_id, child_turn_id, result_json FROM tool_invocations \
+         WHERE session_id = ?1 AND tool_name = 'subagent'",
+    )
+    .bind(&sid)
+    .fetch_one(&mut c)
+    .await
+    .unwrap();
+    let child_sid: String = row.get("child_session_id");
+    let child_turn: String = row.get("child_turn_id");
+    let result_json: String = row.get("result_json");
+    let parsed: Value = serde_json::from_str(&result_json).unwrap();
+    assert_eq!(parsed["session_id"], json!(child_sid));
+    assert_eq!(parsed["status"], json!("failed"));
+    assert_eq!(parsed["stop_reason"], json!("RECOVERY_ATTEMPTS_EXHAUSTED"));
+    assert_eq!(parsed["retryable"], json!(true));
+    assert_eq!(parsed["partial_result"], json!("probe:partial-chunk"));
+
+    let child_res = o.result(&alice(), &child_sid, &child_turn).await.unwrap();
+    assert_eq!(child_res.status, RunStatus::Failed);
+    assert_eq!(
+        child_res.partial_output.as_deref(),
+        Some("probe:partial-chunk")
+    );
+    o.shutdown().await.unwrap();
 }

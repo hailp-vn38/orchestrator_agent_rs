@@ -2,11 +2,13 @@
 
 use tracing::{info, warn};
 
-use crate::gateway::GatewayError;
-use crate::store::{CODE_SHUTTING_DOWN, CODE_STORE_UNAVAILABLE};
+use crate::gateway::{FailureClass, GatewayError};
+use crate::store::{CODE_EXHAUSTED, CODE_SHUTTING_DOWN, CODE_STORE_UNAVAILABLE};
 use crate::types::RunStatus;
 
 use super::{AgentRuntime, Settlement};
+
+const DURABLE_BACKOFF_SECS: [u64; 4] = [60, 300, 900, 1800];
 
 impl AgentRuntime {
     pub(super) async fn fail(&self, run_id: &str, error: GatewayError) -> Settlement {
@@ -19,7 +21,7 @@ impl AgentRuntime {
         error: GatewayError,
         extra_detail: Option<&str>,
     ) -> Settlement {
-        let (status, code, base_message) = match error {
+        match error {
             GatewayError::Cancelled if self.shutdown.is_cancelled() => {
                 return self
                     .finish(
@@ -40,20 +42,26 @@ impl AgentRuntime {
                     )
                     .await;
             }
-            GatewayError::Timeout
-            | GatewayError::Stalled
-            | GatewayError::RequestLimitExceeded => {
-                (RunStatus::TimedOut, error.code(), error.message())
-            }
-            _ => (RunStatus::Failed, error.code(), error.message()),
-        };
+            _ => {}
+        }
+        let code = error.code();
+        let base_message = error.message();
+        let class = error.classify();
         let run_meta = self.store.load_run(run_id).await.ok().flatten();
-        let step_num = self
-            .store
-            .run_steps(run_id)
-            .await
-            .ok()
-            .map(|s| s.saturating_add(1));
+        let step_num = match &run_meta {
+            Some(r) => self
+                .store
+                .turn_steps(&r.session_id, &r.turn_id)
+                .await
+                .ok()
+                .map(|s| s.saturating_add(1)),
+            None => self
+                .store
+                .run_steps(run_id)
+                .await
+                .ok()
+                .map(|s| s.saturating_add(1)),
+        };
         let gw_detail = run_meta
             .as_ref()
             .and_then(|r| self.gateway.take_last_error_detail(&r.provider_id));
@@ -77,7 +85,89 @@ impl AgentRuntime {
             Some(d) => format!("{ctx_header}: {d}"),
             None => ctx_header,
         };
-        self.finish(run_id, status, code, &message).await
+
+        match class {
+            FailureClass::Retryable { .. } | FailureClass::RetryOnceThenSplit => {
+                let Some(ref r) = run_meta else {
+                    return Settlement::Unsettled;
+                };
+                if r.resume_attempt.saturating_add(1) > self.context.max_resume_attempts {
+                    return self
+                        .finish(run_id, RunStatus::Failed, CODE_EXHAUSTED, &message)
+                        .await;
+                }
+                let retry_idx = self
+                    .store
+                    .turn_retry_attempts(&r.session_id, &r.turn_id)
+                    .await
+                    .unwrap_or(r.resume_attempt) as usize;
+                let base_secs =
+                    DURABLE_BACKOFF_SECS[retry_idx.min(DURABLE_BACKOFF_SECS.len() - 1)];
+                let wait_secs = match class {
+                    FailureClass::Retryable {
+                        retry_after: Some(d),
+                    } => d.as_secs().max(base_secs),
+                    _ => base_secs,
+                };
+                let next_at = self
+                    .store
+                    .now_secs()
+                    .saturating_add(wait_secs.min(i64::MAX as u64) as i64);
+                self.suspend(
+                    run_id,
+                    RunStatus::WaitingRetry,
+                    code,
+                    &message,
+                    code,
+                    Some(next_at),
+                )
+                .await
+            }
+            FailureClass::NeedsUser => {
+                self.suspend(run_id, RunStatus::WaitingUser, code, &message, code, None)
+                    .await
+            }
+            FailureClass::Permanent => self.finish(run_id, RunStatus::Failed, code, &message).await,
+            FailureClass::Cancelled => {
+                self.finish(run_id, RunStatus::Cancelled, "CANCELLED", &message)
+                    .await
+            }
+        }
+    }
+
+    pub(super) async fn suspend(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        code: &str,
+        message: &str,
+        retry_reason: &str,
+        next_attempt_at: Option<i64>,
+    ) -> Settlement {
+        match self
+            .store
+            .suspend_run(run_id, status, code, message, retry_reason, next_attempt_at)
+            .await
+        {
+            Ok(committed) => {
+                info!(
+                    status = status.as_str(),
+                    code,
+                    next_attempt_at,
+                    "run suspended to waiting state"
+                );
+                if committed {
+                    self.emitter
+                        .run_waiting(run_id, status, code, retry_reason, next_attempt_at)
+                        .await;
+                }
+                Settlement::Terminal
+            }
+            Err(_) => {
+                warn!("could not persist waiting state; supervisor will sweep");
+                Settlement::Unsettled
+            }
+        }
     }
 
     /// Supervisor bỏ cuộc sau nhiều lần `Unsettled` liên tiếp: chuyển run sang `interrupted`

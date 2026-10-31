@@ -44,8 +44,9 @@ impl SessionStore {
         run_id: &str,
     ) -> Result<Option<RunRecord>, OrchestratorError> {
         let row = sqlx::query(
-            "SELECT r.session_id, r.turn_id, r.agent_id, r.provider_id, r.model_id, r.status, \
-             s.owner_id, s.workspace_id, s.permissions_json, s.parent_session_id \
+            "SELECT r.session_id, r.turn_id, r.resume_attempt, r.agent_id, r.provider_id, \
+             r.model_id, r.status, s.owner_id, s.workspace_id, s.permissions_json, \
+             s.parent_session_id \
              FROM agent_runs r JOIN sessions s ON s.id = r.session_id WHERE r.id = ?1",
         )
         .bind(run_id)
@@ -54,12 +55,14 @@ impl SessionStore {
         .map_err(db("load run"))?;
         let Some(row) = row else { return Ok(None) };
         let status: String = row.try_get("status").map_err(db("read run status"))?;
+        let attempt: i64 = row.try_get("resume_attempt").map_err(db("read attempt"))?;
         let permissions: Option<String> =
             row.try_get("permissions_json").map_err(db("read policy"))?;
         Ok(Some(RunRecord {
             run_id: run_id.to_owned(),
             session_id: row.try_get("session_id").map_err(db("read run"))?,
             turn_id: row.try_get("turn_id").map_err(db("read run turn"))?,
+            resume_attempt: u32::try_from(attempt).unwrap_or(u32::MAX),
             agent_id: row.try_get("agent_id").map_err(db("read run"))?,
             provider_id: row.try_get("provider_id").map_err(db("read run"))?,
             model_id: row.try_get("model_id").map_err(db("read run"))?,
@@ -82,6 +85,126 @@ impl SessionStore {
             .await
             .map_err(db("read run steps"))?;
         Ok(steps.unwrap_or(0).max(0) as u32)
+    }
+
+    /// Tổng số step đã commit xuyên suốt mọi attempt của cùng `(session_id, turn_id)`.
+    pub(crate) async fn turn_steps(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<u32, OrchestratorError> {
+        let steps: Option<i64> = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(steps), 0) FROM agent_runs WHERE session_id = ?1 AND turn_id = ?2",
+        )
+        .bind(session_id)
+        .bind(turn_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db("read turn steps"))?;
+        Ok(steps.unwrap_or(0).max(0) as u32)
+    }
+
+    /// Số attempt trong cùng `(session_id, turn_id)` đã có `retry_reason` (để crash recovery
+    /// không làm dãn lịch backoff `[1m, 5m, 15m, 30m]`).
+    pub(crate) async fn turn_retry_attempts(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<u32, OrchestratorError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_runs \
+             WHERE session_id = ?1 AND turn_id = ?2 AND retry_reason IS NOT NULL",
+        )
+        .bind(session_id)
+        .bind(turn_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db("count turn retry attempts"))?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// Văn bản assistant gần nhất của `(session_id, turn_id)`; nếu chưa có thì lấy tool result
+    /// gần nhất (không tính kết quả lỗi).
+    pub(crate) async fn latest_turn_text(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<String>, OrchestratorError> {
+        let assistant_jsons: Vec<String> = sqlx::query_scalar(
+            "SELECT m.content_json FROM messages m \
+             JOIN agent_runs r ON r.id = m.run_id \
+             WHERE m.session_id = ?1 AND r.turn_id = ?2 AND m.role = 'assistant' \
+             ORDER BY m.sequence DESC LIMIT 16",
+        )
+        .bind(session_id)
+        .bind(turn_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db("load turn assistant messages"))?;
+        if let Some(found) = assistant_jsons
+            .into_iter()
+            .map(|j| text_of(&j))
+            .find(|t| !t.trim().is_empty())
+        {
+            return Ok(Some(found));
+        }
+        let tool_jsons: Vec<String> = sqlx::query_scalar(
+            "SELECT m.content_json FROM messages m \
+             JOIN agent_runs r ON r.id = m.run_id \
+             WHERE m.session_id = ?1 AND r.turn_id = ?2 AND m.role = 'tool' \
+             ORDER BY m.sequence DESC LIMIT 16",
+        )
+        .bind(session_id)
+        .bind(turn_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db("load turn tool messages"))?;
+        Ok(tool_jsons
+            .into_iter()
+            .map(|j| text_of(&j))
+            .find(|t| !t.trim().is_empty()))
+    }
+
+    /// Số lần `llm_attempts` trong cùng `(session_id, turn_id)` ở bước `step` kết thúc với
+    /// `outcome = 'REQUEST_LIMIT_EXCEEDED'`.
+    pub(crate) async fn turn_step_limit_exceeded_count(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        step: u32,
+    ) -> Result<u32, OrchestratorError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM llm_attempts a \
+             JOIN agent_runs r ON r.id = a.run_id \
+             WHERE r.session_id = ?1 AND r.turn_id = ?2 AND a.step = ?3 \
+               AND a.outcome = 'REQUEST_LIMIT_EXCEEDED'",
+        )
+        .bind(session_id)
+        .bind(turn_id)
+        .bind(i64::from(step))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db("count step limit exceeded"))?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// Danh sách `run_id` của các root run đang `running` nhưng thực chất đang chờ một subagent
+    /// child ở trạng thái `waiting_retry` hoặc `waiting_user` (nhường slot `active_roots`).
+    pub(crate) async fn roots_parked_on_waiting_child(
+        &self,
+    ) -> Result<std::collections::HashSet<String>, OrchestratorError> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT ti.run_id FROM tool_invocations ti \
+             JOIN agent_runs pr ON pr.id = ti.run_id AND pr.status = 'running' \
+             JOIN agent_runs cr ON cr.session_id = ti.child_session_id \
+                  AND cr.turn_id = ti.child_turn_id \
+                  AND cr.status IN ('waiting_retry', 'waiting_user') \
+             WHERE ti.status = 'running' AND ti.child_session_id IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db("list roots parked on waiting child"))?;
+        Ok(ids.into_iter().collect())
     }
 
     /// Cộng usage provider báo hoặc gateway ước lượng vào run đang chạy.
@@ -209,9 +332,54 @@ impl SessionStore {
         Ok(Some(message_id))
     }
 
+    /// Tạm dừng run sang `waiting_retry` (kèm `next_attempt_at`) hoặc `waiting_user` (`None`).
+    /// Không đóng các invocation `requested` để attempt kế tiếp tiếp tục.
+    pub(crate) async fn suspend_run(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        error_code: &str,
+        error_message: &str,
+        retry_reason: &str,
+        next_attempt_at: Option<i64>,
+    ) -> Result<bool, OrchestratorError> {
+        debug_assert!(status.is_waiting());
+        let mut tx = self.pool.begin().await.map_err(db("begin suspend"))?;
+        let bumped = sqlx::query(
+            "UPDATE sessions SET state_revision = state_revision + 1, updated_at = unixepoch() \
+             WHERE id = (SELECT session_id FROM agent_runs WHERE id = ?1 AND status = 'running')",
+        )
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db("bump revision on suspend"))?
+        .rows_affected();
+        if bumped == 0 {
+            let _ = tx.rollback().await;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE agent_runs SET status = ?1, error_code = ?2, error_message = ?3, \
+             retry_reason = ?4, next_attempt_at = ?5, finished_at = NULL \
+             WHERE id = ?6 AND status = 'running'",
+        )
+        .bind(status.as_str())
+        .bind(error_code)
+        .bind(sanitize_message(error_message))
+        .bind(retry_reason)
+        .bind(next_attempt_at)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db("suspend run"))?;
+        tx.commit().await.map_err(db("commit suspend"))?;
+        Ok(true)
+    }
+
     /// Terminal không-completed (failed/timed_out/interrupted/cancelled). `Ok(false)`:
-    /// run không còn `running`. Invocation chưa settle của run được đưa về terminal cùng
-    /// transaction (không để `requested`/`running` treo) mà **không** giả outcome.
+    /// run không còn active (`running`/`waiting_retry`/`waiting_user`). Invocation chưa settle
+    /// của run được đưa về terminal cùng transaction (không để `requested`/`running` treo) mà
+    /// **không** giả outcome.
     ///
     /// `interrupted` là trạng thái có thể phục hồi (M5): invocation `running` (outcome chưa
     /// biết) thành `interrupted`, còn invocation `requested` (chưa từng chạy) được **giữ**
@@ -227,7 +395,8 @@ impl SessionStore {
         let mut tx = self.pool.begin().await.map_err(db("begin terminal"))?;
         let bumped = sqlx::query(
             "UPDATE sessions SET state_revision = state_revision + 1, updated_at = unixepoch() \
-             WHERE id = (SELECT session_id FROM agent_runs WHERE id = ?1 AND status = 'running')",
+             WHERE id = (SELECT session_id FROM agent_runs WHERE id = ?1 \
+                 AND status IN ('running', 'waiting_retry', 'waiting_user'))",
         )
         .bind(run_id)
         .execute(&mut *tx)
@@ -240,7 +409,8 @@ impl SessionStore {
         }
         sqlx::query(
             "UPDATE agent_runs SET status = ?1, error_code = ?2, error_message = ?3, \
-             finished_at = unixepoch() WHERE id = ?4 AND status = 'running'",
+             next_attempt_at = NULL, finished_at = unixepoch() \
+             WHERE id = ?4 AND status IN ('running', 'waiting_retry', 'waiting_user')",
         )
         .bind(status.as_str())
         .bind(error_code)
@@ -290,7 +460,7 @@ impl SessionStore {
     ) -> Result<AgentResult, OrchestratorError> {
         let row = sqlx::query(
             "SELECT id, resume_attempt, status, steps, input_tokens, output_tokens, \
-             final_message_id, error_code, error_message \
+             final_message_id, error_code, error_message, next_attempt_at, retry_reason \
              FROM agent_runs WHERE session_id = ?1 AND turn_id = ?2 \
              ORDER BY resume_attempt DESC LIMIT 1",
         )
@@ -316,6 +486,12 @@ impl SessionStore {
         let error_code: Option<String> = row.try_get("error_code").map_err(db("read error"))?;
         let error_message: Option<String> =
             row.try_get("error_message").map_err(db("read error"))?;
+        let next_attempt_at: Option<i64> = row
+            .try_get("next_attempt_at")
+            .map_err(db("read next_attempt_at"))?;
+        let retry_reason: Option<String> = row
+            .try_get("retry_reason")
+            .map_err(db("read retry_reason"))?;
 
         let output = match &final_message_id {
             None => None,
@@ -333,6 +509,11 @@ impl SessionStore {
                 json.map(|j| text_of(&j))
             }
         };
+        let partial_output = if output.is_some() {
+            None
+        } else {
+            self.latest_turn_text(session_id, turn_id).await?
+        };
         Ok(AgentResult {
             session_id: session_id.to_owned(),
             turn_id: turn_id.to_owned(),
@@ -344,11 +525,14 @@ impl SessionStore {
             input_tokens: u64::try_from(input_tokens).unwrap_or_default(),
             output_tokens: u64::try_from(output_tokens).unwrap_or_default(),
             output,
+            partial_output,
             final_message_id,
             error: error_code.map(|code| ResultError {
                 code,
                 message: error_message.unwrap_or_default(),
             }),
+            next_attempt_at,
+            retry_reason,
             artifact_preview: Vec::new(),
             artifacts_next_cursor: None,
         })

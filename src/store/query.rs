@@ -28,7 +28,7 @@ const SESSION_COLUMNS: &str =
 const RUN_COLUMNS: &str = "r.rowid AS rid, r.id, r.session_id, r.turn_id, r.agent_id, \
      r.resume_attempt, r.provider_id, r.model_id, r.status, r.steps, r.input_tokens, \
      r.output_tokens, r.started_at, r.finished_at, r.final_message_id, r.error_code, \
-     r.error_message";
+     r.error_message, r.next_attempt_at, r.retry_reason";
 
 fn page_limit(page: &PageRequest, max_page: u32) -> u32 {
     page.limit.clamp(1, max_page)
@@ -127,6 +127,8 @@ fn run_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RunSummary, Orchestrato
     let output: i64 = row.try_get("output_tokens").map_err(db("read run"))?;
     let code: Option<String> = row.try_get("error_code").map_err(db("read run"))?;
     let message: Option<String> = row.try_get("error_message").map_err(db("read run"))?;
+    let next_attempt_at: Option<i64> = row.try_get("next_attempt_at").map_err(db("read run"))?;
+    let retry_reason: Option<String> = row.try_get("retry_reason").map_err(db("read run"))?;
     Ok(RunSummary {
         run_id: row.try_get("id").map_err(db("read run"))?,
         session_id: row.try_get("session_id").map_err(db("read run"))?,
@@ -147,6 +149,8 @@ fn run_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RunSummary, Orchestrato
             code,
             message: message.unwrap_or_default(),
         }),
+        next_attempt_at,
+        retry_reason,
     })
 }
 

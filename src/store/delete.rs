@@ -36,7 +36,9 @@ impl SessionStore {
         }
         const FAMILY: &str = "(SELECT id FROM sessions WHERE id = ?1 OR parent_session_id = ?1)";
         let running: i64 = sqlx::query_scalar(&format!(
-            "SELECT COUNT(*) FROM agent_runs WHERE status = 'running' AND session_id IN {FAMILY}"
+            "SELECT COUNT(*) FROM agent_runs \
+             WHERE status IN ('running', 'waiting_retry', 'waiting_user') \
+             AND session_id IN {FAMILY}"
         ))
         .bind(root_id)
         .fetch_one(&mut *tx)

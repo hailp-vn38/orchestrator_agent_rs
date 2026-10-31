@@ -22,7 +22,7 @@ pub use crate::gateway::{
 /// spawn). Chỉ sweep định kỳ của supervisor mới cứu được claim.
 pub type DropAdmissionTriggers = Arc<AtomicBool>;
 
-type Responder = Box<dyn Fn(&ModelRequest) -> ModelResponse + Send + Sync>;
+type Responder = Box<dyn Fn(&ModelRequest) -> Result<ModelResponse, GatewayError> + Send + Sync>;
 
 enum Step {
     Fixed(Result<ModelResponse, GatewayError>),
@@ -182,10 +182,26 @@ impl ScriptedGateway {
         self.state().script.push_back(Step::Fixed(Err(error)));
     }
 
+    pub fn push_errors(&self, count: usize, error: GatewayError) {
+        for _ in 0..count {
+            self.push_error(error);
+        }
+    }
+
     /// Response được tính từ request tại thời điểm gateway được gọi.
     pub fn push_with(
         &self,
         responder: impl Fn(&ModelRequest) -> ModelResponse + Send + Sync + 'static,
+    ) {
+        self.state()
+            .script
+            .push_back(Step::Dynamic(Box::new(move |req| Ok(responder(req)))));
+    }
+
+    /// Kết quả (`Result<ModelResponse, GatewayError>`) được tính từ request tại thời điểm gọi.
+    pub fn push_result_with(
+        &self,
+        responder: impl Fn(&ModelRequest) -> Result<ModelResponse, GatewayError> + Send + Sync + 'static,
     ) {
         self.state()
             .script
@@ -248,7 +264,7 @@ impl LlmGateway for ScriptedGateway {
         let next = self.state().script.pop_front();
         match next {
             Some(Step::Fixed(result)) => result,
-            Some(Step::Dynamic(responder)) => Ok(responder(request)),
+            Some(Step::Dynamic(responder)) => responder(request),
             Some(Step::Streamed(events, result)) => {
                 for event in events {
                     self.state().emitted.push(event.clone());
