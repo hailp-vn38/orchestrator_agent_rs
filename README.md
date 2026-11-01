@@ -36,7 +36,7 @@ runtime, transport, AuthN/AuthZ, and registers domain tools through the `HostToo
 
 ```toml
 [dependencies]
-orchestrator-agent = "0.4"
+orchestrator-agent = "0.5"
 async-trait = "0.1"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
