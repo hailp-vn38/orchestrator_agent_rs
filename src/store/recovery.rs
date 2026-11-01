@@ -682,7 +682,9 @@ async fn recover_run_inner(
     let route = route.expect("route checked above");
 
     let next = attempt + 1;
-    if next > i64::from(policy.max_resume_attempt) {
+    let streak =
+        super::run::attempts_without_progress_on(&mut *tx, &session_id, &turn_id, attempt).await?;
+    if streak > policy.max_resume_attempt {
         let terminal_status = if current_code.as_deref() == Some(CODE_RETRY_DUE) {
             "failed"
         } else {

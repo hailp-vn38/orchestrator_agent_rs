@@ -310,6 +310,8 @@ impl AgentRuntime {
                 };
                 let completion_code = if budget_capped {
                     Some(crate::types::CODE_BUDGET_EXHAUSTED)
+                } else if step_capped {
+                    Some(crate::types::CODE_STEP_LIMIT_REACHED)
                 } else {
                     None
                 };

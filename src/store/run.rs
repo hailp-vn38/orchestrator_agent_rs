@@ -106,21 +106,18 @@ impl SessionStore {
 
     /// Số attempt trong cùng `(session_id, turn_id)` đã có `retry_reason` (để crash recovery
     /// không làm dãn lịch backoff `[1m, 5m, 15m, 30m]`).
-    pub(crate) async fn turn_retry_attempts(
+    pub(crate) async fn attempts_without_progress(
         &self,
         session_id: &str,
         turn_id: &str,
+        attempt: u32,
     ) -> Result<u32, OrchestratorError> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_runs \
-             WHERE session_id = ?1 AND turn_id = ?2 AND retry_reason IS NOT NULL",
-        )
-        .bind(session_id)
-        .bind(turn_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(db("count turn retry attempts"))?;
-        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(db("acquire connection for retry streak"))?;
+        attempts_without_progress_on(&mut conn, session_id, turn_id, i64::from(attempt)).await
     }
 
     /// Văn bản assistant gần nhất của `(session_id, turn_id)`; nếu chưa có thì lấy tool result
@@ -405,6 +402,8 @@ impl SessionStore {
         let error_message = error_code.map(|code| {
             if code == crate::types::CODE_BUDGET_EXHAUSTED {
                 "the execution budget was reached; partial summary saved".to_owned()
+            } else if code == crate::types::CODE_STEP_LIMIT_REACHED {
+                "the agent step limit was reached; progress summary saved".to_owned()
             } else {
                 code.to_owned()
             }
@@ -641,6 +640,27 @@ impl SessionStore {
             artifacts_next_cursor: None,
         })
     }
+}
+
+/// Số attempt liên tiếp tính tới `attempt` (kể cả nó) chưa tạo được step mới. Một turn dài có thể
+/// gặp lỗi tạm thời rải rác; chỉ chuỗi không tiến độ mới được coi là không hồi phục được.
+pub(super) async fn attempts_without_progress_on(
+    conn: &mut sqlx::SqliteConnection,
+    session_id: &str,
+    turn_id: &str,
+    attempt: i64,
+) -> Result<u32, OrchestratorError> {
+    let last_progress: Option<i64> = sqlx::query_scalar(
+        "SELECT MAX(resume_attempt) FROM agent_runs \
+         WHERE session_id = ?1 AND turn_id = ?2 AND steps > 0",
+    )
+    .bind(session_id)
+    .bind(turn_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(db("find last attempt with progress"))?;
+    let streak = attempt.saturating_sub(last_progress.unwrap_or(-1)).max(0);
+    Ok(u32::try_from(streak).unwrap_or(u32::MAX))
 }
 
 pub(super) async fn turn_active_secs_on(

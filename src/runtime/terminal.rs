@@ -90,16 +90,19 @@ impl AgentRuntime {
                 let Some(ref r) = run_meta else {
                     return Settlement::Unsettled;
                 };
-                if r.resume_attempt.saturating_add(1) > self.context.max_resume_attempts {
+                let streak = crate::store::settle_sql(self.store.attempts_without_progress(
+                    &r.session_id,
+                    &r.turn_id,
+                    r.resume_attempt,
+                ))
+                .await
+                .unwrap_or_else(|_| r.resume_attempt.saturating_add(1));
+                if streak > self.context.max_resume_attempts {
                     return self
                         .finish(run_id, RunStatus::Failed, CODE_EXHAUSTED, &message)
                         .await;
                 }
-                let retry_idx = crate::store::settle_sql(
-                    self.store.turn_retry_attempts(&r.session_id, &r.turn_id),
-                )
-                .await
-                .unwrap_or(r.resume_attempt) as usize;
+                let retry_idx = streak.saturating_sub(1) as usize;
                 let base_secs = DURABLE_BACKOFF_SECS[retry_idx.min(DURABLE_BACKOFF_SECS.len() - 1)];
                 let wait_secs = match class {
                     FailureClass::Retryable {

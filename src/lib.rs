@@ -65,5 +65,5 @@ pub use types::{
     MessageToolCall, MessageView, OperatorContext, Page, PageRequest, ResultError, RunBudget,
     RunSnapshot, RunStatus, RunSummary, SessionFilter, SessionPolicy, SessionSearch,
     SessionSnapshot, SessionSummary, SubmitOptions, TurnSummary, VerifiedToolResolution,
-    WaitingDescendant, CODE_BUDGET_EXHAUSTED,
+    WaitingDescendant, CODE_BUDGET_EXHAUSTED, CODE_STEP_LIMIT_REACHED,
 };

@@ -1488,7 +1488,9 @@ async fn child_exhausted_structured() {
     gw.push_tool_calls("", vec![("p1", "probe", json!({"text": "partial-chunk"}))]);
     // Child step 2 (attempt 0) gặp lỗi tạm thời -> waiting_retry
     gw.push_error(GatewayError::Timeout);
-    // Child attempt 1 gặp lỗi tạm thời lần nữa -> vượt max_resume_attempts = 1 -> RECOVERY_ATTEMPTS_EXHAUSTED
+    // Attempt 0 đã có step nên chưa tính vào giới hạn; attempt 1 và 2 không có tiến độ ->
+    // vượt max_resume_attempts = 1 -> RECOVERY_ATTEMPTS_EXHAUSTED
+    gw.push_error(GatewayError::Timeout);
     gw.push_error(GatewayError::Timeout);
     // Root nhận structured subagent failure và kết thúc
     gw.push_text("root handled exhausted child");
@@ -1626,6 +1628,50 @@ async fn cancel_tree_while_child_renders() {
     };
     assert_eq!(child_res.status, RunStatus::Cancelled, "{child_res:?}");
     o.shutdown().await.unwrap();
+}
+
+/// Child chạm step cap vẫn trả text, nhưng cha phải thấy rõ việc chưa xong để giao tiếp phần còn lại.
+#[tokio::test]
+async fn parent_sees_when_a_child_stopped_at_its_step_limit() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    let (probe, _) = Probe::new("probe", ToolEffect::ReadOnly, Behavior::Echo);
+    gw.push_tool_calls(
+        "",
+        vec![("s1", "subagent", sub_new("reviewer", "process all videos"))],
+    );
+    gw.push_tool_calls("", vec![("p1", "probe", json!({"text": "video-1"}))]);
+    gw.push_text("done video-1; remaining: video-2");
+    gw.push_text("root noticed the remaining work");
+
+    let cfg = env.config(vec![
+        env.root(&["subagent"], &[]),
+        env.reviewer(&["probe"], &[]).with_steps(1),
+    ]);
+    let o = build(cfg, &gw, vec![probe]).await;
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+    let turn = o.submit(&alice(), &sid, "go".into()).await.unwrap();
+    let r = wait_terminal(&o, &alice(), &sid, &turn.turn_id).await;
+    assert_eq!(r.status, RunStatus::Completed);
+
+    let to_root = gw.agent_requests().last().unwrap().clone();
+    let delegated = to_root
+        .messages
+        .iter()
+        .find(|m| m.text.contains("done video-1"))
+        .expect("child result reaches the parent");
+    assert!(
+        delegated
+            .text
+            .contains("stop_reason=\"STEP_LIMIT_REACHED\""),
+        "{}",
+        delegated.text
+    );
+    assert!(
+        delegated.text.contains("incomplete=\"true\""),
+        "{}",
+        delegated.text
+    );
 }
 
 #[tokio::test]

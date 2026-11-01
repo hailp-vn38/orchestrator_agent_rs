@@ -72,16 +72,23 @@ pub(super) fn outcome_of(scope: &ToolScope, result: AgentResult) -> Delegation {
             let text = result.output.as_deref().filter(|t| !t.trim().is_empty());
             let empty_text = text.is_none();
             let output = text.unwrap_or(EMPTY_TEXT_PLACEHOLDER);
+            // Completed kèm mã nghĩa là con dừng có kiểm soát (step cap, ngân sách): phần việc còn
+            // lại phải hiện rõ cho cha thay vì trông như đã xong.
+            let stop_reason = result.error.as_ref().map(|e| e.code.as_str());
+            let stop_attrs = stop_reason
+                .map(|code| format!(" incomplete=\"true\" stop_reason=\"{code}\""))
+                .unwrap_or_default();
             Delegation::Done(Ok(ToolOutcome {
                 call_id: scope.tool_call_id.clone(),
                 content: format!(
-                    "<subagent sessionID=\"{sid}\" state=\"completed\">\n{output}\n</subagent>"
+                    "<subagent sessionID=\"{sid}\" state=\"completed\"{stop_attrs}>\n{output}\n</subagent>"
                 ),
                 metadata: json!({
                     "session_id": sid,
                     "child_turn_id": result.turn_id,
                     "status": "completed",
                     "empty_text": empty_text,
+                    "stop_reason": stop_reason,
                 }),
             }))
         }

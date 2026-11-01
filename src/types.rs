@@ -28,6 +28,10 @@ pub struct AcceptedTurn {
 /// Mã lỗi khi run kết thúc do chạm trần ngân sách (`RunBudget`).
 pub const CODE_BUDGET_EXHAUSTED: &str = "BUDGET_EXHAUSTED";
 
+/// Mã trên run `completed` khi turn dừng vì chạm `steps` của agent: có bản tóm tắt tiến độ, nhưng
+/// việc chưa chắc đã xong (cùng ngữ nghĩa dừng có kiểm soát với [`CODE_BUDGET_EXHAUSTED`]).
+pub const CODE_STEP_LIMIT_REACHED: &str = "STEP_LIMIT_REACHED";
+
 /// Ngân sách thực thi của một turn, được lưu bền vững trong `agent_runs.budget_json`
 /// và truyền từ Root xuống Child (trừ phần dự trữ `reserve_secs`).
 #[derive(Debug, Clone, PartialEq, Eq)]

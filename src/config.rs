@@ -80,8 +80,9 @@ pub struct RuntimeConfig {
     /// Thời gian drain trước khi cancel: admission mới đã bị từ chối, run đang chạy được tự
     /// kết thúc. `0` = cancel hợp tác ngay (mặc định).
     pub shutdown_drain: Duration,
-    /// Số lần recovery tối đa mỗi turn (`resume_attempt` lớn nhất được tạo tự động). Vượt thì
-    /// attempt cuối giữ `interrupted` với `RECOVERY_ATTEMPTS_EXHAUSTED` (cần người xử lý).
+    /// Số attempt liên tiếp không tạo được step mới được phép resume tự động trong một turn; có
+    /// step mới thì đếm lại từ đầu, nên turn dài được chặn bởi ngân sách chứ không bởi số lỗi rải
+    /// rác. Vượt thì attempt cuối giữ `interrupted` với `RECOVERY_ATTEMPTS_EXHAUSTED`.
     pub max_resume_attempts: u32,
     /// Timeout của *một* thao tác tool (không phải của cả run). Quá hạn: tool ReadOnly trả
     /// lỗi kỹ thuật `TOOL_TIMEOUT`; tool Mutating có outcome unknown → run `interrupted`.
@@ -349,9 +350,7 @@ impl LlmProviderConfig {
         {
             return Err(OrchestratorError::config(
                 ConfigReason::InvalidTimeout,
-                format!(
-                    "provider '{id}': request limits must be > 0 and idle <= max_total"
-                ),
+                format!("provider '{id}': request limits must be > 0 and idle <= max_total"),
             ));
         }
         let is_custom = matches!(self.auth, ProviderAuth::CustomExecutor(_));

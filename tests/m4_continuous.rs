@@ -303,6 +303,11 @@ async fn at20_steps_cap_ends_with_text_only_progress_and_no_new_run() {
         "cap is not a technical error"
     );
     assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("STEP_LIMIT_REACHED"),
+        "a capped turn must not look like a finished task"
+    );
+    assert_eq!(
         r.output.as_deref(),
         Some("progress: did 5 things; remaining: the rest")
     );
@@ -332,6 +337,64 @@ async fn at20_steps_cap_ends_with_text_only_progress_and_no_new_run() {
     let r2 = run_turn(&o, &sid, "continue").await;
     assert_eq!(r2.status, RunStatus::Completed);
     assert_ne!(r2.turn_id, r.turn_id);
+}
+
+/// Lỗi tạm thời rải rác trong một turn dài không được cộng dồn: chỉ các attempt liên tiếp không
+/// tạo được step mới tính vào `max_resume_attempts`.
+#[tokio::test]
+async fn retry_limit_counts_only_attempts_without_progress() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    let (echo, runs, _) = Probe::new("echo", Behavior::Echo);
+    for i in 0..4 {
+        push_call(&gw, &format!("c{i}"), "echo", &format!("n{i}"));
+        gw.push_error(GatewayError::Timeout);
+    }
+    gw.push_text("finished after scattered failures");
+    let mut cfg = env.config(vec![env.root(&["echo"])]);
+    cfg.runtime.max_resume_attempts = 2;
+    cfg.llm.providers[0].limits.fast_retries = 0;
+    let (o, sid) = root_session(&env, cfg, &gw, vec![echo]).await;
+
+    let turn = o.submit(&alice(), &sid, "go".into()).await.unwrap();
+    let done = loop {
+        let r = o.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+        match r.status {
+            RunStatus::Running => tokio::time::sleep(Duration::from_millis(10)).await,
+            RunStatus::WaitingRetry => o.resume_waiting(&alice(), &sid).await.unwrap(),
+            _ => break r,
+        }
+    };
+    assert_eq!(done.status, RunStatus::Completed, "{done:?}");
+    assert_eq!(
+        done.attempt, 4,
+        "four attempts past the old lifetime cap of 2"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 4);
+}
+
+/// Không có tiến độ thì vẫn bị chặn đúng tại `max_resume_attempts`.
+#[tokio::test]
+async fn retry_limit_still_stops_a_turn_that_makes_no_progress() {
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    gw.push_errors(10, GatewayError::Timeout);
+    let mut cfg = env.config(vec![env.root(&[])]);
+    cfg.runtime.max_resume_attempts = 2;
+    cfg.llm.providers[0].limits.fast_retries = 0;
+    let (o, sid) = root_session(&env, cfg, &gw, vec![]).await;
+
+    let turn = o.submit(&alice(), &sid, "go".into()).await.unwrap();
+    let done = loop {
+        let r = o.result(&alice(), &sid, &turn.turn_id).await.unwrap();
+        match r.status {
+            RunStatus::Running => tokio::time::sleep(Duration::from_millis(10)).await,
+            RunStatus::WaitingRetry => o.resume_waiting(&alice(), &sid).await.unwrap(),
+            _ => break r,
+        }
+    };
+    assert_eq!(done.status, RunStatus::Failed, "{done:?}");
+    assert_eq!(done.attempt, 2);
 }
 
 /// Cap: model vẫn trả tool call dù không có tool → bỏ call, không execute, không persist.
