@@ -114,6 +114,17 @@ impl ClientGateway {
     }
 }
 
+/// `llm` chỉ cho đặt `.timeout()` tổng của reqwest, không có `read_timeout`. Đặt dài hơn
+/// `max_total` để watchdog luôn báo trước (ADR 0132); giá trị này chỉ là lưới an toàn mạng.
+pub(super) fn http_safety_net_secs(limits: &crate::config::RequestLimits) -> u64 {
+    const MARGIN_SECS: u64 = 30;
+    limits
+        .max_total
+        .as_secs()
+        .max(1)
+        .saturating_add(MARGIN_SECS)
+}
+
 fn same_provider_config(a: &LlmProviderConfig, b: &LlmProviderConfig) -> bool {
     let same_auth = match (&a.auth, &b.auth) {
         (ProviderAuth::None, ProviderAuth::None) => true,
@@ -123,10 +134,7 @@ fn same_provider_config(a: &LlmProviderConfig, b: &LlmProviderConfig) -> bool {
         }
         _ => false,
     };
-    a.backend == b.backend
-        && a.endpoint == b.endpoint
-        && a.limits == b.limits
-        && same_auth
+    a.backend == b.backend && a.endpoint == b.endpoint && a.limits == b.limits && same_auth
 }
 
 fn build_client(
@@ -148,7 +156,7 @@ fn build_client(
                 .max_output_tokens
                 .unwrap_or(MAX_OUTPUT_TOKENS),
         )
-        .timeout_seconds(cfg.limits.max_total.as_secs().max(1))
+        .timeout_seconds(http_safety_net_secs(&cfg.limits))
         .system(request.system.clone());
     if let Some(t) = request.params.temperature {
         builder = builder.temperature(t);
@@ -223,7 +231,8 @@ impl LlmGateway for ClientGateway {
                     match ev {
                         StreamEvent::TextDelta(t) => {
                             if !t.is_empty() {
-                                let visible = filter.lock().unwrap_or_else(|p| p.into_inner()).push(&t);
+                                let visible =
+                                    filter.lock().unwrap_or_else(|p| p.into_inner()).push(&t);
                                 if !visible.is_empty() {
                                     sink(StreamEvent::TextDelta(visible));
                                 } else {
@@ -300,10 +309,12 @@ impl LlmGateway for ClientGateway {
                 watchdog.touch();
                 sink(ev);
             };
-            collect_with_detail(raw, &watched_sink).await.map_err(|(err, detail)| {
-                self.record_error(provider_key, detail);
-                err
-            })
+            collect_with_detail(raw, &watched_sink)
+                .await
+                .map_err(|(err, detail)| {
+                    self.record_error(provider_key, detail);
+                    err
+                })
         };
         let mut response = tokio::select! {
             () = cancel.cancelled() => return Err(GatewayError::Cancelled),

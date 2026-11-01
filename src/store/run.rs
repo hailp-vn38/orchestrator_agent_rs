@@ -227,6 +227,7 @@ impl SessionStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record_llm_attempt(
         &self,
         id: &str,

@@ -210,6 +210,16 @@ pub struct FamilyArtifact {
     pub created_at: i64,
 }
 
+/// Lý do và lịch chờ của một run con cháu trong khi root vẫn `running`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitingDescendant {
+    pub session_id: String,
+    pub retry_reason: Option<String>,
+    pub next_attempt_at: Option<i64>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
 /// Read projection của attempt mới nhất cho `(session_id, turn_id)`. `Completed` chỉ là
 /// trạng thái thực thi, không khẳng định yêu cầu nghiệp vụ đã đạt.
 #[derive(Debug, Clone, PartialEq, Eq)]

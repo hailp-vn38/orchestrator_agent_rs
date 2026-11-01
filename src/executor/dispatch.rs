@@ -94,19 +94,29 @@ impl ToolExecutor {
                 {
                     Delegation::Done(result) => Dispatch::Settled(self.settle(result)),
                     Delegation::Failed(failure) => {
-                        let body = failure.partial_result.as_deref().unwrap_or("");
-                        let raw_text = format!(
-                            "<subagent sessionID=\"{}\" state=\"failed\" retryable=\"{}\" stop_reason=\"{}\">\n{}\n</subagent>",
-                            failure.session_id, failure.retryable, failure.stop_reason, body
-                        );
-                        let model_text =
-                            super::truncate_utf8(&raw_text, self.limits.model_cap_bytes);
+                        let cap = self.limits.model_cap_bytes;
+                        let partial_result = failure
+                            .partial_result
+                            .as_deref()
+                            .map(|text| super::truncate_utf8(text, cap));
+                        let wrap = |body: &str| {
+                            format!(
+                                "<subagent sessionID=\"{}\" state=\"failed\" retryable=\"{}\" stop_reason=\"{}\">\n{}\n</subagent>",
+                                failure.session_id, failure.retryable, failure.stop_reason, body
+                            )
+                        };
+                        // Cắt phần thân, không cắt cả chuỗi, để model luôn thấy thẻ đóng.
+                        let body_cap = cap.saturating_sub(wrap("").len());
+                        let model_text = wrap(&super::truncate_utf8(
+                            partial_result.as_deref().unwrap_or(""),
+                            body_cap,
+                        ));
                         let result_json = json!({
                             "session_id": failure.session_id,
                             "status": failure.status.as_str(),
                             "stop_reason": failure.stop_reason,
                             "retryable": failure.retryable,
-                            "partial_result": failure.partial_result,
+                            "partial_result": partial_result,
                         })
                         .to_string();
                         Dispatch::Settled(Settled {
@@ -182,6 +192,10 @@ impl ToolExecutor {
                 }
                 if effect == ToolEffect::Resumable && err.code == CODE_OUTCOME_UNKNOWN {
                     return Dispatch::Unknown(CODE_OUTCOME_UNKNOWN);
+                }
+                if effect == ToolEffect::Resumable && err.code == crate::tool::CODE_TOOL_RETRY_LATER
+                {
+                    return Dispatch::RetryLater(err.message);
                 }
                 Dispatch::Settled(self.settle(Err(err)))
             }

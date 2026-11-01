@@ -28,6 +28,10 @@ pub enum ToolEffect {
     Resumable,
 }
 
+/// Tool `Resumable` trả mã này khi operation còn mở gặp lỗi tạm thời: invocation không settle,
+/// run chuyển `waiting_retry` và attempt sau gọi lại tool với cùng `invocation_id`.
+pub const CODE_TOOL_RETRY_LATER: &str = "TOOL_RETRY_LATER";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolOperationStatus {
     Submitting,

@@ -57,7 +57,7 @@ pub use skill::{valid_skill_id, SkillDocument, SkillDocumentError, SkillReloadRe
 pub use tool::{
     CancelReason, CancelSignal, HostTool, OperationUpdate, ToolArtifacts, ToolCheckpoint,
     ToolContext, ToolDescriptor, ToolEffect, ToolError, ToolOperation, ToolOperationHandle,
-    ToolOperationStatus, ToolOperationSummary, ToolOutcome, ToolScope,
+    ToolOperationStatus, ToolOperationSummary, ToolOutcome, ToolScope, CODE_TOOL_RETRY_LATER,
 };
 pub use types::{
     AcceptedTurn, AgentResult, ArtifactRef, ArtifactRole, CallerContext, FamilyArtifact,
@@ -65,5 +65,5 @@ pub use types::{
     MessageToolCall, MessageView, OperatorContext, Page, PageRequest, ResultError, RunBudget,
     RunSnapshot, RunStatus, RunSummary, SessionFilter, SessionPolicy, SessionSearch,
     SessionSnapshot, SessionSummary, SubmitOptions, TurnSummary, VerifiedToolResolution,
-    CODE_BUDGET_EXHAUSTED,
+    WaitingDescendant, CODE_BUDGET_EXHAUSTED,
 };

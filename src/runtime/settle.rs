@@ -80,6 +80,12 @@ impl AgentRuntime {
                     Dispatch::Cancelled => {
                         return Some(self.fail(run_id, GatewayError::Cancelled).await)
                     }
+                    Dispatch::RetryLater(detail) => {
+                        return Some(
+                            self.fail_with_detail(run_id, GatewayError::Provider, Some(&detail))
+                                .await,
+                        )
+                    }
                     Dispatch::Unknown(code) => {
                         return Some(
                             self.finish(

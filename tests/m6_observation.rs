@@ -1561,10 +1561,10 @@ async fn message_committed_includes_message_id_and_redacted_text_for_tool_call_a
     let env = Env::new();
     let gw = ScriptedGateway::new();
     gw.push_tool_calls(
-        &format!("I will call probe now with {API_KEY}"),
+        format!("I will call probe now with {API_KEY}"),
         vec![("c1", "probe", probe_args())],
     );
-    gw.push_text(&format!("Completed probe with {API_KEY}"));
+    gw.push_text(format!("Completed probe with {API_KEY}"));
     let (probe, _) = Probe::new("probe", ToolEffect::ReadOnly, Behavior::Echo);
     let (o, sid) = single(&env, &gw, Some(probe)).await;
     let col = collect(o.subscribe(&alice(), &sid).await.unwrap());

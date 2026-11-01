@@ -784,3 +784,9 @@ fn gateway_error_class_matches_spec_table() {
     );
     assert_eq!(GatewayError::Cancelled.classify(), FailureClass::Cancelled);
 }
+
+#[test]
+fn http_safety_net_outlasts_the_watchdog_total_limit() {
+    let limits = crate::config::RequestLimits::uniform(std::time::Duration::from_secs(600));
+    assert!(super::client::http_safety_net_secs(&limits) > limits.max_total.as_secs());
+}

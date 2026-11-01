@@ -1434,6 +1434,14 @@ async fn child_waiting_parent_stays() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
+    let waiting = o
+        .waiting_descendant(&alice(), &sid)
+        .await
+        .unwrap()
+        .expect("the parent must see the waiting child");
+    assert_eq!(waiting.retry_reason.as_deref(), Some("PROVIDER_TIMEOUT"));
+    assert!(waiting.next_attempt_at.is_some());
+
     // Lúc con đang waiting_retry: cha vẫn đang running, không nhận lỗi và không gọi thêm model.
     let parent_res = o.result(&alice(), &sid, &turn.turn_id).await.unwrap();
     assert_eq!(parent_res.status, RunStatus::Running);

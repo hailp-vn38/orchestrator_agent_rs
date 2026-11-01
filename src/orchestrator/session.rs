@@ -11,7 +11,7 @@ use crate::skill::{SkillManager, SkillReloadReport};
 use crate::tool::ToolDescriptor;
 use crate::types::{
     AcceptedTurn, AgentResult, CallerContext, MessageView, Page, PageRequest, RunStatus,
-    SessionPolicy, SubmitOptions,
+    SessionPolicy, SubmitOptions, WaitingDescendant,
 };
 
 use super::builder::{validate_and_load_agents, ValidatedAgents};
@@ -379,20 +379,35 @@ impl Orchestrator {
         session_id: &str,
     ) -> Result<(), OrchestratorError> {
         let _gate = self.supervisor.admission().await?;
-        let resumed = crate::store::settle_sql(async {
+        let report = crate::store::settle_sql(async {
             self.store.check_scope(caller, session_id).await?;
             let policy = self.recovery.policy();
             self.store.resume_waiting_session(session_id, &policy).await
         })
         .await?;
-        if resumed == 0 {
-            return Err(OrchestratorError::new(
-                ErrorCode::InvalidInput,
-                "the session is not waiting to be resumed",
-            ));
+        if report.resumed == 0 {
+            let message = if report.blocked + report.exhausted > 0 {
+                "the waiting turn could not be resumed: recovery is blocked or exhausted"
+            } else {
+                "the session is not waiting to be resumed"
+            };
+            return Err(OrchestratorError::new(ErrorCode::InvalidInput, message));
         }
         self.supervisor.notify_admitted();
         Ok(())
+    }
+
+    /// Run đang chờ của con cháu còn được session này ủy quyền, nếu có.
+    pub async fn waiting_descendant(
+        &self,
+        caller: &CallerContext,
+        session_id: &str,
+    ) -> Result<Option<WaitingDescendant>, OrchestratorError> {
+        crate::store::settle_sql(async {
+            self.store.check_scope(caller, session_id).await?;
+            self.store.waiting_descendant(session_id).await
+        })
+        .await
     }
 
     /// Hủy hợp tác run đang active của session (và child đang

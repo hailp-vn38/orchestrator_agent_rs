@@ -92,6 +92,8 @@ pub(crate) enum Dispatch {
     Settled(Settled),
     /// Không biết tool đã tạo side effect hay chưa; runtime phải dừng run, không replay.
     Unknown(&'static str),
+    /// Tool `Resumable` gặp lỗi tạm thời khi operation còn mở: giữ invocation, chờ retry bền.
+    RetryLater(String),
     /// Run bị hủy hợp tác (shutdown) khi đang ủy quyền: không có result để ghi, run
     /// `interrupted`. Child turn đã admit vẫn được giữ và đọc được qua invocation link.
     Cancelled,

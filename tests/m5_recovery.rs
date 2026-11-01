@@ -2500,7 +2500,11 @@ async fn resume_blocked_on_config_change() {
     let mut cfg2 = env.config(vec![env.root("model-z", &[]), env.reviewer(&[])]);
     cfg2.llm.providers[0].limits.fast_retries = 0;
     let o2 = build(cfg2, &gw, vec![]).await.unwrap();
-    o2.resume_waiting(&alice(), &sid).await.unwrap();
+    let refused = o2.resume_waiting(&alice(), &sid).await.unwrap_err();
+    assert!(
+        refused.message().contains("blocked or exhausted"),
+        "a blocked resume must not report success: {refused:?}"
+    );
 
     let r_blocked = o2.result(&alice(), &sid, &turn.turn_id).await.unwrap();
     assert_eq!(r_blocked.status, RunStatus::Interrupted);
@@ -3266,5 +3270,74 @@ async fn resumable_panic_with_open_operation_does_not_settle_as_failure() {
         1,
         "model must not retry an open operation with a fresh tool call"
     );
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn resumable_retry_later_keeps_invocation_and_waits() {
+    struct RetryOnce {
+        calls: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HostTool for RetryOnce {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "retry_once".into(),
+                description: "resumable tool hitting a transient failure".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"],
+                    "additionalProperties": false
+                }),
+                effect: ToolEffect::Resumable,
+            }
+        }
+
+        async fn execute(&self, ctx: ToolContext, _args: Value) -> Result<ToolOutcome, ToolError> {
+            let first = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(ctx.scope().invocation_id.clone());
+                calls.len() == 1
+            };
+            if first {
+                return Err(ToolError {
+                    code: orchestrator_agent_rs::CODE_TOOL_RETRY_LATER.into(),
+                    message: "PROVIDER_UNAVAILABLE: cooling down".into(),
+                });
+            }
+            Ok(ToolOutcome {
+                call_id: ctx.scope().tool_call_id.clone(),
+                content: "done".into(),
+                metadata: Value::Null,
+            })
+        }
+    }
+
+    let env = Env::new();
+    let gw = ScriptedGateway::new();
+    gw.push_tool_calls("", vec![("c1", "retry_once", json!({"text": "x"}))]);
+    gw.push_text("finished");
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tool: Arc<dyn HostTool> = Arc::new(RetryOnce {
+        calls: calls.clone(),
+    });
+    let o = build(env.config(env.agents(&["retry_once"])), &gw, vec![tool])
+        .await
+        .unwrap();
+    let sid = o.create_session(&alice(), "root").await.unwrap();
+    let turn = o.submit(&alice(), &sid, "go".into()).await.unwrap();
+
+    let waiting = wait_terminal(&o, &sid, &turn.turn_id).await;
+    assert_eq!(waiting.status, RunStatus::WaitingRetry, "{waiting:?}");
+    assert!(waiting.next_attempt_at.is_some());
+
+    o.resume_waiting(&alice(), &sid).await.unwrap();
+    let done = wait_terminal(&o, &sid, &turn.turn_id).await;
+    assert_eq!(done.status, RunStatus::Completed, "{done:?}");
+    let seen = calls.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0], seen[1], "the retry must reuse the same invocation");
     o.shutdown().await.unwrap();
 }
