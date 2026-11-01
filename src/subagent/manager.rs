@@ -18,6 +18,10 @@ use tokio_util::sync::CancellationToken;
 const FALLBACK_POLL: Duration = Duration::from_secs(2);
 /// Số lần đọc store lỗi liên tiếp trước khi bỏ cuộc đợi (child vẫn chạy và vẫn đọc được sau).
 const MAX_POLL_ERRORS: u32 = 5;
+/// Child commit trạng thái terminal rồi mới phát event, nên parent đọc store có thể thấy kết quả
+/// trước khi event lên feed. Chờ có giới hạn để `tool.completed` của parent không vượt event của
+/// child; publication bị mất chỉ làm chậm parent đúng mức này.
+const TERMINAL_EVENT_GRACE: Duration = Duration::from_millis(500);
 
 struct TaskCatalog {
     /// Chỉ agent có thể làm child (mode `Subagent|All`), theo id.
@@ -212,6 +216,9 @@ impl TaskManager {
         let mut rx = self.emitter.feed().subscribe_raw();
         let mut rx_open = true;
         let mut errors = 0;
+        // Child đã terminal ngay lần đọc đầu (resume) thì event đã phát từ trước: không chờ.
+        let mut seen_live = false;
+        let mut terminal_event_seen = false;
         let result = loop {
             if cancel.is_cancelled() {
                 return Delegation::Cancelled;
@@ -222,8 +229,16 @@ impl TaskManager {
             )
             .await
             {
-                Ok(r) if r.status.is_terminal() => break r,
-                Ok(_) => errors = 0,
+                Ok(r) if r.status.is_terminal() => {
+                    if seen_live && !terminal_event_seen && rx_open {
+                        await_terminal_event(&mut rx, &admission.session_id, cancel).await;
+                    }
+                    break r;
+                }
+                Ok(_) => {
+                    errors = 0;
+                    seen_live = true;
+                }
                 Err(_) => {
                     errors += 1;
                     if errors >= MAX_POLL_ERRORS {
@@ -254,6 +269,7 @@ impl TaskManager {
                             if ev.session_id == admission.session_id
                                 && ev.state_revision.is_some() =>
                         {
+                            terminal_event_seen = event::is_run_terminal(&ev.event_type);
                             break;
                         }
                         Ok(_) => continue,
@@ -273,4 +289,26 @@ impl TaskManager {
         }
         outcome_of(scope, result)
     }
+}
+
+async fn await_terminal_event(
+    rx: &mut tokio::sync::broadcast::Receiver<crate::feed::ExecutionEvent>,
+    session_id: &str,
+    cancel: &CancellationToken,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    let wait = async {
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return,
+                item = rx.recv() => match item {
+                    Ok(ev) if ev.session_id == session_id && event::is_run_terminal(&ev.event_type) => return,
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return,
+                },
+            }
+        }
+    };
+    let _ = tokio::time::timeout(TERMINAL_EVENT_GRACE, wait).await;
 }

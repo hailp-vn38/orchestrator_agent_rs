@@ -30,6 +30,13 @@ pub(crate) const TERMINAL: &[&str] = &[
     TOOL_INTERRUPTED,
 ];
 
+pub(crate) fn is_run_terminal(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        RUN_COMPLETED | RUN_FAILED | RUN_CANCELLED | RUN_INTERRUPTED
+    )
+}
+
 /// Event terminal của run theo trạng thái (timed_out gộp vào failed).
 pub(crate) fn run_terminal(status: crate::types::RunStatus) -> &'static str {
     use crate::types::RunStatus;

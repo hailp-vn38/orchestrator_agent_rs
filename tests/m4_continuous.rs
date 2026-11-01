@@ -1088,7 +1088,9 @@ async fn budget_wrap_up_guidance() {
 async fn budget_capped_text_only() {
     let env = Env::new();
     let gw = ScriptedGateway::new();
-    let (slow, _, _) = Probe::new("slow", Behavior::Sleep(Duration::from_secs(100)));
+    // `now_secs` trộn đồng hồ thật và đồng hồ tokio đã pause, nên có thể lệch 1s: ngủ vượt hạn
+    // mức 100s để không phụ thuộc vào việc giây thật có nhảy trước khi run bắt đầu hay không.
+    let (slow, _, _) = Probe::new("slow", Behavior::Sleep(Duration::from_secs(102)));
     push_call(&gw, "c1", "slow", "work");
     gw.push_text("partial summary before budget stop");
 

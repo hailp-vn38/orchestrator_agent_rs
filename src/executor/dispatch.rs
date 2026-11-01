@@ -20,6 +20,15 @@ use tokio_util::sync::CancellationToken;
 const USER_CANCEL_GRACE: Duration = Duration::from_secs(30);
 const SHUTDOWN_CANCEL_GRACE_MAX: Duration = Duration::from_secs(20);
 
+/// Ân hạn cho tool khi shutdown: chừa 5s cho phần còn lại của shutdown. `shutdown_grace` ngắn thì
+/// chừa một nửa thay vì về 0, để tool hợp tác vẫn kịp trả kết quả mà không vượt tổng ân hạn.
+fn shutdown_cancel_grace(shutdown_grace: Duration) -> Duration {
+    shutdown_grace
+        .saturating_sub(Duration::from_secs(5))
+        .max(shutdown_grace / 2)
+        .min(SHUTDOWN_CANCEL_GRACE_MAX)
+}
+
 impl ToolExecutor {
     /// Chạy một invocation đã `prepare`. Cancel là hợp tác: tool nhận cờ `is_cancelled` và tự
     /// dừng; executor không bỏ tool đang chạy (shutdown chờ trong grace). Timeout là per-op.
@@ -157,9 +166,7 @@ impl ToolExecutor {
             cancel.cancelled().await;
             cancelled.store(true, Ordering::Release);
             let grace = if shutdown_token.is_cancelled() {
-                shutdown_grace
-                    .saturating_sub(Duration::from_secs(5))
-                    .min(SHUTDOWN_CANCEL_GRACE_MAX)
+                shutdown_cancel_grace(shutdown_grace)
             } else {
                 USER_CANCEL_GRACE
             };
