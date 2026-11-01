@@ -36,7 +36,7 @@ transport, AuthN/AuthZ và đăng ký domain tool qua trait `HostTool`.
 
 ```toml
 [dependencies]
-orchestrator-agent = "0.5"
+orchestrator-agent = "0.6"
 async-trait = "0.1"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
