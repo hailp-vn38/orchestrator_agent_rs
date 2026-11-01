@@ -197,7 +197,7 @@ When the host/server already owns model access (credentials, clients, routing), 
 | `page_size` | 50 | Max items per page |
 | `shutdown_grace` | 30s | Wait for tasks to quiesce/join after cancel |
 | `shutdown_drain` | 0 | Drain before cancel (0 = cancel immediately) |
-| `max_resume_attempts` | 10 | Auto-recovery attempts per turn |
+| `max_resume_attempts` | 10 | Consecutive auto-recovery attempts without a new step, per turn |
 | `tool_timeout` | 300s | Timeout of one tool operation |
 | `tool_output_cap_bytes` | 64 KiB | Truncation of model-visible output |
 | `tool_result_hard_cap_bytes` | 8 MiB | Exceeding it yields `TOOL_OUTPUT_TOO_LARGE` |

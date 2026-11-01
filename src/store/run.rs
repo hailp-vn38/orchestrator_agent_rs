@@ -104,8 +104,7 @@ impl SessionStore {
         Ok(steps.unwrap_or(0).max(0) as u32)
     }
 
-    /// Số attempt trong cùng `(session_id, turn_id)` đã có `retry_reason` (để crash recovery
-    /// không làm dãn lịch backoff `[1m, 5m, 15m, 30m]`).
+    /// Xem [`attempts_without_progress_on`].
     pub(crate) async fn attempts_without_progress(
         &self,
         session_id: &str,
