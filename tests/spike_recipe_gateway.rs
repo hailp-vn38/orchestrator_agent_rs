@@ -9,11 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use orchestrator_agent_rs::{
-    ModelUsage,
     AgentDefinition, AgentMode, AgentResult, CallerContext, GatewayError, HostTool, LlmConfig,
-    ModelRequest, ModelResponse, ModelRole, ModelToolCall, Orchestrator, OrchestratorConfig,
-    ProviderRuntime, RunStatus, RuntimeProvider, StreamSink, ToolContext, ToolDescriptor,
-    ToolEffect, ToolError, ToolOutcome,
+    ModelRequest, ModelResponse, ModelRole, ModelToolCall, ModelUsage, Orchestrator,
+    OrchestratorConfig, ProviderRuntime, RunStatus, RuntimeProvider, StreamSink, ToolContext,
+    ToolDescriptor, ToolEffect, ToolError, ToolOutcome,
 };
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -129,7 +128,10 @@ impl HostTool for Probe {
 
     async fn execute(&self, ctx: ToolContext, args: Value) -> Result<ToolOutcome, ToolError> {
         let text = args["text"].as_str().unwrap_or_default().to_owned();
-        self.calls.lock().unwrap().push(format!("{}:{text}", self.name));
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("{}:{text}", self.name));
         tokio::time::sleep(self.delay).await;
         Ok(ToolOutcome {
             call_id: ctx.scope().tool_call_id.clone(),
@@ -216,7 +218,10 @@ async fn recipe_runs_fixed_steps_and_agent_step_through_existing_runtime() {
     let o = build(&dir, &rt, &calls, Duration::ZERO).await;
 
     let sid = o.create_session(&who(), "root").await.unwrap();
-    let turn = o.submit(&who(), &sid, r#"{"playlist":"PL1"}"#.into()).await.unwrap();
+    let turn = o
+        .submit(&who(), &sid, r#"{"playlist":"PL1"}"#.into())
+        .await
+        .unwrap();
     let r = wait_terminal(&o, &sid, &turn.turn_id).await;
 
     assert_eq!(r.status, RunStatus::Completed, "{r:?}");
@@ -226,7 +231,11 @@ async fn recipe_runs_fixed_steps_and_agent_step_through_existing_runtime() {
         ["fetch_list:PL1", "save_item:trading/ict"],
         "tool steps in order, Agent Step output fed into the next step"
     );
-    assert_eq!(rt.llm_calls.load(Ordering::SeqCst), 1, "only the Agent Step hit an LLM");
+    assert_eq!(
+        rt.llm_calls.load(Ordering::SeqCst),
+        1,
+        "only the Agent Step hit an LLM"
+    );
     spike_log(format!(
         "SPIKE steps={} recipe_calls={} tokens={}/{}",
         r.steps,
@@ -245,7 +254,10 @@ async fn recipe_continues_after_restart_mid_tool_step() {
     let o = build(&dir, &rt, &calls, Duration::from_secs(3)).await;
 
     let sid = o.create_session(&who(), "root").await.unwrap();
-    let turn = o.submit(&who(), &sid, r#"{"playlist":"PL1"}"#.into()).await.unwrap();
+    let turn = o
+        .submit(&who(), &sid, r#"{"playlist":"PL1"}"#.into())
+        .await
+        .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while calls.lock().unwrap().is_empty() {
         assert!(tokio::time::Instant::now() < deadline);
@@ -255,16 +267,29 @@ async fn recipe_continues_after_restart_mid_tool_step() {
 
     let o2 = build(&dir, &rt, &calls, Duration::ZERO).await;
     let r = wait_terminal(&o2, &sid, &turn.turn_id).await;
-    spike_log(format!("SPIKE restart status={:?} attempt={} steps={} calls={:?}", r.status, r.attempt, r.steps, calls.lock().unwrap()));
+    spike_log(format!(
+        "SPIKE restart status={:?} attempt={} steps={} calls={:?}",
+        r.status,
+        r.attempt,
+        r.steps,
+        calls.lock().unwrap()
+    ));
     assert_eq!(r.status, RunStatus::Completed, "{r:?}");
-    assert_eq!(calls.lock().unwrap().last().map(String::as_str), Some("save_item:trading/ict"));
+    assert_eq!(
+        calls.lock().unwrap().last().map(String::as_str),
+        Some("save_item:trading/ict")
+    );
     o2.shutdown().await.unwrap();
 }
 
 fn spike_log(line: String) {
     use std::io::Write;
     if let Ok(path) = std::env::var("SPIKE_OUT") {
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
         writeln!(f, "{line}").unwrap();
     }
 }
@@ -321,7 +346,11 @@ async fn recipe_batch_is_many_tool_calls_in_one_step_with_zero_usage() {
     let r = wait_terminal(&o, &sid, &turn.turn_id).await;
     spike_log(format!(
         "SPIKE fanout status={:?} steps={} tokens={}/{} calls={}",
-        r.status, r.steps, r.input_tokens, r.output_tokens, calls.lock().unwrap().len()
+        r.status,
+        r.steps,
+        r.input_tokens,
+        r.output_tokens,
+        calls.lock().unwrap().len()
     ));
     assert_eq!(r.status, RunStatus::Completed, "{r:?}");
     assert_eq!(calls.lock().unwrap().len(), 5);
