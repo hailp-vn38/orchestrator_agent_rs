@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use orchestrator_agent_rs::{
-    AgentDefinition, AgentMode, CallerContext, ConfigReason, GatewayError, LlmBackend, LlmConfig,
-    LlmProviderConfig, ModelRequest, ModelResponse, Orchestrator, OrchestratorConfig, ProviderAuth,
-    ProviderRuntime, RunStatus, RuntimeProvider, SecretString, StreamSink,
+    AgentDefinition, AgentMode, CallerContext, ConfigReason, CustomModelExecutor, GatewayError,
+    LlmBackend, LlmConfig, LlmProviderConfig, ModelRequest, ModelResponse, ModelRole,
+    ModelToolCall, Orchestrator, OrchestratorConfig, ProviderAuth, ProviderRuntime, RunStatus,
+    RuntimeProvider, SecretString, StreamSink,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -41,6 +42,35 @@ impl ProviderRuntime for ServerRuntime {
             .lock()
             .unwrap()
             .push((request.provider_id.clone(), request.model_id.clone()));
+        if request.tools.iter().any(|tool| tool.name == "subagent") {
+            let delegated = request
+                .messages
+                .iter()
+                .any(|message| message.role == ModelRole::Tool);
+            return Ok(if delegated {
+                ModelResponse {
+                    text: "recipe completed after child".into(),
+                    finish_reason: "stop".into(),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }
+            } else {
+                ModelResponse {
+                    text: String::new(),
+                    finish_reason: "tool_calls".into(),
+                    tool_calls: vec![ModelToolCall {
+                        id: "delegate-1".into(),
+                        name: "subagent".into(),
+                        arguments: serde_json::json!({
+                            "agent": "classifier",
+                            "description": "classify collected videos",
+                            "prompt": "Choose a topic",
+                        }),
+                    }],
+                    usage: None,
+                }
+            });
+        }
         Ok(ModelResponse {
             text: "from server runtime".into(),
             finish_reason: "stop".into(),
@@ -156,7 +186,7 @@ async fn rejects_invalid_runtime_configuration() {
     );
     let llm = LlmConfig {
         providers: vec![LlmProviderConfig {
-            id: "x".into(),
+            id: "a".into(),
             backend: LlmBackend::OpenAi,
             endpoint: None,
             auth: ProviderAuth::ApiKey(SecretString::new("sk-test")),
@@ -167,4 +197,146 @@ async fn rejects_invalid_runtime_configuration() {
         build_err(llm, vec![p("a", "1")], "a").await,
         ConfigReason::ProviderRuntimeConflict
     );
+}
+
+#[derive(Debug)]
+struct HttpFake {
+    seen: Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl CustomModelExecutor for HttpFake {
+    fn routing_fingerprint(&self) -> String {
+        "http-fake:v1".into()
+    }
+
+    async fn complete(
+        &self,
+        request: &ModelRequest,
+        _cancel: &CancellationToken,
+        _sink: StreamSink<'_>,
+    ) -> Result<ModelResponse, GatewayError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((request.provider_id.clone(), request.model_id.clone()));
+        Ok(ModelResponse {
+            text: "classified by child HTTP provider".into(),
+            finish_reason: "stop".into(),
+            tool_calls: Vec::new(),
+            usage: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn runtime_root_can_delegate_to_an_llm_provider_and_keep_both_fingerprints() {
+    let dir = tempfile::tempdir().unwrap();
+    let root_prompt = dir.path().join("root.md");
+    let child_prompt = dir.path().join("child.md");
+    std::fs::write(&root_prompt, "root").unwrap();
+    std::fs::write(&child_prompt, "child").unwrap();
+    let child = Arc::new(HttpFake {
+        seen: Mutex::new(Vec::new()),
+    });
+    let llm = LlmConfig {
+        providers: vec![LlmProviderConfig {
+            id: "http-fake".into(),
+            backend: LlmBackend::OpenAiCompatible,
+            endpoint: None,
+            auth: ProviderAuth::CustomExecutor(child.clone()),
+            limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(5)),
+        }],
+    };
+    let config = OrchestratorConfig::new(
+        llm,
+        vec![
+            AgentDefinition::new("root", "recipe", "collect@1")
+                .with_mode(AgentMode::Primary)
+                .with_prompt_path(root_prompt)
+                .with_allowed_tools(["subagent"])
+                .with_allowed_subagents(["classifier"]),
+            AgentDefinition::new("classifier", "http-fake", "small-model")
+                .with_mode(AgentMode::Subagent)
+                .with_description("classify")
+                .with_prompt_path(child_prompt),
+        ],
+        dir.path().join("store"),
+    );
+    let runtime = ServerRuntime::new(vec![RuntimeProvider::new("recipe", "recipe:v1")]);
+    let o = Orchestrator::builder(config)
+        .with_provider_runtime(runtime.clone())
+        .build()
+        .await
+        .expect("non-overlapping provider sources should be combined");
+    assert_eq!(o.provider_fingerprint("recipe"), Some("recipe:v1"));
+    assert!(o
+        .provider_fingerprint("http-fake")
+        .unwrap()
+        .starts_with("v1:"));
+
+    // The fixed runtime root delegates directly to the child provider.
+    let root_calls = runtime.clone();
+    let who = CallerContext::new("alice", "ws");
+    let sid = o.create_session(&who, "root").await.unwrap();
+    let turn = o.submit(&who, &sid, "collect".into()).await.unwrap();
+    let r = wait_result(&o, &who, &sid, &turn.turn_id).await;
+    assert_eq!(r.status, RunStatus::Completed, "{r:?}");
+    assert_eq!(r.output.as_deref(), Some("recipe completed after child"));
+    assert_eq!(
+        child.seen.lock().unwrap().as_slice(),
+        [("http-fake".to_string(), "small-model".to_string())]
+    );
+    assert_eq!(
+        root_calls.seen.lock().unwrap().as_slice(),
+        [
+            ("recipe".to_string(), "collect@1".to_string()),
+            ("recipe".to_string(), "collect@1".to_string())
+        ]
+    );
+    o.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn rejects_provider_alias_declared_by_both_sources() {
+    let llm = LlmConfig {
+        providers: vec![LlmProviderConfig {
+            id: "shared".into(),
+            backend: LlmBackend::OpenAiCompatible,
+            endpoint: None,
+            auth: ProviderAuth::CustomExecutor(Arc::new(HttpFake {
+                seen: Mutex::new(Vec::new()),
+            })),
+            limits: orchestrator_agent_rs::RequestLimits::uniform(Duration::from_secs(5)),
+        }],
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let error = Orchestrator::builder(config(&dir, llm, "shared"))
+        .with_provider_runtime(ServerRuntime::new(vec![RuntimeProvider::new(
+            "shared",
+            "runtime:v1",
+        )]))
+        .build()
+        .await
+        .err()
+        .expect("duplicate aliases must fail at build");
+    assert_eq!(error.reason(), Some(ConfigReason::ProviderRuntimeConflict));
+    assert!(error.message().contains("shared"));
+}
+
+async fn wait_result(
+    o: &Orchestrator,
+    who: &CallerContext,
+    sid: &str,
+    turn_id: &str,
+) -> orchestrator_agent_rs::AgentResult {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let r = o.result(who, sid, turn_id).await.unwrap();
+        if r.status != RunStatus::Running && r.status != RunStatus::Interrupted {
+            return r;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "run stuck: {r:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

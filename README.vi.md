@@ -139,7 +139,7 @@ Mọi hàm async trả `Result<_, OrchestratorError>`. Sau `shutdown()` các hà
 | Field / hàm | Ý nghĩa |
 |---|---|
 | `OrchestratorConfig::new(llm, agents, store_dir)` | Tạo config với `RuntimeConfig::default()` |
-| `llm: LlmConfig` | Danh sách `LlmProviderConfig` (để trống khi dùng `with_provider_runtime`) |
+| `llm: LlmConfig` | Danh sách `LlmProviderConfig`; có thể dùng cùng runtime với alias không trùng |
 | `agents: Vec<AgentDefinition>` | Registry agent |
 | `store_dir` | Thư mục SQLite + owner lock + artifact. Dùng DB riêng, không dùng DB nghiệp vụ của host |
 | `runtime: RuntimeConfig` | Giới hạn vận hành (bên dưới) |
@@ -158,11 +158,12 @@ Mọi hàm async trả `Result<_, OrchestratorError>`. Sau `shutdown()` các hà
 
 `SecretString::new(..)` che giá trị khi `Debug`. Host tự resolve secret trước `build()`; library validate cục bộ, không gọi remote lúc build.
 
-#### Provider runtime của server (thay `LlmProviderConfig`)
+#### Provider runtime của server
 
-Khi host/server đã sở hữu việc gọi model (credential, client, routing), cắm bằng
-`Orchestrator::builder(cfg).with_provider_runtime(Arc<dyn ProviderRuntime>)` và để trống `llm.providers`
-(nếu không trống sẽ bị từ chối với `ConfigReason::ProviderRuntimeConflict`).
+Khi host/server sở hữu một số alias model, cắm bằng
+`Orchestrator::builder(cfg).with_provider_runtime(Arc<dyn ProviderRuntime>)`. Alias runtime đi qua
+`ProviderRuntime`; alias khác trong `llm.providers` tiếp tục đi qua client gateway của library.
+Nếu cùng alias được khai báo ở cả hai nguồn, build trả `ConfigReason::ProviderRuntimeConflict`.
 
 | Mục | Ý nghĩa |
 |---|---|

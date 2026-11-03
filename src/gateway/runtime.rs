@@ -50,6 +50,30 @@ pub(crate) struct RuntimeGateway {
     known: HashMap<String, ()>,
 }
 
+/// Composite gateway for disjoint aliases owned by the host runtime and ClientGateway.
+pub(crate) struct MixedGateway {
+    runtime: RuntimeGateway,
+    client: Arc<super::client::ClientGateway>,
+    runtime_ids: HashMap<String, ()>,
+}
+
+impl MixedGateway {
+    pub(crate) fn new(
+        runtime: Arc<dyn ProviderRuntime>,
+        runtime_providers: &[RuntimeProvider],
+        client: Arc<super::client::ClientGateway>,
+    ) -> Self {
+        Self {
+            runtime: RuntimeGateway::new(runtime, runtime_providers),
+            client,
+            runtime_ids: runtime_providers
+                .iter()
+                .map(|provider| (provider.id.trim().to_owned(), ()))
+                .collect(),
+        }
+    }
+}
+
 impl RuntimeGateway {
     pub(crate) fn new(runtime: Arc<dyn ProviderRuntime>, providers: &[RuntimeProvider]) -> Self {
         Self {
@@ -76,5 +100,29 @@ impl LlmGateway for RuntimeGateway {
         let mut response = self.runtime.complete(request, cancel, sink).await?;
         response.usage = Some(ModelUsage::or_estimated(response.usage, request, &response));
         Ok(response)
+    }
+}
+
+#[async_trait]
+impl LlmGateway for MixedGateway {
+    async fn complete(
+        &self,
+        request: &ModelRequest,
+        cancel: &CancellationToken,
+        sink: StreamSink<'_>,
+    ) -> Result<ModelResponse, GatewayError> {
+        if self.runtime_ids.contains_key(request.provider_id.trim()) {
+            self.runtime.complete(request, cancel, sink).await
+        } else {
+            self.client.complete(request, cancel, sink).await
+        }
+    }
+
+    fn take_last_error_detail(&self, provider_id: &str) -> Option<String> {
+        if self.runtime_ids.contains_key(provider_id.trim()) {
+            None
+        } else {
+            self.client.take_last_error_detail(provider_id)
+        }
     }
 }

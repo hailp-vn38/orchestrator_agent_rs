@@ -12,7 +12,9 @@ use crate::config::{OrchestratorConfig, ProviderAuth};
 use crate::error::{ConfigReason, OrchestratorError};
 use crate::executor::{replay_safe_names, ToolExecutor, ToolLimits};
 use crate::feed::{Emitter, ExecutionFeed};
-use crate::gateway::{ClientGateway, LlmGateway, ProviderRuntime, RuntimeGateway, RuntimeProvider};
+use crate::gateway::{
+    ClientGateway, LlmGateway, MixedGateway, ProviderRuntime, RuntimeGateway, RuntimeProvider,
+};
 use crate::owner_lock::OwnerLock;
 use crate::prompt::PromptBuilder;
 use crate::runtime::{AgentRuntime, ContextPolicy};
@@ -110,9 +112,9 @@ impl OrchestratorBuilder {
         self
     }
 
-    /// Tích hợp provider runtime của server/host: model được gọi qua `runtime` thay vì
-    /// `LlmProviderConfig`. Khi dùng, `config.llm.providers` phải để trống; provider alias và
-    /// routing fingerprint lấy từ [`ProviderRuntime::providers`].
+    /// Tích hợp provider runtime của server/host. Alias runtime lấy từ
+    /// [`ProviderRuntime::providers`]; các alias không trùng trong `config.llm.providers` tiếp tục
+    /// được phục vụ bởi `ClientGateway`.
     pub fn with_provider_runtime(mut self, runtime: Arc<dyn ProviderRuntime>) -> Self {
         self.provider_runtime = Some(runtime);
         self
@@ -153,39 +155,35 @@ impl OrchestratorBuilder {
         let base_version = parse_base_version(BASE_INSTRUCTIONS)?;
 
         self.config.validate_local()?;
-        // (provider_id -> fingerprint) từ runtime của server hoặc từ `LlmConfig`.
-        let (fingerprints, fast_retries): (BTreeMap<String, String>, BTreeMap<String, u8>) =
-            match &self.provider_runtime {
-                Some(runtime) => {
-                    if !self.config.llm.providers.is_empty() {
-                        return Err(OrchestratorError::config(
-                            ConfigReason::ProviderRuntimeConflict,
-                            "llm.providers must be empty when a provider runtime is used",
-                        ));
-                    }
-                    let fps = runtime_fingerprints(&runtime.providers())?;
-                    let retries = fps.keys().map(|id| (id.clone(), 2u8)).collect();
-                    (fps, retries)
+        // Fingerprints and retry policy are merged after validating alias ownership.
+        let runtime_providers = self
+            .provider_runtime
+            .as_ref()
+            .map(|runtime| runtime.providers());
+        let mut fingerprints = runtime_providers
+            .as_deref()
+            .map(runtime_fingerprints)
+            .transpose()?
+            .unwrap_or_default();
+        let mut fast_retries: BTreeMap<String, u8> =
+            fingerprints.keys().map(|id| (id.clone(), 2u8)).collect();
+
+        if self.provider_runtime.is_none() || !self.config.llm.providers.is_empty() {
+            self.config.llm.validate()?;
+            for provider in &self.config.llm.providers {
+                let id = provider.id.trim().to_string();
+                if fingerprints.contains_key(&id) {
+                    return Err(OrchestratorError::config(
+                        ConfigReason::ProviderRuntimeConflict,
+                        format!(
+                            "provider alias '{id}' is declared by both ProviderRuntime and llm.providers"
+                        ),
+                    ));
                 }
-                None => {
-                    self.config.llm.validate()?;
-                    let fps = self
-                        .config
-                        .llm
-                        .providers
-                        .iter()
-                        .map(|p| (p.id.trim().to_string(), p.routing_fingerprint()))
-                        .collect();
-                    let retries = self
-                        .config
-                        .llm
-                        .providers
-                        .iter()
-                        .map(|p| (p.id.trim().to_string(), p.limits.fast_retries))
-                        .collect();
-                    (fps, retries)
-                }
-            };
+                fingerprints.insert(id.clone(), provider.routing_fingerprint());
+                fast_retries.insert(id, provider.limits.fast_retries);
+            }
+        }
 
         let mut tools: BTreeMap<String, Arc<dyn HostTool>> = BTreeMap::new();
         for tool in self.tools {
@@ -355,15 +353,24 @@ impl OrchestratorBuilder {
         );
 
         let has_provider_runtime = self.provider_runtime.is_some();
+        let client_gateway = (!self.config.llm.providers.is_empty())
+            .then(|| Arc::new(ClientGateway::new(&self.config.llm.providers)));
         let (gateway, client_gateway): (Arc<dyn LlmGateway>, Option<Arc<ClientGateway>>) =
             match (self.gateway, self.provider_runtime) {
                 (Some(g), _) => (g, None),
-                (None, Some(runtime)) => {
-                    let providers = runtime.providers();
-                    (Arc::new(RuntimeGateway::new(runtime, &providers)), None)
-                }
+                (None, Some(runtime)) => match (runtime_providers.as_deref(), client_gateway) {
+                    (Some(providers), Some(client)) => (
+                        Arc::new(MixedGateway::new(runtime, providers, client.clone())),
+                        Some(client),
+                    ),
+                    (Some(providers), None) => {
+                        (Arc::new(RuntimeGateway::new(runtime, providers)), None)
+                    }
+                    (None, _) => unreachable!("runtime providers are captured before build"),
+                },
                 (None, None) => {
-                    let gw = Arc::new(ClientGateway::new(&self.config.llm.providers));
+                    let gw = client_gateway
+                        .expect("LlmConfig validation requires at least one provider");
                     (gw.clone(), Some(gw))
                 }
             };
