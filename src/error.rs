@@ -75,7 +75,7 @@ pub enum ConfigReason {
     DuplicateSkill,
     UnknownSkill,
     ProjectInstructionsInvalid,
-    /// Host cắm `ProviderRuntime` nhưng `LlmConfig` vẫn khai báo provider (hai nguồn mâu thuẫn).
+    /// Alias provider bị trùng nguồn, hoặc `reconfigure` dùng khi có `ProviderRuntime`.
     ProviderRuntimeConflict,
 }
 

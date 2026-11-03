@@ -158,11 +158,12 @@ Every async function returns `Result<_, OrchestratorError>`. After `shutdown()`,
 
 `SecretString::new(..)` masks the value in `Debug`. The host resolves secrets before `build()`; the library validates locally and makes no remote calls at build time.
 
-#### Server provider runtime (instead of `LlmProviderConfig`)
+#### Server provider runtime
 
-When the host/server already owns model access (credentials, clients, routing), plug it in with
-`Orchestrator::builder(cfg).with_provider_runtime(Arc<dyn ProviderRuntime>)` and leave `llm.providers` empty
-(a non-empty list is rejected with `ConfigReason::ProviderRuntimeConflict`).
+When the host/server owns some model aliases, plug it in with
+`Orchestrator::builder(cfg).with_provider_runtime(Arc<dyn ProviderRuntime>)`. Runtime aliases use
+`ProviderRuntime`; distinct aliases in `llm.providers` continue through the library's client gateway.
+Declaring the same alias in both sources fails with `ConfigReason::ProviderRuntimeConflict`.
 
 | Item | Meaning |
 |---|---|

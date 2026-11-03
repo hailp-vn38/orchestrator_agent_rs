@@ -174,11 +174,11 @@ Mỗi quyết định dưới đây có trạng thái **Accepted** theo thảo l
 
 **Status:** Accepted (2026-10-21); **supersedes only the "library creates provider clients" part of EMB-12 and the "host cannot inject gateway" rule in ADR-015 for model access**.
 
-**Decision:** Host/server may plug in `ProviderRuntime` via `OrchestratorBuilder::with_provider_runtime` instead of `LlmConfig`. The runtime declares `RuntimeProvider { id, fingerprint }` and performs each model turn; the library keeps owning prompts, tool loop, persistence and recovery. `llm.providers` must be empty when a runtime is used (`ConfigReason::ProviderRuntimeConflict`); the host-supplied fingerprint replaces `routing_fingerprint` (EMB-16). Runtime must return `Ok` only for a fully finished response.
+**Decision:** Host/server may plug in `ProviderRuntime` via `OrchestratorBuilder::with_provider_runtime`. The runtime declares `RuntimeProvider { id, fingerprint }` and performs each model turn; the library keeps owning prompts, tool loop, persistence and recovery. Runtime aliases and `llm.providers` aliases may be combined when their IDs are disjoint; each alias routes only through its owning source and uses that source's fingerprint. An alias declared in both sources fails build with `ConfigReason::ProviderRuntimeConflict`. Runtime must return `Ok` only for a fully finished response.
 
 **Why:** A server host already owns credentials, clients and routing; configuring providers twice is error-prone and leaks secrets into a second place.
 
-**Alternatives rejected:** Mixing `LlmConfig` and runtime providers (ambiguous routing and fingerprint source), exposing the raw `LlmGateway` publicly (leaks internal seam and `llm` crate types).
+**Alternatives rejected:** Allowing ambiguous duplicate aliases, exposing the raw `LlmGateway` publicly (leaks internal seam and `llm` crate types). The original no-mixing restriction was amended by the accepted Task Recipe Seam 0 decision (2026-11-03): disjoint aliases can be mixed so a deterministic Root runtime can delegate to LLM-backed Subagents.
 
 **Consequences:** Host is responsible for credential handling, timeouts and error sanitising (`GatewayError`); fingerprint must change when the alias targets a different backend or recovery may resume on the wrong one.
 
