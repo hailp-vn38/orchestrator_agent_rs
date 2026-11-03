@@ -956,14 +956,13 @@ async fn fast_retry_then_success() {
     o.shutdown().await.unwrap();
 
     let mut conn = env.sql().await;
-    let outcomes: Vec<String> =
-        sqlx::query("SELECT outcome FROM llm_attempts ORDER BY rowid")
-            .fetch_all(&mut conn)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|r| r.get(0))
-            .collect();
+    let outcomes: Vec<String> = sqlx::query("SELECT outcome FROM llm_attempts ORDER BY rowid")
+        .fetch_all(&mut conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
     assert_eq!(
         outcomes,
         ["PROVIDER_TIMEOUT", "PROVIDER_UNAVAILABLE", "completed"]
@@ -985,7 +984,11 @@ async fn fast_retry_cancelled() {
     o.cancel(&alice(), &sid).await.unwrap();
     let r = wait_terminal(&o, &alice(), &sid, &t.turn_id).await;
     assert_eq!(r.status, RunStatus::Cancelled);
-    assert_eq!(gw.call_count(), 1, "cancel during sleep must abort fast retry");
+    assert_eq!(
+        gw.call_count(),
+        1,
+        "cancel during sleep must abort fast retry"
+    );
     o.shutdown().await.unwrap();
 }
 
@@ -1000,7 +1003,10 @@ async fn split_guidance_after_two_limits() {
     let sid = o.create_session(&alice(), "root").await.unwrap();
 
     tokio::time::pause();
-    let t = o.submit(&alice(), &sid, "write a huge report".into()).await.unwrap();
+    let t = o
+        .submit(&alice(), &sid, "write a huge report".into())
+        .await
+        .unwrap();
     let r = wait_terminal(&o, &alice(), &sid, &t.turn_id).await;
     assert_eq!(r.status, RunStatus::Completed);
     assert_eq!(r.output.as_deref(), Some("concise summary"));
@@ -1008,24 +1014,21 @@ async fn split_guidance_after_two_limits() {
     let reqs = gw.requests();
     assert_eq!(reqs.len(), 3);
     assert!(
-        !reqs[0]
-            .messages
-            .iter()
-            .any(|m| m.text.contains("Break the remaining work into smaller steps")),
+        !reqs[0].messages.iter().any(|m| m
+            .text
+            .contains("Break the remaining work into smaller steps")),
         "attempt 1 must not have split guidance"
     );
     assert!(
-        !reqs[1]
-            .messages
-            .iter()
-            .any(|m| m.text.contains("Break the remaining work into smaller steps")),
+        !reqs[1].messages.iter().any(|m| m
+            .text
+            .contains("Break the remaining work into smaller steps")),
         "attempt 2 must not have split guidance yet"
     );
     assert!(
-        reqs[2]
-            .messages
-            .iter()
-            .any(|m| m.text.contains("Break the remaining work into smaller steps")),
+        reqs[2].messages.iter().any(|m| m
+            .text
+            .contains("Break the remaining work into smaller steps")),
         "attempt 3 must include SPLIT_OUTPUT_GUIDANCE"
     );
 

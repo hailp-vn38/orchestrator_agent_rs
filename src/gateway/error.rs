@@ -13,11 +13,18 @@ pub enum GatewayError {
     Timeout,
     Stalled,
     RequestLimitExceeded,
-    RateLimited { retry_after_secs: Option<u64> },
+    RateLimited {
+        retry_after_secs: Option<u64>,
+    },
     Cancelled,
     Protocol,
     /// Provider từ chối vì prompt vượt context window trước khi sinh output.
     ContextOverflow,
+    /// A trusted host reports a permanent workflow failure with static, non-sensitive text.
+    HostPermanent {
+        code: &'static str,
+        message: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +51,7 @@ impl GatewayError {
             Self::Cancelled => "CANCELLED",
             Self::Protocol => "PROVIDER_PROTOCOL_ERROR",
             Self::ContextOverflow => "CONTEXT_LIMIT",
+            Self::HostPermanent { code, .. } => code,
         }
     }
 
@@ -64,16 +72,15 @@ impl GatewayError {
             Self::Cancelled => "the request was cancelled",
             Self::Protocol => "the provider returned an unexpected response",
             Self::ContextOverflow => "the conversation exceeds the model context limit",
+            Self::HostPermanent { message, .. } => message,
         }
     }
 
     pub(crate) fn classify(self) -> FailureClass {
         match self {
-            Self::Stalled
-            | Self::Timeout
-            | Self::Transport
-            | Self::Provider
-            | Self::Protocol => FailureClass::Retryable { retry_after: None },
+            Self::Stalled | Self::Timeout | Self::Transport | Self::Provider | Self::Protocol => {
+                FailureClass::Retryable { retry_after: None }
+            }
             Self::RateLimited { retry_after_secs } => FailureClass::Retryable {
                 retry_after: retry_after_secs.map(Duration::from_secs),
             },
@@ -82,6 +89,7 @@ impl GatewayError {
             Self::NotConfigured | Self::InvalidRequest | Self::ContextOverflow => {
                 FailureClass::Permanent
             }
+            Self::HostPermanent { .. } => FailureClass::Permanent,
             Self::Cancelled => FailureClass::Cancelled,
         }
     }
@@ -159,9 +167,7 @@ pub(crate) fn error_detail(e: &LLMError) -> Option<String> {
             message,
             raw_response,
         } => match http_status(message) {
-            Some(status)
-                if looks_like_overflow(message) || looks_like_overflow(raw_response) =>
-            {
+            Some(status) if looks_like_overflow(message) || looks_like_overflow(raw_response) => {
                 Some(format!(
                     "upstream returned HTTP {status} (context length exceeded)"
                 ))
@@ -224,5 +230,22 @@ pub fn sanitize_diagnostic_detail(raw: &str) -> String {
         format!("{truncated}...")
     } else {
         joined
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FailureClass, GatewayError};
+
+    #[test]
+    fn host_permanent_gateway_error_preserves_static_code_and_never_retries() {
+        let error = GatewayError::HostPermanent {
+            code: "RECIPE_STEP_FAILED",
+            message: "a deterministic recipe step failed",
+        };
+
+        assert_eq!(error.code(), "RECIPE_STEP_FAILED");
+        assert_eq!(error.message(), "a deterministic recipe step failed");
+        assert_eq!(error.classify(), FailureClass::Permanent);
     }
 }
